@@ -20,12 +20,19 @@
 
 ## Install / Update 🛠️
 
-
 ```bash
 git clone https://github.com/Southland-Systems/mince.git
 cd mince
 make install
-#make update
+
+# Update
+cd mince
+git pull
+make update
+
+# Uninstall
+cd mince
+make uninstall-user
 ```
 
 ## First run 🚀
