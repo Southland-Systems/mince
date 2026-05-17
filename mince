@@ -40,7 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ),
     "temperature": 1.0,
     "top_p": 1.0,
-    "max_output_tokens": 4096,
+    "max_output_tokens": 65534,
     "max_file_size_kb": 512,
     "response_format": "text",
 }
@@ -171,13 +171,17 @@ def print_stats(
     response_text: str,
     usage: dict[str, Any] | None = None,
 ) -> None:
-    print("\n--- stats ---", file=sys.stderr)
-    print(f"request_tokens_estimate: {request_tokens}", file=sys.stderr)
-    print(f"response_characters: {len(response_text)}", file=sys.stderr)
+    stats: list[str] = [
+        f"request_tokens_estimate={request_tokens}",
+        f"response_characters={len(response_text)}",
+    ]
 
-    if usage is not None:
-        print("openai_usage:", file=sys.stderr)
-        print(json.dumps(usage, indent=2, ensure_ascii=False), file=sys.stderr)
+    if usage:
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            if key in usage:
+                stats.append(f"{key}={usage[key]}")
+
+    print("stats: " + " ".join(stats), file=sys.stderr)
 
 
 def coerce_int(value: Any, default: int) -> int:
@@ -516,7 +520,7 @@ def main() -> int:
         print(f"ERROR: api_key missing in {CONFIG_FILE}", file=sys.stderr)
         print()
         print("Run:")
-        print("  single_shot_llm.py --init")
+        print("  mince --init")
         return 1
 
     max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
@@ -537,7 +541,7 @@ def main() -> int:
         user_prompt=user_prompt,
     )
 
-    print(f"REQUEST TOKENS ESTIMATE: {request_tokens}", file=sys.stderr)
+    print(f"request_token_estimate: {request_tokens}", file=sys.stderr)
 
     try:
         result, usage = call_llm(
@@ -561,7 +565,9 @@ def main() -> int:
     if response_format in ("json", "schema"):
         result = pretty_json(result)
 
+    print("<response>")
     print(result)
+    print("</response>")
     print_stats(
         request_tokens=request_tokens,
         response_text=result,

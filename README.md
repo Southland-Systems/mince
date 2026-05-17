@@ -9,7 +9,7 @@
 
 ## Requirements 📦
 
-- Python 3.11 or newer and the `pip` package manager
+- `python` 3.11 or newer and the `pip` package manager
 - `make` from GNU Make or compatible
 - Network access to your chosen OpenAI-compatible endpoint
 - An API key for the endpoint
