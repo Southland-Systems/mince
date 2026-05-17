@@ -1,5 +1,8 @@
+![MinCE logo](mince.png)
+
 ## What it does ✨
 
+- MinCE ensures minimal context by giving you full control for maximum result
 - Reads one or more local files as context
 - Sends a single request to an OpenAI‑compatible model endpoint
 - Supports plain text, JSON, and JSON Schema outputs
