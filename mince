@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+mince
+
+A small, single-command assistant for turning local files into useful answers.
+
+Features:
+- Reads one or more files as context
+- Sends a single request to an OpenAI-compatible model endpoint
+- Stores settings in ~/.local/state/mince/config.json
+- Supports an optional system prompt
+- Supports plain text, JSON, and JSON Schema outputs
+- Auto-creates its config directory and file
+- Works with local OpenAI-compatible endpoints too
+  (for example, set base_url to http://address:11434/v1)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import tiktoken
+from openai import OpenAI
+
+APP_DIR = Path.home() / ".local/state/mince"
+CONFIG_FILE = APP_DIR / "config.json"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "model": "gpt-5.5",
+    "api_key": "",
+    "openai_base_url": "https://api.openai.com/v1",
+    "openai_project": "",
+    "service_tier": "auto",
+    "system_prompt": (
+        "You are a concise and technically accurate software engineering assistant."
+    ),
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_output_tokens": 4096,
+    "max_file_size_kb": 512,
+    "response_format": "text",
+}
+
+
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
+
+def merged_config() -> dict[str, Any]:
+    config = DEFAULT_CONFIG.copy()
+
+    if CONFIG_FILE.exists():
+        try:
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                config.update(raw)
+        except Exception:
+            print(f"ERROR: Failed to parse config: {CONFIG_FILE}", file=sys.stderr)
+            raise SystemExit(1)
+
+    return config
+
+
+def ensure_config_exists() -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not CONFIG_FILE.exists():
+        save_config(DEFAULT_CONFIG.copy())
+
+
+def load_config() -> dict[str, Any]:
+    ensure_config_exists()
+    return merged_config()
+
+
+def save_config(config: dict[str, Any]) -> None:
+    merged = DEFAULT_CONFIG.copy()
+    merged.update(config)
+
+    CONFIG_FILE.write_text(
+        json.dumps(merged, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def prompt_config_value(
+    config: dict[str, Any],
+    key: str,
+    label: str,
+    cast: type | None = None,
+) -> None:
+    current = config.get(key)
+    value = input(f"{label} [{current}]: ").strip()
+
+    if not value:
+        return
+
+    try:
+        config[key] = cast(value) if cast else value
+    except Exception:
+        print(f"WARNING: Invalid value for {key}; keeping existing value.")
+
+
+def init_config_interactive() -> None:
+    ensure_config_exists()
+    config = load_config()
+
+    print(f"Config file: {CONFIG_FILE}")
+    print()
+
+    prompt_config_value(config, "model", "Model")
+    prompt_config_value(config, "api_key", "API key")
+    prompt_config_value(config, "openai_base_url", "Base URL")
+    prompt_config_value(config, "openai_project", "Project name or ID")
+    prompt_config_value(config, "service_tier", "Service tier")
+
+    prompt_config_value(config, "system_prompt", "System prompt")
+    prompt_config_value(config, "temperature", "Temperature", float)
+    prompt_config_value(config, "top_p", "Top P", float)
+    prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
+    prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
+
+    save_config(config)
+
+    print()
+    print("Configuration saved.")
+
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
+def number_lines(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return ""
+
+    width = len(str(len(lines)))
+    return "\n".join(f"{i:0{width}d}: {line}" for i, line in enumerate(lines, start=1))
+
+
+def estimate_request_tokens(model: str, system_prompt: str, user_prompt: str) -> int:
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except Exception:
+        encoding = tiktoken.get_encoding("o200k_base")
+
+    request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+    return len(encoding.encode(request_text))
+
+
+def usage_to_dict(usage: Any) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if hasattr(usage, "dict"):
+        return usage.dict()
+    return {"raw": str(usage)}
+
+
+def print_stats(
+    *,
+    request_tokens: int,
+    response_text: str,
+    usage: dict[str, Any] | None = None,
+) -> None:
+    print("\n--- stats ---", file=sys.stderr)
+    print(f"request_tokens_estimate: {request_tokens}", file=sys.stderr)
+    print(f"response_characters: {len(response_text)}", file=sys.stderr)
+
+    if usage is not None:
+        print("openai_usage:", file=sys.stderr)
+        print(json.dumps(usage, indent=2, ensure_ascii=False), file=sys.stderr)
+
+
+def coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def read_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return f"[ERROR READING FILE: {path}]\n{exc}"
+
+
+def build_context(
+    file_paths: list[Path],
+    max_file_size_kb: int,
+) -> str:
+    sections = []
+    max_bytes = max_file_size_kb * 1024
+
+    for path in file_paths:
+        if not path.exists():
+            sections.append(f"[MISSING FILE: {path}]")
+            continue
+
+        if path.stat().st_size > max_bytes:
+            sections.append(
+                f"[SKIPPED LARGE FILE: {path} ({path.stat().st_size} bytes)]"
+            )
+            continue
+
+        content = read_file(path)
+        numbered_content = number_lines(content)
+
+        sections.append(
+            f"""
+---
+- path: {path}
+---
+{numbered_content}
+""".strip()
+        )
+
+    return "\n\n".join(sections)
+
+
+def load_json_schema(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("Schema file must contain a JSON object")
+        return raw
+    except Exception as exc:
+        print(f"ERROR: Failed to load JSON schema: {path}\n{exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def pretty_json(raw: str) -> str:
+    try:
+        return json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+    except Exception:
+        return raw
+
+
+# -------------------------------------------------------------------
+# Prompting
+# -------------------------------------------------------------------
+
+def build_user_prompt(
+    task: str,
+    context: str,
+    response_format: str = "text",
+    json_schema: dict[str, Any] | None = None,
+) -> str:
+    schema_block = ""
+
+    if response_format == "schema" and json_schema is not None:
+        schema_block = (
+            "\n\nReturn ONLY valid JSON that matches this schema exactly:\n"
+            f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}"
+        )
+
+    return f"""
+TASK:
+{task}
+
+PROJECT CONTEXT:
+{context}
+{schema_block}
+""".strip()
+
+
+# -------------------------------------------------------------------
+# OpenAI-compatible request
+# -------------------------------------------------------------------
+
+def call_openai(
+    api_key: str,
+    base_url: str,
+    project: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    response_format: str = "text",
+    json_schema: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_output_tokens: int | None = None,
+    service_tier: str | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        project=project or None,
+    )
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "instructions": system_prompt,
+        "input": user_prompt,
+    }
+
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+
+    if max_output_tokens is not None:
+        kwargs["max_output_tokens"] = max_output_tokens
+
+    if service_tier:
+        kwargs["service_tier"] = service_tier
+
+    if response_format == "json":
+        kwargs["text"] = {"format": {"type": "json_object"}}
+    elif response_format == "schema":
+        if not json_schema:
+            raise ValueError("--response-format schema requires --schema-file")
+
+        kwargs["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "single_shot_output",
+                "schema": json_schema,
+                "strict": True,
+            }
+        }
+
+    response = client.responses.create(**kwargs)
+    return response.output_text, usage_to_dict(getattr(response, "usage", None))
+
+
+def call_llm(
+    api_key: str,
+    openai_base_url: str,
+    openai_project: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    response_format: str = "text",
+    json_schema: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_output_tokens: int | None = None,
+    service_tier: str | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    return call_openai(
+        api_key=api_key,
+        base_url=openai_base_url,
+        project=openai_project,
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        response_format=response_format,
+        json_schema=json_schema,
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=max_output_tokens,
+        service_tier=service_tier,
+    )
+
+
+# -------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Single-shot AI assistant with file context"
+    )
+
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Initialize ~/.local/state/mince/config.json",
+    )
+
+    parser.add_argument("--task", help="Task/prompt for the model")
+
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        help="Files to include as context",
+    )
+
+    parser.add_argument(
+        "--system-prompt",
+        help="System prompt override",
+    )
+
+    parser.add_argument(
+        "--model",
+        help="Override configured model",
+    )
+
+    parser.add_argument(
+        "--openai-base-url",
+        help="OpenAI-compatible API base URL",
+    )
+
+    parser.add_argument(
+        "--openai-project",
+        help="Optional project name or ID",
+    )
+
+    parser.add_argument(
+        "--service-tier",
+        help="OpenAI service tier (auto, flex, default)",
+    )
+
+    parser.add_argument(
+        "--response-format",
+        choices=("text", "json", "schema"),
+        default="text",
+        help="text = normal output, json = valid JSON, schema = structured JSON Schema",
+    )
+
+    parser.add_argument(
+        "--schema-file",
+        type=Path,
+        help="Path to a JSON Schema file (required for --response-format schema)",
+    )
+
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Sampling temperature",
+    )
+
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        help="Top-p nucleus sampling",
+    )
+
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        help="Maximum output tokens",
+    )
+
+    return parser.parse_args()
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
+def main() -> int:
+    args = parse_args()
+
+    if args.init:
+        init_config_interactive()
+        return 0
+
+    if not args.task:
+        print("ERROR: --task is required", file=sys.stderr)
+        return 1
+
+    if not args.files:
+        print("ERROR: --files is required", file=sys.stderr)
+        return 1
+
+    config = load_config()
+
+    model = str(args.model or config.get("model", "gpt-5.5")).strip()
+    openai_base_url = str(
+        args.openai_base_url
+        or config.get("openai_base_url", "https://api.openai.com/v1")
+    ).strip()
+
+    openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
+    system_prompt = str(args.system_prompt or config.get("system_prompt", "")).strip()
+
+    temperature = (
+        args.temperature
+        if args.temperature is not None
+        else config.get("temperature")
+    )
+
+    top_p = args.top_p if args.top_p is not None else config.get("top_p")
+
+    max_output_tokens = (
+        args.max_output_tokens
+        if args.max_output_tokens is not None
+        else config.get("max_output_tokens")
+    )
+
+    service_tier = str(args.service_tier or config.get("service_tier", "auto")).strip()
+    response_format: str = args.response_format or str(config.get("response_format", "text"))
+
+    json_schema: dict[str, Any] | None = None
+    if response_format == "schema":
+        if not args.schema_file:
+            print(
+                "ERROR: --schema-file is required when --response-format schema",
+                file=sys.stderr,
+            )
+            return 1
+        json_schema = load_json_schema(args.schema_file)
+    elif args.schema_file:
+        print(
+            "ERROR: --schema-file only applies to --response-format schema",
+            file=sys.stderr,
+        )
+        return 1
+
+    api_key = str(config.get("api_key", "")).strip()
+    if not api_key:
+        print(f"ERROR: api_key missing in {CONFIG_FILE}", file=sys.stderr)
+        print()
+        print("Run:")
+        print("  single_shot_llm.py --init")
+        return 1
+
+    max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
+    file_paths = [Path(f).resolve() for f in args.files]
+
+    context = build_context(file_paths=file_paths, max_file_size_kb=max_file_size_kb)
+
+    user_prompt = build_user_prompt(
+        task=args.task,
+        context=context,
+        response_format=response_format,
+        json_schema=json_schema,
+    )
+
+    request_tokens = estimate_request_tokens(
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+
+    print(f"REQUEST TOKENS ESTIMATE: {request_tokens}", file=sys.stderr)
+
+    try:
+        result, usage = call_llm(
+            api_key=api_key,
+            openai_base_url=openai_base_url,
+            openai_project=openai_project,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_format=response_format,
+            json_schema=json_schema,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            service_tier=service_tier,
+        )
+    except Exception as exc:
+        print(f"OpenAI API error: {exc}", file=sys.stderr)
+        return 1
+
+    if response_format in ("json", "schema"):
+        result = pretty_json(result)
+
+    print(result)
+    print_stats(
+        request_tokens=request_tokens,
+        response_text=result,
+        usage=usage,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
