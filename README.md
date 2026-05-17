@@ -36,13 +36,13 @@ This creates `~/.local/state/mince/config.json`.
 ## Basic usage 💡
 
 ```bash
-mince --task "Summarize this project" --files "README.md src/main.py"
+mince --task "Summarize this project" --files README.md src/main.py
 ```
 
 ```bash
 mince --system-prompt "You are a senior engineering reviewer." \
   --task "Review the deployment flow" \
-  --files "docker-compose.yml deploy.py"
+  --files docker-compose.yml deploy.py
 ```
 
 ```bash
@@ -127,6 +127,7 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make uninstall-global` | Deletes the global install and the associated state directory. | — |
 | `make update-global` | Refreshes a global install – identical to *update‑user* but with `sudo`. | Same as *install‑global* |
 | `make update` | Auto‑detects whether a **user** or **global** install exists and runs the appropriate update target. | — |
+| `make install` | Alias for `install-user` | — |
 | `make shell` | Drops you into a Bash shell with the correct virtual‑env activated (`source …/bin/activate`). Handy for debugging or ad‑hoc runs. | — |
 | `make help` | Prints this table and a short description of each target. | — |
 

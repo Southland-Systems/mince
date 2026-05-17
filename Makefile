@@ -18,7 +18,7 @@ ifeq ($(shell id -u),0)
 SUDO :=
 endif
 
-.PHONY: install-user uninstall-user update-user install-global uninstall-global update-global update help
+.PHONY: install-user uninstall-user update-user install-global uninstall-global update-global update help shell
 
 help:
 	@printf '%s\n' \
@@ -105,6 +105,8 @@ update-global:
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 		$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 	fi
+
+install: install-user
 
 update:
 	@set -eu; \
