@@ -34,9 +34,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "openai_project": "",
-    "service_tier": "auto",
+    "service_tier": "default",
     "system_prompt": (
-        "You are a concise and technically accurate software engineering assistant."
+        "You are a concise and technically accurate software engineering assistant. Output in formatted plain text unless instructed otherwise."
     ),
     "temperature": 1.0,
     "top_p": 1.0,
@@ -367,6 +367,9 @@ def call_llm(
         top_p=top_p,
         max_output_tokens=max_output_tokens,
         service_tier=service_tier,
+        presence_penalty=0,
+        frequency_penalty=0,
+        seed=42,
     )
 
 
@@ -376,13 +379,7 @@ def call_llm(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Single-shot AI assistant with file context"
-    )
-
-    parser.add_argument(
-        "--init",
-        action="store_true",
-        help="Initialize ~/.local/state/mince/config.json",
+        description="MinCE: read-only one-shot AI assistant for text files"
     )
 
     parser.add_argument("--task", help="Task/prompt for the model")
@@ -392,6 +389,13 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help="Files to include as context",
     )
+
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Initialize and interactively change the configuration file",
+    )
+
 
     parser.add_argument(
         "--system-prompt",
@@ -464,7 +468,7 @@ def main() -> int:
         return 0
 
     if not args.task:
-        print("ERROR: --task is required", file=sys.stderr)
+        print("ERROR: --help or --task and --files are required", file=sys.stderr)
         return 1
 
     if not args.files:
