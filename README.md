@@ -33,7 +33,8 @@ cd mince
 make uninstall-user
 
 # Manual install
-(cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince && pip install -U -r requirements.txt)
+(cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince \
+  && pip install -U -r requirements.txt)
 ```
 
 ## First run 🚀

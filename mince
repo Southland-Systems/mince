@@ -32,7 +32,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ),
     "temperature": 1.0,
     "top_p": 1.0,
-#    "top_logprobs": 20,
     "openai_reasoning": "high",
     "max_output_tokens": 65534,
     "max_file_size_kb": 512,
@@ -121,7 +120,6 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
     prompt_config_value(config, "top_p", "Top P (0.0-1.0)", float)
-#    prompt_config_value(config, "top_logprobs", "Top Logprobs (0-20)", int)
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
@@ -308,7 +306,6 @@ def call_openai(
     top_p: float | None = None,
     max_output_tokens: int | None = None,
     openai_service_tier: str | None = None,
-    top_logprobs: int | None = None,
     openai_reasoning: str | None = None,
     llm_timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
@@ -332,9 +329,6 @@ def call_openai(
 
     if top_p is not None:
         kwargs["top_p"] = top_p
-
-    if top_logprobs is not None:
-        kwargs["top_logprobs"] = top_logprobs
 
     if openai_reasoning is not None:
         kwargs["reasoning"] = {"effort": openai_reasoning}
@@ -378,7 +372,6 @@ def call_llm(
     top_p: float | None = None,
     max_output_tokens: int | None = None,
     openai_service_tier: str | None = None,
-    top_logprobs: int | None = None,
     openai_reasoning: str | None = None,
     llm_timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
@@ -396,7 +389,6 @@ def call_llm(
         top_p=top_p,
         max_output_tokens=max_output_tokens,
         openai_service_tier=openai_service_tier,
-        top_logprobs=top_logprobs,
         openai_reasoning=openai_reasoning,
         llm_timeout=llm_timeout,
    )
@@ -482,12 +474,6 @@ def parse_args() -> argparse.Namespace:
         help="Top-p nucleus sampling (0.0-1.0)",
     )
 
-#    parser.add_argument(
-#        "--top-logprobs",
-#        type=int,
-#        help="Number of top logprobs to return (0‑20)",
-#    )
-
     parser.add_argument(
         "--openai-reasoning",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),
@@ -561,12 +547,6 @@ def main() -> int:
         else config.get("max_output_tokens")
     )
 
-    top_logprobs = (
-        args.top_logprobs
-        if args.top_logprobs is not None
-        else config.get("top_logprobs")
-    )
-
     openai_reasoning = (
         args.openai_reasoning
         if args.openai_reasoning is not None
@@ -629,7 +609,7 @@ def main() -> int:
     request_characters = len(full_system_prompt + user_prompt)
 
     if not args.quiet:
-        print(f"request_token_estimate={request_tokens} request_characters={request_characters}", file=sys.stderr)
+        print(f"request_tokens_estimate={request_tokens} request_characters={request_characters}", file=sys.stderr)
 
     try:
         response_obj, usage = call_llm(
@@ -646,7 +626,6 @@ def main() -> int:
             top_p=top_p,
             max_output_tokens=max_output_tokens,
             openai_service_tier=openai_service_tier,
-            top_logprobs=top_logprobs,
             openai_reasoning=openai_reasoning,
             llm_timeout=llm_timeout,
         )
