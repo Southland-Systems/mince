@@ -150,13 +150,6 @@ def init_config_interactive() -> None:
 # Helpers
 # -------------------------------------------------------------------
 
-def extract_reasoning(response: Any) -> str:
-    if hasattr(response, "reasoning"):
-        try:
-            return response.reasoning or ""
-        except Exception:
-            return ""
-
 def number_lines(text: str) -> str:
     lines = text.splitlines()
     if not lines:
@@ -404,7 +397,7 @@ def call_openai(
         kwargs["top_p"] = top_p
 
     if openai_reasoning is not None:
-        kwargs["reasoning"] = {"effort": openai_reasoning}
+        kwargs["reasoning"] = {"effort": openai_reasoning, "summary": "detailed"}
 
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
@@ -732,9 +725,13 @@ def main() -> int:
         result = pretty_json(result)
 
     if args.print_reasoning:
-        reasoning = extract_reasoning(response_obj)
-        print(f"<reasoning>{reasoning}</reasoning>")
-        print(f"<response>{result}</response>")
+        for item in getattr(response_obj, "output", []):
+            if getattr(item, "type", None) == "reasoning":
+                for content in getattr(item, "content", []):
+                    if getattr(content, "type", None) == "reasoning_text":
+                        reasoning = getattr(content, "text", "")
+        print(f"<reasoning>\n{reasoning}\n</reasoning>")
+        print(f"<response>\n{result}\n</response>")
     else:
         print(result)
 
@@ -745,6 +742,8 @@ def main() -> int:
             response_text=result,
             usage=usage,
         )
+# TODO debugging response
+#    print(json.dumps(response_obj.model_dump(), indent=2))
 
     return 0
 
