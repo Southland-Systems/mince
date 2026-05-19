@@ -132,6 +132,32 @@ mince --openai-base-url http://localhost:11434/v1 \
 - Binary files are not supported.
 - JSON Schema mode is best when you need machine‑readable output.
 
+## Command line arguments 📋
+
+All the `mince` cli arguments for reference.
+
+| Argument                | Description |
+|-------------------------|-------------|
+| `--task`                | Task/prompt for the model. |
+| `--files`               | Files to include as context. |
+| `--init`                | Initialize and interactively change the configuration file. |
+| `--system-prompt`       | System prompt override. |
+| `--model`               | Override configured model. |
+| `--openai-base-url`     | OpenAI‑compatible API base URL. |
+| `--openai-organization` | Optional OpenAI organization ID. |
+| `--openai-project`      | Optional project name or ID. |
+| `--openai-service-tier` | OpenAI service tier (`auto`, `default`, `flex`, `scale`, `priority`). |
+| `--response-format`     | Output format: `text` (default), `json`, or `schema`. |
+| `--schema-file`         | Path to a JSON Schema file (required for `--response-format schema`). |
+| `--temperature`         | Sampling temperature (0.0‑2.0). |
+| `--top-p`               | Top‑p nucleus sampling (0.0‑1.0). |
+| `--openai-reasoning`    | Reasoning effort level (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`). |
+| `--token-limit`         | Maximum allowed input token count. |
+| `--max-output-tokens`   | Maximum output tokens the LLM will use. |
+| `--llm-timeout`         | Timeout in seconds for the API call. |
+| `--print-reasoning`     | Output the reasoning monolog in `<reasoning>` tags with the content in `<response>` tags. |
+| `--quiet`               | Suppress printing of extra output (stats, information). |
+
 ## Make targets 🚀
 
 The project ships with a tiny **Makefile** that handles both *user* and *system‑wide* installations.
@@ -149,4 +175,9 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make install` | Alias for `install-user` | — |
 | `make shell` | Drops you into a Bash shell with the correct virtual‑env activated (`source …/bin/activate`). Handy for debugging or ad‑hoc runs. | — |
 | `make help` | Prints this table and a short description of each target. | — |
+
+## License and Copyright 📄
+
+This project is licensed under the **Apache License, Version 2.0**.
+© Southland Systems
 

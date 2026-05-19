@@ -765,6 +765,7 @@ rv = 0
 try:
     rv = main()
 except KeyboardInterrupt:
+    print(f"\nStopped.", file=sys.stderr)
     sys.exit(130)
 except Exception as e:
     print(e, file=sys.stderr)
