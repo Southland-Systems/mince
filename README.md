@@ -134,7 +134,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 
 ## Command line arguments 📋
 
-All the `mince` cli arguments for reference.
+All the `mince` CLI arguments for reference.
 
 | Argument                | Description |
 |-------------------------|-------------|
@@ -163,21 +163,22 @@ All the `mince` cli arguments for reference.
 The project ships with a tiny **Makefile** that handles both *user* and *system‑wide* installations.
 All targets are **idempotent** – running them twice will simply refresh the existing install.
 
-| Target | What it does | Where it puts the files |
-|--------|--------------|------------------------|
-| `make install-user` | Creates a per‑user virtual‑env under `~/.local/share/mince`, installs the Python dependencies, copies the `mince` script, and drops a tiny launcher into `~/.local/bin/mince`. | `~/.local/share/mince/.venv` + `~/.local/bin/mince` |
-| `make uninstall-user` | Removes the user‑local install (launcher, virtual‑env and state directory). | — |
-| `make update-user` | Re‑copies the script, upgrades the virtual‑env’s `pip` and the core packages (`openai`, `tiktoken`). | Same as *install‑user* |
-| `make install-global` | Performs the same steps as *install‑user* but under `/opt/mince` (code) and `/usr/local/bin/mince` (launcher).  Uses `sudo` when needed. | `/opt/mince/.venv` + `/usr/local/bin/mince` |
-| `make uninstall-global` | Deletes the global install and the associated state directory. | — |
-| `make update-global` | Refreshes a global install – identical to *update‑user* but with `sudo`. | Same as *install‑global* |
-| `make update` | Auto‑detects whether a **user** or **global** install exists and runs the appropriate update target. | — |
-| `make install` | Alias for `install-user` | — |
-| `make shell` | Drops you into a Bash shell with the correct virtual‑env activated (`source …/bin/activate`). Handy for debugging or ad‑hoc runs. | — |
-| `make help` | Prints this table and a short description of each target. | — |
+| Target | What it does |
+|--------|--------------|
+| `make install-user` | Creates a per‑user virtual‑env under `~/.local/share/mince`, installs the Python dependencies, copies the `mince` script, and drops a tiny launcher into `~/.local/bin/mince`. |
+| `make uninstall-user` | Removes the user‑local install (launcher, virtual‑env and state directory). |
+| `make update-user` | Re‑copies the script, upgrades the virtual‑env’s `pip` and the core packages (`openai`, `tiktoken`). |
+| `make install-global` | Performs the same steps as *install‑user* but under `/opt/mince` (code) and `/usr/local/bin/mince` (launcher).  Uses `sudo` when needed. |
+| `make uninstall-global` | Deletes the global install and the associated state directory. |
+| `make update-global` | Refreshes a global install – identical to *update‑user* but with `sudo`. |
+| `make update` | Auto‑detects whether a **user** or **global** install exists and runs the appropriate update target. |
+| `make install` | Alias for `install-user` |
+| `make shell` | Drops you into a Bash shell with the correct virtual‑env activated (`source …/bin/activate`). Handy for debugging or ad‑hoc runs. |
+| `make help` | Prints this table and a short description of each target. |
 
 ## License and Copyright 📄
 
-This project is licensed under the **Apache License, Version 2.0**.
-© Southland Systems
+This project is licensed under the **Apache-2.0 License**.
+
+© 2026 Southland Systems, Ontario, Canada.
 
