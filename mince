@@ -24,6 +24,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.5",
     "api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
+    "openai_organization": "",
     "openai_project": "",
     "openai_service_tier": "auto",
     "system_prompt": (
@@ -31,11 +32,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ),
     "temperature": 1.0,
     "top_p": 1.0,
-    "top_logprobs": 20,
+#    "top_logprobs": 20,
     "openai_reasoning": "high",
     "max_output_tokens": 65534,
     "max_file_size_kb": 512,
     "response_format": "text",
+    "llm_timeout": 300,
 }
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -113,12 +115,13 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key")
     prompt_config_value(config, "openai_base_url", "OpenAI-compatible Base URL")
+    prompt_config_value(config, "openai_organization", "Organization name or ID")
     prompt_config_value(config, "openai_project", "Project name or ID")
     prompt_config_value(config, "openai_service_tier", "Service tier")
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
     prompt_config_value(config, "top_p", "Top P (0.0-1.0)", float)
-    prompt_config_value(config, "top_logprobs", "Top Logprobs (0-20)", int)
+#    prompt_config_value(config, "top_logprobs", "Top Logprobs (0-20)", int)
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
@@ -126,7 +129,7 @@ def init_config_interactive() -> None:
     save_config(config)
 
     print()
-    print("Configuration saved.")
+    print(f"Configuration saved.")
 
 
 # -------------------------------------------------------------------
@@ -292,12 +295,13 @@ PROJECT CONTEXT:
 # -------------------------------------------------------------------
 
 def call_openai(
-    api_key: str,
-    openai_base_url: str,
-    openai_project: str,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
+    api_key: str = "",
+    openai_base_url: str = "",
+    openai_organization: str = "",
+    openai_project: str = "",
+    model: str = "",
+    system_prompt: str = "",
+    user_prompt: str = "",
     response_format: str = "text",
     json_schema: dict[str, Any] | None = None,
     temperature: float | None = None,
@@ -306,13 +310,14 @@ def call_openai(
     openai_service_tier: str | None = None,
     top_logprobs: int | None = None,
     openai_reasoning: str | None = None,
+    llm_timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     client = OpenAI(
         api_key=api_key,
         base_url=openai_base_url,
         project=openai_project or None,
-        organization=None,
-        timeout=300,
+        organization=openai_organization or None,
+        timeout=llm_timeout if llm_timeout is not None else 300,
         max_retries=1,
     )
 
@@ -360,12 +365,13 @@ def call_openai(
 
 
 def call_llm(
-    api_key: str,
-    openai_base_url: str,
-    openai_project: str,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
+    api_key: str = "",
+    openai_base_url: str = "",
+    openai_organization: str = "",
+    openai_project: str = "",
+    model: str = "",
+    system_prompt: str = "",
+    user_prompt: str = "",
     response_format: str = "text",
     json_schema: dict[str, Any] | None = None,
     temperature: float | None = None,
@@ -374,10 +380,12 @@ def call_llm(
     openai_service_tier: str | None = None,
     top_logprobs: int | None = None,
     openai_reasoning: str | None = None,
+    llm_timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     return call_openai(
         api_key=api_key,
         openai_base_url=openai_base_url,
+        openai_organization=openai_organization,
         openai_project=openai_project,
         model=model,
         system_prompt=system_prompt,
@@ -390,6 +398,7 @@ def call_llm(
         openai_service_tier=openai_service_tier,
         top_logprobs=top_logprobs,
         openai_reasoning=openai_reasoning,
+        llm_timeout=llm_timeout,
    )
 
 
@@ -433,6 +442,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--openai-organization",
+        help="Optional OpenAI organization ID",
+    )
+
+    parser.add_argument(
         "--openai-project",
         help="Optional project name or ID",
     )
@@ -468,11 +482,11 @@ def parse_args() -> argparse.Namespace:
         help="Top-p nucleus sampling (0.0-1.0)",
     )
 
-    parser.add_argument(
-        "--top-logprobs",
-        type=int,
-        help="Number of top logprobs to return (0‑20)",
-    )
+#    parser.add_argument(
+#        "--top-logprobs",
+#        type=int,
+#        help="Number of top logprobs to return (0‑20)",
+#    )
 
     parser.add_argument(
         "--openai-reasoning",
@@ -484,6 +498,12 @@ def parse_args() -> argparse.Namespace:
         "--max-output-tokens",
         type=int,
         help="Maximum output tokens",
+    )
+
+    parser.add_argument(
+        "--llm-timeout",
+        type=int,
+        help="Timeout in seconds for API calls (default 300)",
     )
 
     parser.add_argument(
@@ -522,11 +542,8 @@ def main() -> int:
     config = load_config()
 
     model = str(args.model or config.get("model")).strip()
-    openai_base_url = str(
-        args.openai_base_url
-        or config.get("openai_base_url")
-    ).strip()
-
+    openai_base_url = str(args.openai_base_url or config.get("openai_base_url")).strip()
+    openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
     openai_project = str(args.openai_project or config.get("openai_project")).strip()
     system_prompt = str(args.system_prompt or config.get("system_prompt")).strip()
 
@@ -554,6 +571,12 @@ def main() -> int:
         args.openai_reasoning
         if args.openai_reasoning is not None
         else config.get("openai_reasoning")
+    )
+
+    llm_timeout = (
+        args.llm_timeout
+        if args.llm_timeout is not None
+        else config.get("llm_timeout", 300)
     )
 
     openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "auto")).strip()
@@ -612,6 +635,7 @@ def main() -> int:
         response_obj, usage = call_llm(
             api_key=api_key,
             openai_base_url=openai_base_url,
+            openai_organization=openai_organization,
             openai_project=openai_project,
             model=model,
             system_prompt=full_system_prompt,
@@ -624,6 +648,7 @@ def main() -> int:
             openai_service_tier=openai_service_tier,
             top_logprobs=top_logprobs,
             openai_reasoning=openai_reasoning,
+            llm_timeout=llm_timeout,
         )
     except Exception as exc:
         print(f"OpenAI API error: {exc}", file=sys.stderr)

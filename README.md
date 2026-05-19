@@ -6,13 +6,12 @@
 - Reads one or more local files as context
 - Sends a single request to an OpenAI‑compatible model endpoint
 - Supports plain text, JSON, and JSON Schema outputs
-- Stores your settings in a local config file
 - Works with hosted APIs and local OpenAI‑compatible servers
 - Prefix line numbers to content for improved LLM understanding
 
 ## Requirements 📦
 
-- `python` 3.11 or newer and the `pip` package manager
+- `python` 3.9 or newer and the `pip` package manager
 - `make` from GNU Make or compatible for a managed installation
 - Network access to your chosen OpenAI-compatible endpoint
 - An API key for the endpoint
@@ -34,7 +33,7 @@ cd mince
 make uninstall-user
 
 # Manual install
-cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince
+(cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince && pip install -U -r requirements.txt)
 ```
 
 ## First run 🚀
@@ -71,7 +70,9 @@ mince --response-format schema \
 ```
 
 ```bash
-mince --task "Add single-user locking to the provided script. Only output the whole script with any changes. Add commented notes at the end." \
+mince --task "Add single-user locking to the provided script. \
+Only output the whole script with any changes. \
+Add commented notes at the end." \
   --files taskedit.py >taskedit-new.py
 ```
 
@@ -87,6 +88,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 
 ## Use cases 🎯
 
+- Generate source code patches and whole re-writes
 - Summarize a repository from a handful of files
 - Explain what a legacy script is doing
 - Turn meeting notes into a clean recap
