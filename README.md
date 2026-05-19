@@ -40,7 +40,7 @@ cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince
 ## First run 🚀
 
 ```bash
-make init
+mince --init
 ```
 
 This creates `~/.local/state/mince/config.json`.
