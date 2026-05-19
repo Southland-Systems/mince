@@ -4,15 +4,6 @@ mince
 
 A small, single-command assistant for turning local files into useful answers.
 
-Features:
-- Reads one or more files as context
-- Sends a single request to an OpenAI-compatible model endpoint
-- Stores settings in ~/.local/state/mince/config.json
-- Supports an optional system prompt
-- Supports plain text, JSON, and JSON Schema outputs
-- Auto-creates its config directory and file
-- Works with local OpenAI-compatible endpoints too
-  (for example, set base_url to http://address:11434/v1)
 """
 
 from __future__ import annotations
@@ -34,16 +25,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "openai_project": "",
-    "service_tier": "default",
+    "openai_service_tier": "auto",
     "system_prompt": (
         "You are a concise and technically accurate software engineering assistant. Output in formatted plain text unless instructed otherwise."
     ),
     "temperature": 1.0,
     "top_p": 1.0,
+    "top_logprobs": 20,
+    "openai_reasoning": "high",
     "max_output_tokens": 65534,
     "max_file_size_kb": 512,
     "response_format": "text",
 }
+
+DEFAULT_SYSTEM_PROMPT = """
+The provided files are prefixed with line numbers (example: '1 ').
+Do not include the line numbers when responding or completing a task.
+"""
 
 
 # -------------------------------------------------------------------
@@ -114,13 +112,14 @@ def init_config_interactive() -> None:
 
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key")
-    prompt_config_value(config, "openai_base_url", "Base URL")
+    prompt_config_value(config, "openai_base_url", "OpenAI-compatible Base URL")
     prompt_config_value(config, "openai_project", "Project name or ID")
-    prompt_config_value(config, "service_tier", "Service tier")
-
+    prompt_config_value(config, "openai_service_tier", "Service tier")
     prompt_config_value(config, "system_prompt", "System prompt")
-    prompt_config_value(config, "temperature", "Temperature", float)
-    prompt_config_value(config, "top_p", "Top P", float)
+    prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
+    prompt_config_value(config, "top_p", "Top P (0.0-1.0)", float)
+    prompt_config_value(config, "top_logprobs", "Top Logprobs (0-20)", int)
+    prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
 
@@ -134,13 +133,19 @@ def init_config_interactive() -> None:
 # Helpers
 # -------------------------------------------------------------------
 
+def extract_reasoning(response: Any) -> str:
+    try:
+        return response.choices[0].message.reasoning or ""
+    except Exception:
+        return ""
+
 def number_lines(text: str) -> str:
     lines = text.splitlines()
     if not lines:
         return ""
 
     width = len(str(len(lines)))
-    return "\n".join(f"{i:0{width}d}: {line}" for i, line in enumerate(lines, start=1))
+    return "\n".join(f"{i} {line}" for i, line in enumerate(lines, start=1))
 
 
 def estimate_request_tokens(model: str, system_prompt: str, user_prompt: str) -> int:
@@ -167,11 +172,13 @@ def usage_to_dict(usage: Any) -> dict[str, Any] | None:
 
 def print_stats(
     *,
+    request_characters: int,
     request_tokens: int,
     response_text: str,
     usage: dict[str, Any] | None = None,
 ) -> None:
     stats: list[str] = [
+        f"request_characters={request_characters}",
         f"request_tokens_estimate={request_tokens}",
         f"response_characters={len(response_text)}",
     ]
@@ -224,6 +231,7 @@ def build_context(
         sections.append(
             f"""
 ---
+- lines_numbered: True
 - path: {path}
 ---
 {numbered_content}
@@ -285,8 +293,8 @@ PROJECT CONTEXT:
 
 def call_openai(
     api_key: str,
-    base_url: str,
-    project: str,
+    openai_base_url: str,
+    openai_project: str,
     model: str,
     system_prompt: str,
     user_prompt: str,
@@ -295,12 +303,17 @@ def call_openai(
     temperature: float | None = None,
     top_p: float | None = None,
     max_output_tokens: int | None = None,
-    service_tier: str | None = None,
-) -> tuple[str, dict[str, Any] | None]:
+    openai_service_tier: str | None = None,
+    top_logprobs: int | None = None,
+    openai_reasoning: str | None = None,
+) -> tuple[Any, dict[str, Any] | None]:
     client = OpenAI(
         api_key=api_key,
-        base_url=base_url,
-        project=project or None,
+        base_url=openai_base_url,
+        project=openai_project or None,
+        organization=None,
+        timeout=300,
+        max_retries=1,
     )
 
     kwargs: dict[str, Any] = {
@@ -315,11 +328,17 @@ def call_openai(
     if top_p is not None:
         kwargs["top_p"] = top_p
 
+    if top_logprobs is not None:
+        kwargs["top_logprobs"] = top_logprobs
+
+    if openai_reasoning is not None:
+        kwargs["reasoning"] = {"effort": openai_reasoning}
+
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
 
-    if service_tier:
-        kwargs["service_tier"] = service_tier
+    if openai_service_tier:
+        kwargs["service_tier"] = openai_service_tier
 
     if response_format == "json":
         kwargs["text"] = {"format": {"type": "json_object"}}
@@ -337,7 +356,7 @@ def call_openai(
         }
 
     response = client.responses.create(**kwargs)
-    return response.output_text, usage_to_dict(getattr(response, "usage", None))
+    return response, usage_to_dict(getattr(response, "usage", None))
 
 
 def call_llm(
@@ -352,12 +371,14 @@ def call_llm(
     temperature: float | None = None,
     top_p: float | None = None,
     max_output_tokens: int | None = None,
-    service_tier: str | None = None,
-) -> tuple[str, dict[str, Any] | None]:
+    openai_service_tier: str | None = None,
+    top_logprobs: int | None = None,
+    openai_reasoning: str | None = None,
+) -> tuple[Any, dict[str, Any] | None]:
     return call_openai(
         api_key=api_key,
-        base_url=openai_base_url,
-        project=openai_project,
+        openai_base_url=openai_base_url,
+        openai_project=openai_project,
         model=model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -366,11 +387,10 @@ def call_llm(
         temperature=temperature,
         top_p=top_p,
         max_output_tokens=max_output_tokens,
-        service_tier=service_tier,
-        presence_penalty=0,
-        frequency_penalty=0,
-        seed=42,
-    )
+        openai_service_tier=openai_service_tier,
+        top_logprobs=top_logprobs,
+        openai_reasoning=openai_reasoning,
+   )
 
 
 # -------------------------------------------------------------------
@@ -382,12 +402,12 @@ def parse_args() -> argparse.Namespace:
         description="MinCE: read-only one-shot AI assistant for text files"
     )
 
-    parser.add_argument("--task", help="Task/prompt for the model")
+    parser.add_argument("--task", help="Task/prompt for the model (required)")
 
     parser.add_argument(
         "--files",
         nargs="+",
-        help="Files to include as context",
+        help="Files to include as context (required)",
     )
 
     parser.add_argument(
@@ -418,8 +438,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--service-tier",
-        help="OpenAI service tier (auto, flex, default)",
+        "--openai-service-tier",
+        choices=("auto", "default", "flex", "scale", "priority"),
+        help="OpenAI service tier",
     )
 
     parser.add_argument(
@@ -438,19 +459,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temperature",
         type=float,
-        help="Sampling temperature",
+        help="Sampling temperature (0.0-2.0)",
     )
 
     parser.add_argument(
         "--top-p",
         type=float,
-        help="Top-p nucleus sampling",
+        help="Top-p nucleus sampling (0.0-1.0)",
+    )
+
+    parser.add_argument(
+        "--top-logprobs",
+        type=int,
+        help="Number of top logprobs to return (0‑20)",
+    )
+
+    parser.add_argument(
+        "--openai-reasoning",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+        help="Reasoning effort level",
     )
 
     parser.add_argument(
         "--max-output-tokens",
         type=int,
         help="Maximum output tokens",
+    )
+
+    parser.add_argument(
+        "--print-reasoning",
+        action="store_true",
+        help="Output the reasoning dialog in <reasoning> tags with the content in <response> tags"
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress printing of extra output (stats, information)",
     )
 
     return parser.parse_args()
@@ -477,14 +521,14 @@ def main() -> int:
 
     config = load_config()
 
-    model = str(args.model or config.get("model", "gpt-5.5")).strip()
+    model = str(args.model or config.get("model")).strip()
     openai_base_url = str(
         args.openai_base_url
-        or config.get("openai_base_url", "https://api.openai.com/v1")
+        or config.get("openai_base_url")
     ).strip()
 
-    openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
-    system_prompt = str(args.system_prompt or config.get("system_prompt", "")).strip()
+    openai_project = str(args.openai_project or config.get("openai_project")).strip()
+    system_prompt = str(args.system_prompt or config.get("system_prompt")).strip()
 
     temperature = (
         args.temperature
@@ -500,7 +544,19 @@ def main() -> int:
         else config.get("max_output_tokens")
     )
 
-    service_tier = str(args.service_tier or config.get("service_tier", "auto")).strip()
+    top_logprobs = (
+        args.top_logprobs
+        if args.top_logprobs is not None
+        else config.get("top_logprobs")
+    )
+
+    openai_reasoning = (
+        args.openai_reasoning
+        if args.openai_reasoning is not None
+        else config.get("openai_reasoning")
+    )
+
+    openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "auto")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
 
     json_schema: dict[str, Any] | None = None
@@ -532,6 +588,8 @@ def main() -> int:
 
     context = build_context(file_paths=file_paths, max_file_size_kb=max_file_size_kb)
 
+    full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
+
     user_prompt = build_user_prompt(
         task=args.task,
         context=context,
@@ -541,42 +599,56 @@ def main() -> int:
 
     request_tokens = estimate_request_tokens(
         model=model,
-        system_prompt=system_prompt,
+        system_prompt=full_system_prompt,
         user_prompt=user_prompt,
     )
 
-    print(f"request_token_estimate: {request_tokens}", file=sys.stderr)
+    request_characters = len(full_system_prompt + user_prompt)
+
+    if not args.quiet:
+        print(f"request_token_estimate={request_tokens} request_characters={request_characters}", file=sys.stderr)
 
     try:
-        result, usage = call_llm(
+        response_obj, usage = call_llm(
             api_key=api_key,
             openai_base_url=openai_base_url,
             openai_project=openai_project,
             model=model,
-            system_prompt=system_prompt,
+            system_prompt=full_system_prompt,
             user_prompt=user_prompt,
             response_format=response_format,
             json_schema=json_schema,
             temperature=temperature,
             top_p=top_p,
             max_output_tokens=max_output_tokens,
-            service_tier=service_tier,
+            openai_service_tier=openai_service_tier,
+            top_logprobs=top_logprobs,
+            openai_reasoning=openai_reasoning,
         )
     except Exception as exc:
         print(f"OpenAI API error: {exc}", file=sys.stderr)
         return 1
 
+    result = getattr(response_obj, "output_text", "")
+
     if response_format in ("json", "schema"):
         result = pretty_json(result)
 
-    print("<response>")
-    print(result)
-    print("</response>")
-    print_stats(
-        request_tokens=request_tokens,
-        response_text=result,
-        usage=usage,
-    )
+    if args.print_reasoning:
+        reasoning = extract_reasoning(response_obj)
+        print(f"<reasoning>{reasoning}</reasoning>")
+        print(f"<response>{result}</response>")
+    else:
+        print(result)
+
+    if not args.quiet:
+        print_stats(
+            request_characters=request_characters,
+            request_tokens=request_tokens,
+            response_text=result,
+            usage=usage,
+        )
+
     return 0
 
 

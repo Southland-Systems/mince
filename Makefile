@@ -29,6 +29,7 @@ help:
 	  '  install-global    Install to /opt/mince and /usr/local/bin/mince' \
 	  '  uninstall-global  Remove the global install' \
 	  '  update-global     Refresh the global install' \
+	  '  install           Alias for install-user' \
 	  '  update            Auto-detect and update whichever install exists' \
 	  '  shell             Start a shell in the installed environment'
 
@@ -60,6 +61,7 @@ update-user:
 		echo "User install not found; running install-user"; \
 		$(MAKE) install-user; \
 	else \
+		git pull; \
 		cp -f "$(SOURCE)" "$(USER_DIR)/$(PROGRAM)"; \
 		chmod 755 "$(USER_DIR)/$(PROGRAM)"; \
 		if [ ! -x "$(USER_VENV)/bin/python" ]; then \
@@ -96,6 +98,7 @@ update-global:
 		echo "Global install not found; running install-global"; \
 		$(MAKE) install-global; \
 	else \
+		git pull; \
 		$(SUDO) cp -f "$(SOURCE)" "$(GLOBAL_DIR)/$(PROGRAM)"; \
 		$(SUDO) chmod 755 "$(GLOBAL_DIR)/$(PROGRAM)"; \
 		if [ ! -x "$(GLOBAL_VENV)/bin/python" ]; then \

@@ -8,12 +8,12 @@
 - Supports plain text, JSON, and JSON Schema outputs
 - Stores your settings in a local config file
 - Works with hosted APIs and local OpenAI‑compatible servers
-- Keeps the setup lightweight and repeatable
+- Prefix line numbers to content for improved LLM understanding
 
 ## Requirements 📦
 
 - `python` 3.11 or newer and the `pip` package manager
-- `make` from GNU Make or compatible
+- `make` from GNU Make or compatible for a managed installation
 - Network access to your chosen OpenAI-compatible endpoint
 - An API key for the endpoint
 - Optional: a local OpenAI‑compatible server
@@ -27,12 +27,14 @@ make install
 
 # Update
 cd mince
-git pull
 make update
 
 # Uninstall
 cd mince
 make uninstall-user
+
+# Manual install
+cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince
 ```
 
 ## First run 🚀
@@ -68,12 +70,17 @@ mince --response-format schema \
   --files notes.md
 ```
 
+```bash
+mince --task "Add single-user locking to the provided script. Only output the whole script with any changes. Add commented notes at the end." \
+  --files taskedit.py >taskedit-new.py
+```
+
 ## Local model servers 🌐
 
 Use any OpenAI‑compatible base URL, including Ollama:
 
 ```bash
-mince --openai-base-url http://address:11434/v1 \
+mince --openai-base-url http://localhost:11434/v1 \
   --task "Summarize the project" \
   --files README.md
 ```
@@ -120,7 +127,7 @@ mince --openai-base-url http://address:11434/v1 \
 ## Notes 🗒️
 
 - Large files are skipped automatically.
-- Binary or unreadable files are handled as safely as possible.
+- Binary files are not supported.
 - JSON Schema mode is best when you need machine‑readable output.
 
 ## Make targets 🚀
