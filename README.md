@@ -2,12 +2,11 @@
 
 ## What it does ✨
 
-- MinCE ensures minimal context by giving you full control for maximum result
 - Reads one or more local files as context
+- Prefix line numbers to content for improved LLM understanding
 - Sends a single request to an OpenAI‑compatible model endpoint
 - Supports plain text, JSON, and JSON Schema outputs
 - Works with hosted APIs and local OpenAI‑compatible servers
-- Prefix line numbers to content for improved LLM understanding
 
 ## Requirements 📦
 

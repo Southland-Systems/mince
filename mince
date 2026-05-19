@@ -12,6 +12,7 @@ import os
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ),
     "temperature": 1.0,
     "top_p": 1.0,
-    "openai_reasoning": "high",
+    "openai_reasoning": "low",
     "token_limit": 65534,
     "max_output_tokens": 65534,
     "max_file_size_kb": 512,
@@ -185,10 +186,12 @@ def print_stats(
     *,
     request_characters: int,
     request_tokens: int,
+    processing_time: float | None = None,
     response_text: str,
     usage: dict[str, Any] | None = None,
 ) -> None:
     stats: list[str] = [
+        f"processing_time={int(processing_time)}s",
         f"request_characters={request_characters}",
         f"request_tokens_estimate={request_tokens}",
         f"response_characters={len(response_text)}",
@@ -199,7 +202,7 @@ def print_stats(
             if key in usage:
                 stats.append(f"llm_{key}={usage[key]}")
 
-    print("stats: " + " ".join(stats), file=sys.stderr)
+    print(" ".join(stats), file=sys.stderr)
 
 
 def coerce_int(value: Any, default: int) -> int:
@@ -292,7 +295,7 @@ def build_user_prompt(
 TASK:
 {task}
 
-PROJECT CONTEXT:
+CONTEXT:
 {context}
 {schema_block}
 """.strip()
@@ -473,11 +476,12 @@ def parse_args() -> argparse.Namespace:
         description="MinCE: read-only one-shot AI assistant for text files"
     )
 
-    parser.add_argument("--task", help="Task/prompt for the model (required)")
+    parser.add_argument("--task", required=True, help="Task/prompt for the model (required)")
 
     parser.add_argument(
         "--files",
         nargs="+",
+        required=True,
         help="Files to include as context (required)",
     )
 
@@ -547,31 +551,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--openai-reasoning",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),
-        help="Reasoning effort level",
+        help="Reasoning effort level (low)",
     )
 
     parser.add_argument(
         "--token-limit",
         type=int,
-        help="Maximum allowed input token count (default 65534)",
+        help="Maximum allowed input token count (65534)",
     )
 
     parser.add_argument(
         "--max-output-tokens",
         type=int,
-        help="Maximum output tokens the LLM will use",
+        help="Maximum output tokens the LLM will use (65534)",
     )
 
     parser.add_argument(
         "--llm-timeout",
         type=int,
-        help="Timeout in seconds for API calls (default 300)",
+        help="Timeout in seconds for the API call (300)",
     )
 
     parser.add_argument(
         "--print-reasoning",
         action="store_true",
-        help="Output the reasoning dialog in <reasoning> tags with the content in <response> tags"
+        help="Output the reasoning monolog in <reasoning> tags with the content in <response> tags"
     )
     parser.add_argument(
         "--quiet",
@@ -594,7 +598,7 @@ def main() -> int:
         return 0
 
     if not args.task:
-        print("ERROR: --help or --task and --files are required", file=sys.stderr)
+        print("ERROR: --task is required", file=sys.stderr)
         return 1
 
     if not args.files:
@@ -606,8 +610,8 @@ def main() -> int:
     model = str(args.model or config.get("model")).strip()
     openai_base_url = str(args.openai_base_url or config.get("openai_base_url")).strip()
     openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
-    openai_project = str(args.openai_project or config.get("openai_project")).strip()
-    system_prompt = str(args.system_prompt or config.get("system_prompt")).strip()
+    openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
+    system_prompt = str(args.system_prompt or config.get("system_prompt", "")).strip()
 
     temperature = (
         args.temperature
@@ -632,7 +636,7 @@ def main() -> int:
     openai_reasoning = (
         args.openai_reasoning
         if args.openai_reasoning is not None
-        else config.get("openai_reasoning", "minimal")
+        else config.get("openai_reasoning", "low")
     )
 
     llm_timeout = (
@@ -695,7 +699,9 @@ def main() -> int:
     request_characters = len(full_system_prompt + user_prompt)
 
     if not args.quiet:
-        print(f"info: request_characters={request_characters} request_tokens_estimate={request_tokens}", file=sys.stderr)
+        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}", file=sys.stderr)
+
+    start_time = time.perf_counter()
 
     try:
         response_obj, usage = call_llm(
@@ -719,6 +725,7 @@ def main() -> int:
         print(f"OpenAI API error: {exc}", file=sys.stderr)
         return 1
 
+    elapsed = time.perf_counter() - start_time
     result = getattr(response_obj, "output_text", "")
 
     if response_format in ("json", "schema"):
@@ -739,14 +746,28 @@ def main() -> int:
         print_stats(
             request_characters=request_characters,
             request_tokens=request_tokens,
+            processing_time=elapsed,
             response_text=result,
             usage=usage,
         )
+
 # TODO debugging response
 #    print(json.dumps(response_obj.model_dump(), indent=2))
 
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# -------------------------------------------------------------------
+# Run
+# -------------------------------------------------------------------
+
+rv = 0
+try:
+    rv = main()
+except KeyboardInterrupt:
+    sys.exit(130)
+except Exception as e:
+    print(e, file=sys.stderr)
+finally:
+    sys.exit(rv)
+
