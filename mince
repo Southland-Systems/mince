@@ -480,16 +480,16 @@ def call_llm(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MinCE: read-only one-shot AI assistant for text files"
+        description="MinCE: read-only single command AI assistant for text files"
     )
-
-    parser.add_argument("--task", help="Task/prompt for the model")
 
     parser.add_argument(
         "--files",
         nargs="+",
         help="Files to include as context",
     )
+
+    parser.add_argument("--task", help="Task/prompt for the model")
 
     parser.add_argument(
         "--init",
@@ -498,7 +498,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--taskfile",
+        "--task-file",
         type=Path,
         help="Read the task/prompt from the given file (--task overrides)",
     )
@@ -624,10 +624,10 @@ def main() -> int:
 
     if args.task:
         task = args.task
-    elif args.taskfile:
-        task = read_file(args.taskfile).strip()
+    elif args.task_file:
+        task = read_file(args.task_file).strip()
     else:
-        print("ERROR: --task or --taskfile required (--help for help)", file=sys.stderr)
+        print("ERROR: --task or --task-file required (--help for help)", file=sys.stderr)
         return 1
 
     if not args.files:

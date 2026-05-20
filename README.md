@@ -181,6 +181,14 @@ All the `mince` CLI arguments for reference.
 | `--print-reasoning`     | Output the reasoning monolog in `<reasoning>` tags with the content in `<response>` tags. |
 | `--quiet`               | Suppress printing of extra output (stats, information). |
 
+Environment variables supported.
+
+| Environment Variable | Description |
+|----------------------|-------------|
+| OPENAI_API_KEY       | OpenAI-compatible API key |
+
+
+
 ## Make targets 🚀
 
 The project ships with a tiny **Makefile** that handles both *user* and *system‑wide* installations.
