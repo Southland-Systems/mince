@@ -30,6 +30,8 @@ from openai import (
     InternalServerError,
     UnprocessableEntityError,
 )
+import httpx
+
 
 APP_DIR = Path.home() / ".local/state/mince"
 CONFIG_FILE = APP_DIR / "config.json"
@@ -38,6 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.5",
     "api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
+    "openai_proxy": "",
     "openai_organization": "",
     "openai_project": "",
     "openai_service_tier": "auto",
@@ -128,6 +131,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)")
     prompt_config_value(config, "openai_base_url", "OpenAI-compatible base URL")
+    prompt_config_value(config, "openai_proxy", "HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)")
     prompt_config_value(config, "openai_organization", "Organization name or ID")
     prompt_config_value(config, "openai_project", "Project name or ID")
     prompt_config_value(config, "openai_service_tier", "Service tier")
@@ -359,6 +363,7 @@ def validate_model(model: str, client: OpenAI) -> None:
 def call_openai(
     api_key: str = "",
     openai_base_url: str = "",
+    openai_proxy: str = "",
     openai_organization: str = "",
     openai_project: str = "",
     model: str = "",
@@ -373,6 +378,10 @@ def call_openai(
     openai_reasoning: str | None = None,
     llm_timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
+    http_client = None
+    if openai_proxy:
+        http_client = httpx.Client(proxy=openai_proxy)
+
     client = OpenAI(
         api_key=api_key,
         base_url=openai_base_url,
@@ -380,6 +389,7 @@ def call_openai(
         organization=openai_organization or None,
         timeout=llm_timeout if llm_timeout is not None else 300,
         max_retries=2,
+        http_client=http_client,
     )
 
 #    validate_model(model, client)
@@ -429,6 +439,7 @@ def call_openai(
 def call_llm(
     api_key: str = "",
     openai_base_url: str = "",
+    openai_proxy: str = "",
     openai_organization: str = "",
     openai_project: str = "",
     model: str = "",
@@ -446,6 +457,7 @@ def call_llm(
     return call_openai(
         api_key=api_key,
         openai_base_url=openai_base_url,
+        openai_proxy=openai_proxy,
         openai_organization=openai_organization,
         openai_project=openai_project,
         model=model,
@@ -471,13 +483,12 @@ def parse_args() -> argparse.Namespace:
         description="MinCE: read-only one-shot AI assistant for text files"
     )
 
-    parser.add_argument("--task", required=True, help="Task/prompt for the model (required)")
+    parser.add_argument("--task", help="Task/prompt for the model")
 
     parser.add_argument(
         "--files",
         nargs="+",
-        required=True,
-        help="Files to include as context (required)",
+        help="Files to include as context",
     )
 
     parser.add_argument(
@@ -486,10 +497,21 @@ def parse_args() -> argparse.Namespace:
         help="Initialize and interactively change the configuration file",
     )
 
+    parser.add_argument(
+        "--taskfile",
+        type=Path,
+        help="Read the task/prompt from the given file (--task overrides)",
+    )
 
     parser.add_argument(
         "--system-prompt",
         help="System prompt override",
+    )
+
+    parser.add_argument(
+        "--system-prompt-file",
+        type=Path,
+        help="Read the system prompt from the given file (--system-prompt overrides)",
     )
 
     parser.add_argument(
@@ -500,6 +522,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--openai-base-url",
         help="OpenAI-compatible API base URL",
+    )
+
+    parser.add_argument(
+        "--openai-proxy",
+        help="HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)",
     )
 
     parser.add_argument(
@@ -586,27 +613,41 @@ def parse_args() -> argparse.Namespace:
 # -------------------------------------------------------------------
 
 def main() -> int:
+    # TODO hardcoded variables
+    tokenizer_padding = 14
+
     args = parse_args()
 
     if args.init:
         init_config_interactive()
         return 0
 
-    if not args.task:
-        print("ERROR: --task is required", file=sys.stderr)
+    if args.task:
+        task = args.task
+    elif args.taskfile:
+        task = read_file(args.taskfile).strip()
+    else:
+        print("ERROR: --task or --taskfile required (--help for help)", file=sys.stderr)
         return 1
 
     if not args.files:
-        print("ERROR: --files is required", file=sys.stderr)
+        print("ERROR: --files required (--help for help)", file=sys.stderr)
         return 1
 
     config = load_config()
 
     model = str(args.model or config.get("model")).strip()
     openai_base_url = str(args.openai_base_url or config.get("openai_base_url")).strip()
+    openai_proxy = str(args.openai_proxy or config.get("openai_proxy", "")).strip()
     openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
     openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
-    system_prompt = str(args.system_prompt or config.get("system_prompt", "")).strip()
+
+    if args.system_prompt:
+        system_prompt = str(args.system_prompt).strip()
+    elif args.system_prompt_file:
+        system_prompt = read_file(args.system_prompt_file).strip()
+    else:
+        system_prompt = str(config.get("system_prompt", "")).strip()
 
     temperature = (
         args.temperature
@@ -675,7 +716,7 @@ def main() -> int:
     full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
 
     user_prompt = build_user_prompt(
-        task=args.task,
+        task=task,
         context=context,
         response_format=response_format,
         json_schema=json_schema,
@@ -686,6 +727,8 @@ def main() -> int:
         system_prompt=full_system_prompt,
         user_prompt=user_prompt,
     )
+
+    request_tokens += tokenizer_padding
 
     if request_tokens > token_limit:
         print(f"ERROR: Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
@@ -702,6 +745,7 @@ def main() -> int:
         response_obj, usage = call_llm(
             api_key=api_key,
             openai_base_url=openai_base_url,
+            openai_proxy=openai_proxy,
             openai_organization=openai_organization,
             openai_project=openai_project,
             model=model,

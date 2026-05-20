@@ -3,10 +3,11 @@
 ## What it does ✨
 
 - Reads one or more local files as context
-- Prefix line numbers to content for improved LLM understanding
+- Prefixes line numbers to content for improved LLM understanding
 - Sends a single request to an OpenAI‑compatible model endpoint
 - Supports plain text, JSON, and JSON Schema outputs
 - Works with hosted APIs and local OpenAI‑compatible servers
+- Creates a context controlled and always verified workflow
 
 ## Requirements 📦
 
@@ -60,13 +61,6 @@ mince --system-prompt "You are a senior engineering reviewer." \
 mince --response-format json \
   --task "Extract the key settings" \
   --files config.yml
-```
-
-```bash
-mince --response-format schema \
-  --schema-file schema.json \
-  --task "Turn the notes into structured output" \
-  --files notes.md
 ```
 
 ```bash
@@ -165,11 +159,14 @@ All the `mince` CLI arguments for reference.
 | Argument                | Description |
 |-------------------------|-------------|
 | `--task`                | Task/prompt for the model. |
+| `--taskfile`            | Read the task/prompt from the given file (--task overrides). |
 | `--files`               | Files to include as context. |
 | `--init`                | Initialize and interactively change the configuration file. |
 | `--system-prompt`       | System prompt override. |
+| `--system-prompt-file`  | Read the system prompt from the given file (--system-prompt overrides). |
 | `--model`               | Override configured model. |
 | `--openai-base-url`     | OpenAI‑compatible API base URL. |
+| `--openai-proxy`        | HTTP(S) proxy URL (eg: http://user:pass@proxy:8080). |
 | `--openai-organization` | Optional OpenAI organization ID. |
 | `--openai-project`      | Optional project name or ID. |
 | `--openai-service-tier` | OpenAI service tier (`auto`, `default`, `flex`, `scale`, `priority`). |
