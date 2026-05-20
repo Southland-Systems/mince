@@ -55,8 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 DEFAULT_SYSTEM_PROMPT = """
-The provided files are prefixed with line numbers (example: '1 ').
-Do not include the line numbers when responding or completing a task.
+The provided files are prefixed with line numbers (example: '1 ') that are not included in the original content.
 """
 
 
@@ -127,8 +126,8 @@ def init_config_interactive() -> None:
     print()
 
     prompt_config_value(config, "model", "Model")
-    prompt_config_value(config, "api_key", "API key (default OPENAI_API_KEY)")
-    prompt_config_value(config, "openai_base_url", "OpenAI-compatible Base URL")
+    prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)")
+    prompt_config_value(config, "openai_base_url", "OpenAI-compatible base URL")
     prompt_config_value(config, "openai_organization", "Organization name or ID")
     prompt_config_value(config, "openai_project", "Project name or ID")
     prompt_config_value(config, "openai_service_tier", "Service tier")
@@ -196,7 +195,6 @@ def print_stats(
         f"request_tokens_estimate={request_tokens}",
         f"response_characters={len(response_text)}",
     ]
-
     if usage:
         for key in ("input_tokens", "output_tokens", "total_tokens"):
             if key in usage:
@@ -413,24 +411,21 @@ def call_openai(
     elif response_format == "schema":
         if not json_schema:
             raise ValueError("--response-format schema requires --schema-file")
-
         kwargs["text"] = {
             "format": {
                 "type": "json_schema",
-                "name": "single_shot_output",
-                "schema": json_schema,
+                "name": "mince",
                 "strict": True,
+                "schema": json_schema,
             }
         }
-
     try:
         response = client.responses.create(**kwargs)
     except Exception as exc:
         _handle_openai_error(exc)
-
     return response, usage_to_dict(getattr(response, "usage", None))
 
-
+# premature optimization
 def call_llm(
     api_key: str = "",
     openai_base_url: str = "",

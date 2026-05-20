@@ -76,6 +76,32 @@ Add commented notes at the end." \
   --files taskedit.py >taskedit-new.py
 ```
 
+```bash
+mince --task "Provide the file name and line count as JSON" \
+  --files README.md requirements.txt --response-format schema \
+  --schema-file filemeta.json
+```
+
+```json
+- filemeta.json
+{
+  "type": "array",
+  "items": {
+    "type": "object",
+    "properties": {
+      "filename": {
+        "type": "string"
+      },
+      "line_count": {
+        "type": "integer"
+      }
+    },
+    "required": ["filename", "line_count"],
+    "additionalProperties": false
+  }
+}
+```
+
 ## Local model servers 🌐
 
 Use any OpenAI‑compatible base URL, including Ollama:
