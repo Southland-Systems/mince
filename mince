@@ -3,7 +3,6 @@
 mince
 
 A small, single-command assistant for turning local files into useful answers.
-
 """
 
 from __future__ import annotations
@@ -310,28 +309,28 @@ def _handle_openai_error(exc: Exception) -> None:
         msg = "Rate limit exceeded – try again later."
         code = 3
     elif isinstance(exc, BadRequestError):
-        msg = f"Bad request: {exc.user_message or exc}"
+        msg = f"Bad request: {exc}"
         code = 4
     elif isinstance(exc, PermissionDeniedError):
-        msg = f"Permission denied: {exc.user_message or exc}"
+        msg = f"Permission denied: {exc}"
         code = 5
     elif isinstance(exc, NotFoundError):
-        msg = f"Resource not found: {exc.user_message or exc}"
+        msg = f"Resource not found: {exc}"
         code = 6
     elif isinstance(exc, APITimeoutError):
-        msg = f"Request timed out after {exc.timeout or 'unknown'} seconds."
+        msg = f"Request timed out: {exc}"
         code = 7
     elif isinstance(exc, APIConnectionError):
         msg = f"Network error: {exc}"
         code = 8
     elif isinstance(exc, APIError):
-        msg = f"OpenAI API error: {exc.user_message or exc}"
+        msg = f"OpenAI API error: {exc}"
         code = 9
     elif isinstance(exc, UnprocessableEntityError):
-        msg = f"Cannot process request despite it being correct: {exc.user_message or exc}"
+        msg = f"Cannot process request despite it being correct: {exc}"
         code = 10
     elif isinstance(exc, InternalServerError):
-        msg = f"OpenAI API internal server error: {exc.user_message or exc}"
+        msg = f"OpenAI API internal server error: {exc}"
         code = 11
     else:
         msg = f"Unexpected error: {exc}"
