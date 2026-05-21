@@ -174,11 +174,11 @@ All the `mince` CLI arguments for reference.
 | `--ask`                | Prompt without file context or the configured system prompt. |
 | `--ask-file`           | Read the ask prompt from the given file. |
 | `--task`               | Task/prompt for the model with file context. |
-| `--task-file`          | Read the task/prompt from the given file (--task overrides). |
+| `--task-file`          | Read the task/prompt from the given file. |
 | `--files`              | Files to include as context. |
 | `--init`               | Initialize and interactively change the configuration file. |
 | `--system-prompt`      | System prompt override. |
-| `--system-prompt-file` | Read the system prompt from the given file (--system-prompt overrides). |
+| `--system-prompt-file` | Read the system prompt from the given file . |
 | `--model`              | Override configured model. |
 | `--openai-base-url`    | OpenAI‑compatible API base URL. |
 | `--openai-proxy`       | HTTP(S) proxy URL (eg: http://user:pass@proxy:8080). |
@@ -194,6 +194,9 @@ All the `mince` CLI arguments for reference.
 | `--max-output-tokens`  | Maximum output tokens the LLM will use (65534). |
 | `--llm-timeout`        | Timeout in seconds for the API call (300). |
 | `--print-reasoning`    | Output the reasoning monolog in <reasoning> tags with the content in <response> tags. |
+| `--no-line-numbers`    | Do not prefix line numbers to context files. |
+| `--print-default-config` | Print the built-in default configuration as JSON. |
+| `--print-current-config` | Print the stored configuration file (creates it if missing). |
 | `--quiet`              | Suppress printing of extra output (stats, information). |
 
 Environment variables supported.
@@ -222,7 +225,7 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 
 ## License and Copyright 📄
 
-This project is licensed under the **Apache-2.0 License**.
+This project is licensed under the **Apache-2.0 License**
 
-© 2026 Southland Systems, Ontario, Canada.
+© 2026 Southland Systems, Ontario, Canada
 

@@ -54,7 +54,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "llm_timeout": 300,
 }
 
-DEFAULT_SYSTEM_PROMPT = "The provided files are prefixed with line numbers (example: '123 ') that are not included in the original content, remove them when responding unless instructed otherwise."
+DEFAULT_SYSTEM_PROMPT = ""
+LINENUM_SYSTEM_PROMPT = "The provided files are prefixed with line numbers (example: '123 ') that are not included in the original content, remove them when responding unless instructed otherwise."
 
 # -------------------------------------------------------------------
 # Config
@@ -220,6 +221,7 @@ def read_file(path: Path) -> str:
 def build_context(
     file_paths: list[Path],
     max_file_size_kb: int,
+    add_line_numbers: bool = True,
 ) -> str:
     sections = []
     max_bytes = max_file_size_kb * 1024
@@ -236,12 +238,14 @@ def build_context(
             continue
 
         content = read_file(path)
-        numbered_content = number_lines(content)
+        if add_line_numbers:
+            numbered_content = number_lines(content)
+        else:
+            numbered_content = content
 
         sections.append(
             f"""
 ---
-lines_numbered: True
 path: {path}
 ---
 {numbered_content}
@@ -552,7 +556,7 @@ def parse_args() -> argparse.Namespace:
         "--response-format",
         choices=("text", "json", "schema"),
         default="text",
-        help="text = normal output, json = valid JSON, schema = structured JSON Schema",
+        help="LLM response format in text, JSON or JSON-Schema",
     )
 
     parser.add_argument(
@@ -598,9 +602,27 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--no-line-numbers",
+        action="store_true",
+        help="Do not prefix line numbers to context files",
+    )
+
+    parser.add_argument(
         "--print-reasoning",
         action="store_true",
         help="Output the reasoning monolog in <reasoning> tags with the content in <response> tags"
+    )
+
+    parser.add_argument(
+        "--print-default-config",
+        action="store_true",
+        help="Print the built-in default configuration as JSON"
+    )
+
+    parser.add_argument(
+        "--print-current-config",
+        action="store_true",
+        help="Print the stored configuration file (creates it if missing)"
     )
 
     parser.add_argument(
@@ -628,6 +650,19 @@ def main() -> int:
 
     args = parse_args()
 
+    if args.print_default_config:
+        print(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.print_current_config:
+        ensure_config_exists()
+        try:
+            print(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"ERROR: Unable to read config file: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
     if args.ask is not None and args.ask_file is not None:
         print("ERROR: Confliect between --ask and --ask-file", file=sys.stderr)
         return 1
@@ -645,6 +680,8 @@ def main() -> int:
         init_config_interactive()
         return 0
 
+    add_line_numbers = not args.no_line_numbers
+
     ask_mode: bool = args.ask is not None or args.ask_file is not None
 
     if not ask_mode:
@@ -653,7 +690,7 @@ def main() -> int:
         elif args.task_file:
             task = read_file(args.task_file).strip()
         else:
-            print("ERROR: --task or --task-file required (--help for help)", file=sys.stderr)
+            print("ERROR: --ask or --task required (--help for help)", file=sys.stderr)
             return 1
 
         if not args.files:
@@ -749,8 +786,15 @@ def main() -> int:
     else:
         max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
         file_paths = [Path(f).resolve() for f in args.files]
-        context = build_context(file_paths=file_paths, max_file_size_kb=max_file_size_kb)
-        full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
+        context = build_context(
+            file_paths=file_paths,
+            max_file_size_kb=max_file_size_kb,
+            add_line_numbers=add_line_numbers
+        )
+        if add_line_numbers:
+            full_system_prompt = (DEFAULT_SYSTEM_PROMPT + LINENUM_SYSTEM_PROMPT + system_prompt)
+        else:
+            full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
         user_prompt = build_user_prompt(
             task=task,
             context=context,
