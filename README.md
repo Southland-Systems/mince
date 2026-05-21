@@ -7,7 +7,7 @@
 - Sends a single request to an OpenAI‑compatible model endpoint
 - Supports plain text, JSON, and JSON Schema outputs
 - Works with hosted APIs and local OpenAI‑compatible servers
-- Creates a context controlled and always verified workflow
+- Creates a context controlled, continuously verified workflow
 
 ## Requirements 📦
 
@@ -49,6 +49,11 @@ This creates `~/.local/state/mince/config.json`.
 
 ```bash
 mince --task "Summarize this project" --files README.md src/main.py
+```
+
+```bash
+mince --ask "You are an expert programmer specializing in Python. \
+How are two strings concatenated?"
 ```
 
 ```bash
@@ -94,6 +99,13 @@ mince --task "Provide the file name and line count as JSON" \
     "additionalProperties": false
   }
 }
+```
+
+```bash
+systemd-run --user -qt -p ProtectSystem=strict -p ProtectHome=read-only mince
+
+# https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
 ```
 
 ## Local model servers 🌐
@@ -148,46 +160,47 @@ mince --openai-base-url http://localhost:11434/v1 \
 
 ## Notes 🗒️
 
-- Large files are skipped automatically.
-- Binary files are not supported.
-- JSON Schema mode is best when you need machine‑readable output.
+- Large files are skipped automatically
+- Binary files are not supported
+- JSON Schema mode is best when you need machine‑readable output
+- MinCE is tested on and assisted by `gpt-oss-120b`
 
 ## Command line arguments 📋
 
 All the `mince` CLI arguments for reference.
 
-| Argument                | Description |
-|-------------------------|-------------|
-| `--task`                | Task/prompt for the model. |
-| `--taskfile`            | Read the task/prompt from the given file (--task overrides). |
-| `--files`               | Files to include as context. |
-| `--init`                | Initialize and interactively change the configuration file. |
-| `--system-prompt`       | System prompt override. |
-| `--system-prompt-file`  | Read the system prompt from the given file (--system-prompt overrides). |
-| `--model`               | Override configured model. |
-| `--openai-base-url`     | OpenAI‑compatible API base URL. |
-| `--openai-proxy`        | HTTP(S) proxy URL (eg: http://user:pass@proxy:8080). |
-| `--openai-organization` | Optional OpenAI organization ID. |
-| `--openai-project`      | Optional project name or ID. |
-| `--openai-service-tier` | OpenAI service tier (`auto`, `default`, `flex`, `scale`, `priority`). |
-| `--response-format`     | Output format: `text` (default), `json`, or `schema`. |
-| `--schema-file`         | Path to a JSON Schema file (required for `--response-format schema`). |
-| `--temperature`         | Sampling temperature (0.0‑2.0). |
-| `--top-p`               | Top‑p nucleus sampling (0.0‑1.0). |
-| `--openai-reasoning`    | Reasoning effort level (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`). |
-| `--token-limit`         | Maximum allowed input token count. |
-| `--max-output-tokens`   | Maximum output tokens the LLM will use. |
-| `--llm-timeout`         | Timeout in seconds for the API call. |
-| `--print-reasoning`     | Output the reasoning monolog in `<reasoning>` tags with the content in `<response>` tags. |
-| `--quiet`               | Suppress printing of extra output (stats, information). |
+| Argument               | Description |
+|------------------------|-------------|
+| `--ask`                | Prompt without file context or the configured system prompt. |
+| `--ask-file`           | Read the ask prompt from the given file. |
+| `--task`               | Task/prompt for the model with file context. |
+| `--task-file`          | Read the task/prompt from the given file (--task overrides). |
+| `--files`              | Files to include as context. |
+| `--init`               | Initialize and interactively change the configuration file. |
+| `--system-prompt`      | System prompt override. |
+| `--system-prompt-file` | Read the system prompt from the given file (--system-prompt overrides). |
+| `--model`              | Override configured model. |
+| `--openai-base-url`    | OpenAI‑compatible API base URL. |
+| `--openai-proxy`       | HTTP(S) proxy URL (eg: http://user:pass@proxy:8080). |
+| `--openai-organization`| Optional OpenAI organization ID. |
+| `--openai-project`     | Optional project name or ID. |
+| `--openai-service-tier`| OpenAI service tier. |
+| `--response-format`    | text = normal output, json = valid JSON, schema = structured JSON Schema. |
+| `--schema-file`        | Path to a JSON Schema file (required for --response-format schema). |
+| `--temperature`        | Sampling temperature (0.0‑2.0). |
+| `--top-p`              | Top‑p nucleus sampling (0.0‑1.0). |
+| `--openai-reasoning`   | Reasoning effort level (low). |
+| `--token-limit`        | Maximum allowed input token count (65534). |
+| `--max-output-tokens`  | Maximum output tokens the LLM will use (65534). |
+| `--llm-timeout`        | Timeout in seconds for the API call (300). |
+| `--print-reasoning`    | Output the reasoning monolog in <reasoning> tags with the content in <response> tags. |
+| `--quiet`              | Suppress printing of extra output (stats, information). |
 
 Environment variables supported.
 
 | Environment Variable | Description |
 |----------------------|-------------|
 | OPENAI_API_KEY       | OpenAI-compatible API key |
-
-
 
 ## Make targets 🚀
 

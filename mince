@@ -44,9 +44,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_organization": "",
     "openai_project": "",
     "openai_service_tier": "auto",
-    "system_prompt": (
-        "You are a concise and technically accurate software engineering assistant. Output in formatted plain text unless instructed otherwise."
-    ),
+    "system_prompt": "You are a concise and technically accurate software engineering assistant.",
     "temperature": 1.0,
     "top_p": 1.0,
     "openai_reasoning": "low",
@@ -57,10 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "llm_timeout": 300,
 }
 
-DEFAULT_SYSTEM_PROMPT = """
-The provided files are prefixed with line numbers (example: '1 ') that are not included in the original content.
-"""
-
+DEFAULT_SYSTEM_PROMPT = "The provided files are prefixed with line numbers (example: '123 ') that are not included in the original content, remove them when responding unless instructed otherwise."
 
 # -------------------------------------------------------------------
 # Config
@@ -247,8 +242,8 @@ def build_context(
         sections.append(
             f"""
 ---
-- lines_numbered: True
-- path: {path}
+lines_numbered: True
+path: {path}
 ---
 {numbered_content}
 """.strip()
@@ -484,23 +479,32 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--files",
-        nargs="+",
-        help="Files to include as context",
-    )
-
-    parser.add_argument("--task", help="Task/prompt for the model")
-
-    parser.add_argument(
-        "--init",
-        action="store_true",
-        help="Initialize and interactively change the configuration file",
+        "--task",
+        help="Task/prompt for the model with file context"
     )
 
     parser.add_argument(
         "--task-file",
         type=Path,
-        help="Read the task/prompt from the given file (--task overrides)",
+        help="Read the task/prompt from the given file",
+    )
+
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        help="Files to include as context",
+    )
+
+    parser.add_argument(
+        "--ask",
+        type=str,
+        help="Prompt without file context or the configured system prompt",
+    )
+
+    parser.add_argument(
+        "--ask-file",
+        type=Path,
+        help="Read the ask prompt from the given file",
     )
 
     parser.add_argument(
@@ -511,7 +515,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--system-prompt-file",
         type=Path,
-        help="Read the system prompt from the given file (--system-prompt overrides)",
+        help="Read the system prompt from the given file",
     )
 
     parser.add_argument(
@@ -599,10 +603,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Output the reasoning monolog in <reasoning> tags with the content in <response> tags"
     )
+
     parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress printing of extra output (stats, information)",
+    )
+
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Initialize and interactively change the configuration file",
     )
 
     return parser.parse_args()
@@ -618,21 +629,39 @@ def main() -> int:
 
     args = parse_args()
 
+    if args.ask is not None and args.ask_file is not None:
+        print("ERROR: Confliect between --ask and --ask-file", file=sys.stderr)
+        return 1
+    if (args.ask is not None or args.ask_file) and (args.task is not None or args.task_file is not None):
+        print("ERROR: Conflict between --ask / --ask-file and --task / --task-file", file=sys.stderr)
+        return 1
+    if args.task is not None and args.task_file is not None:
+        print("ERROR: Confliect between --task and --task-file", file=sys.stderr)
+        return 1
+    if args.system_prompt is not None and args.system_prompt_file is not None:
+        print("ERROR: Confliect between --system-prompt and --system-prompt-file", file=sys.stderr)
+        return 1
+
     if args.init:
         init_config_interactive()
         return 0
 
-    if args.task:
-        task = args.task
-    elif args.task_file:
-        task = read_file(args.task_file).strip()
-    else:
-        print("ERROR: --task or --task-file required (--help for help)", file=sys.stderr)
-        return 1
+    ask_mode: bool = args.ask is not None or args.ask_file is not None
 
-    if not args.files:
-        print("ERROR: --files required (--help for help)", file=sys.stderr)
-        return 1
+    if not ask_mode:
+        if args.task:
+            task = args.task
+        elif args.task_file:
+            task = read_file(args.task_file).strip()
+        else:
+            print("ERROR: --task or --task-file required (--help for help)", file=sys.stderr)
+            return 1
+
+        if not args.files:
+            print("ERROR: --files required (--help for help)", file=sys.stderr)
+            return 1
+    else:
+        task = ""
 
     config = load_config()
 
@@ -646,6 +675,8 @@ def main() -> int:
         system_prompt = str(args.system_prompt).strip()
     elif args.system_prompt_file:
         system_prompt = read_file(args.system_prompt_file).strip()
+    elif ask_mode:
+        system_prompt = ""
     else:
         system_prompt = str(config.get("system_prompt", "")).strip()
 
@@ -708,19 +739,25 @@ def main() -> int:
         print("  mince --init")
         return 1
 
-    max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
-    file_paths = [Path(f).resolve() for f in args.files]
 
-    context = build_context(file_paths=file_paths, max_file_size_kb=max_file_size_kb)
-
-    full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
-
-    user_prompt = build_user_prompt(
-        task=task,
-        context=context,
-        response_format=response_format,
-        json_schema=json_schema,
-    )
+    if ask_mode:
+        context = ""
+        if args.ask is not None:
+            user_prompt = args.ask.strip()
+        else:
+            user_prompt = read_file(args.ask_file).strip()
+        full_system_prompt = system_prompt
+    else:
+        max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
+        file_paths = [Path(f).resolve() for f in args.files]
+        context = build_context(file_paths=file_paths, max_file_size_kb=max_file_size_kb)
+        full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
+        user_prompt = build_user_prompt(
+            task=task,
+            context=context,
+            response_format=response_format,
+            json_schema=json_schema,
+        )
 
     request_tokens = estimate_request_tokens(
         model=model,
