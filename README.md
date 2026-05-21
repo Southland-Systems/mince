@@ -11,7 +11,7 @@
 
 ## Requirements 📦
 
-- `python` 3.9 or newer and the `pip` package manager
+- `python` 3.10 or newer and the `pip` package manager
 - `make` from GNU Make or compatible for a managed installation
 - Network access to your chosen OpenAI-compatible endpoint
 - An API key for the endpoint
@@ -102,7 +102,13 @@ mince --task "Provide the file name and line count as JSON" \
 ```
 
 ```bash
-systemd-run --user -qt -p ProtectSystem=strict -p ProtectHome=read-only mince
+# systemd core container for restricted testing
+
+systemd-run --user -qt -p ProtectSystem=strict \
+  -p ProtectHome=read-only -p PrivateTmp=yes \
+  mince --help
+
+# -p RestrictAddressFamilies=AF_UNIX
 
 # https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html
 # https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
@@ -117,46 +123,6 @@ mince --openai-base-url http://localhost:11434/v1 \
   --task "Summarize the project" \
   --files README.md
 ```
-
-## Use cases 🎯
-
-- Generate source code patches and whole re-writes
-- Summarize a repository from a handful of files
-- Explain what a legacy script is doing
-- Turn meeting notes into a clean recap
-- Draft release notes from changelog fragments
-- Convert rough notes into polished prose
-- Extract key fields from YAML, JSON, or text files
-- Review deployment files for clarity
-- Compare two versions of a document
-- Generate a checklist from a plan
-- Create a migration summary
-- Rewrite content for a different audience
-- Produce a concise executive summary
-- Pull action items from a meeting transcript
-- Convert incident notes into a postmortem draft
-- Turn a spec into a customer-friendly overview
-- Extract risks and assumptions from project notes
-- Create FAQ-style answers from documentation
-- Summarize pull-request context before review
-- Describe configuration files in plain English
-- Clean up rough draft text
-- Turn brainstorming notes into a structured outline
-- Identify missing pieces in a draft
-- Create a “what changed” summary from file diffs or notes
-- Rephrase technical language for non-technical readers
-- Produce structured output for downstream automation
-- Extract deadlines, owners, and next steps
-- Transform scattered notes into a decision log
-- Draft handoff notes for another teammate
-- Build a compact briefing from several source files
-- Create training material from internal notes
-- Shape product notes into a feature description
-- Turn dense documentation into a friendlier version
-- Summarize a design document before a meeting
-- Review a roadmap note and highlight priorities
-- Convert an outline into a polished article draft
-- Generate a quick answer from a bundle of reference files
 
 ## Notes 🗒️
 
