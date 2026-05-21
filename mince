@@ -33,7 +33,8 @@ import httpx
 
 
 APP_DIR = Path.home() / ".local/state/mince"
-CONFIG_FILE = APP_DIR / "config.json"
+DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
+CONFIG_FILE = DEFAULT_CONFIG_FILE
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.5",
@@ -144,6 +145,10 @@ def init_config_interactive() -> None:
     print()
     print(f"Configuration saved.")
 
+def get_profile_path(name: str) -> Path:
+    if name == "config":
+        return DEFAULT_CONFIG_FILE
+    return APP_DIR / f"{name}.json"
 
 # -------------------------------------------------------------------
 # Helpers
@@ -433,44 +438,6 @@ def call_openai(
         _handle_openai_error(exc)
     return response, usage_to_dict(getattr(response, "usage", None))
 
-# premature optimization
-def call_llm(
-    api_key: str = "",
-    openai_base_url: str = "",
-    openai_proxy: str = "",
-    openai_organization: str = "",
-    openai_project: str = "",
-    model: str = "",
-    system_prompt: str = "",
-    user_prompt: str = "",
-    response_format: str = "text",
-    json_schema: dict[str, Any] | None = None,
-    temperature: float | None = None,
-    top_p: float | None = None,
-    max_output_tokens: int | None = None,
-    openai_service_tier: str | None = None,
-    openai_reasoning: str | None = None,
-    llm_timeout: int | None = None,
-) -> tuple[Any, dict[str, Any] | None]:
-    return call_openai(
-        api_key=api_key,
-        openai_base_url=openai_base_url,
-        openai_proxy=openai_proxy,
-        openai_organization=openai_organization,
-        openai_project=openai_project,
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        response_format=response_format,
-        json_schema=json_schema,
-        temperature=temperature,
-        top_p=top_p,
-        max_output_tokens=max_output_tokens,
-        openai_service_tier=openai_service_tier,
-        openai_reasoning=openai_reasoning,
-        llm_timeout=llm_timeout,
-   )
-
 
 # -------------------------------------------------------------------
 # CLI
@@ -637,6 +604,36 @@ def parse_args() -> argparse.Namespace:
         help="Initialize and interactively change the configuration file",
     )
 
+    parser.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="Select configuration profile",
+    )
+
+    parser.add_argument(
+        "--init-profile",
+        metavar="NAME",
+        help="Interactively initialise a new configuration profile",
+    )
+
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="List available configuration profiles",
+    )
+
+    parser.add_argument(
+        "--copy-profile",
+        metavar="NEW_NAME",
+        help="Copy the current configuration profile to a new profile",
+    )
+
+    parser.add_argument(
+        "--remove-profile",
+        metavar="NAME",
+        help="Remove a configuration profile",
+    )
+
     return parser.parse_args()
 
 
@@ -648,7 +645,91 @@ def main() -> int:
     # TODO hardcoded variables
     tokenizer_padding = 14
 
+    global CONFIG_FILE
+
     args = parse_args()
+
+    base_profile = args.profile or "config"
+
+    if not base_profile.isidentifier():
+        print(f"ERROR: Invalid profile name '{base_profile}'.", file=sys.stderr)
+        return 1
+
+    profile_actions = sum(bool(x) for x in [
+        args.init_profile,
+        args.copy_profile,
+        args.remove_profile,
+        args.list_profiles,
+    ])
+
+    if profile_actions > 1:
+        print(
+            "ERROR: Only one of --init-profile, --copy-profile, --remove-profile may be used at a time.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.list_profiles:
+        ensure_config_exists()
+        profiles = sorted(p.stem for p in APP_DIR.glob("*.json"))
+        for name in profiles:
+            print(name)
+        return 0
+
+    if args.init_profile:
+        new_name = args.init_profile
+        if not new_name.isidentifier():
+            print(f"ERROR: Invalid profile name '{new_name}'.", file=sys.stderr)
+            return 1
+        CONFIG_FILE = get_profile_path(new_name)
+        init_config_interactive()
+        return 0
+
+    if args.copy_profile:
+        new_name = args.copy_profile
+        if new_name == "config":
+            print("ERROR: Cannot copy to profile name 'config'.", file=sys.stderr)
+            return 1
+        if not new_name.isidentifier():
+            print(f"ERROR: Invalid profile name '{new_name}'.", file=sys.stderr)
+            return 1
+        src_path = get_profile_path(base_profile)
+        dst_path = get_profile_path(new_name)
+        if not src_path.exists():
+            print(f"ERROR: Source profile '{base_profile}' does not exist.", file=sys.stderr)
+            return 1
+        if dst_path.exists():
+            print(f"ERROR: Destination profile '{new_name}' already exists.", file=sys.stderr)
+            return 1
+        try:
+            dst_path.write_text(src_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception as exc:
+            print(f"ERROR: Failed to copy profile: {exc}", file=sys.stderr)
+            return 1
+        print(f"Profile '{base_profile}' copied to '{new_name}'.")
+        return 0
+
+    if args.remove_profile:
+        name = args.remove_profile
+        if name == "config":
+            print("ERROR: Cannot remove the default 'config' profile.", file=sys.stderr)
+            return 1
+        if not name.isidentifier():
+            print(f"ERROR: Invalid profile name '{name}'.", file=sys.stderr)
+            return 1
+        path = get_profile_path(name)
+        if not path.exists():
+            print(f"ERROR: Profile '{name}' does not exist.", file=sys.stderr)
+            return 1
+        try:
+            path.unlink()
+        except Exception as exc:
+            print(f"ERROR: Failed to remove profile: {exc}", file=sys.stderr)
+            return 1
+        print(f"Profile '{name}' removed.")
+        return 0
+
+    CONFIG_FILE = get_profile_path(base_profile)
 
     if args.print_default_config:
         print(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False))
@@ -822,7 +903,7 @@ def main() -> int:
     start_time = time.perf_counter()
 
     try:
-        response_obj, usage = call_llm(
+        response_obj, usage = call_openai(
             api_key=api_key,
             openai_base_url=openai_base_url,
             openai_proxy=openai_proxy,
