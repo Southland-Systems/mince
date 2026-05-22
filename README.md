@@ -142,6 +142,7 @@ All the `mince` CLI arguments for reference.
 | `--files`              | Files to include as context. |
 | `--ask`                | Prompt without file context or the configured system prompt. |
 | `--ask-file`           | Read the ask prompt from the given file. |
+| `--output-file`        | Write the response to the given file (overwrites if it exists). |
 | `--system-prompt`      | System prompt override. |
 | `--system-prompt-file` | Read the system prompt from the given file. |
 | `--model`              | Override configured model. |
@@ -158,6 +159,7 @@ All the `mince` CLI arguments for reference.
 | `--token-limit`        | Maximum allowed input token count (65534). |
 | `--max-output-tokens`  | Maximum output tokens the LLM will use (65534). |
 | `--llm-timeout`        | Timeout in seconds for the API call (300). |
+| `--linenum-system-prompt` | System prompt for handling context file line numbers. |
 | `--no-line-numbers`    | Do not prefix line numbers to context files. |
 | `--print-reasoning`    | Output the reasoning monolog in <reasoning> tags with the content in <response> tags. |
 | `--print-default-config` | Print the built‑in default configuration as JSON. |
@@ -165,7 +167,7 @@ All the `mince` CLI arguments for reference.
 | `--quiet`              | Suppress printing of extra output (stats, information). |
 | `--init`               | Initialize and interactively change the configuration file. |
 | `--profile`            | Select configuration profile. |
-| `--init-profile`       | Interactively initialise a new configuration profile. |
+| `--init-profile`       | Interactively initialize a new configuration profile. |
 | `--list-profiles`      | List available configuration profiles. |
 | `--copy-profile`       | Copy the current configuration profile to a new profile. |
 | `--remove-profile`     | Remove a configuration profile. |

@@ -36,6 +36,9 @@ APP_DIR = Path.home() / ".local/state/mince"
 DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
 CONFIG_FILE = DEFAULT_CONFIG_FILE
 
+DEFAULT_SYSTEM_PROMPT = "You are a concise and technically accurate software engineering assistant."
+DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from the start of each line."
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.5",
     "api_key": "",
@@ -44,7 +47,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_organization": "",
     "openai_project": "",
     "openai_service_tier": "auto",
-    "system_prompt": "You are a concise and technically accurate software engineering assistant.",
+    "system_prompt": DEFAULT_SYSTEM_PROMPT,
+    "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
     "temperature": 1.0,
     "top_p": 1.0,
     "openai_reasoning": "low",
@@ -55,8 +59,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "llm_timeout": 300,
 }
 
-DEFAULT_SYSTEM_PROMPT = ""
-LINENUM_SYSTEM_PROMPT = "The provided files are prefixed with line numbers (example: '123 ') that are not included in the original content, remove them when responding unless instructed otherwise."
 
 # -------------------------------------------------------------------
 # Config
@@ -132,6 +134,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_project", "Project name or ID")
     prompt_config_value(config, "openai_service_tier", "Service tier")
     prompt_config_value(config, "system_prompt", "System prompt")
+    prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
     prompt_config_value(config, "top_p", "Top P (0.0-1.0)", float)
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
@@ -202,7 +205,7 @@ def print_stats(
     if usage:
         for key in ("input_tokens", "output_tokens", "total_tokens"):
             if key in usage:
-                stats.append(f"llm_{key}={usage[key]}")
+                stats.append(f"response_{key}={usage[key]}")
 
     print(" ".join(stats), file=sys.stderr)
 
@@ -478,6 +481,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--output-file",
+        type=Path,
+        help="Write the response to the given file (overwrites if it exists)",
+    )
+
+    parser.add_argument(
         "--system-prompt",
         help="System prompt override",
     )
@@ -566,6 +575,11 @@ def parse_args() -> argparse.Namespace:
         "--llm-timeout",
         type=int,
         help="Timeout in seconds for the API call (300)",
+    )
+
+    parser.add_argument(
+        "--linenum-system-prompt",
+        help="System prompt for handling context file line numbers",
     )
 
     parser.add_argument(
@@ -797,6 +811,13 @@ def main() -> int:
     else:
         system_prompt = str(config.get("system_prompt", "")).strip()
 
+    if args.linenum_system_prompt:
+        linenum_system_prompt = str(args.linenum_system_prompt).strip()
+    else:
+        linenum_system_prompt = str(
+            config.get("linenum_system_prompt", "")
+        ).strip()
+
     temperature = (
         args.temperature
         if args.temperature is not None
@@ -873,9 +894,9 @@ def main() -> int:
             add_line_numbers=add_line_numbers
         )
         if add_line_numbers:
-            full_system_prompt = (DEFAULT_SYSTEM_PROMPT + LINENUM_SYSTEM_PROMPT + system_prompt)
+            full_system_prompt = (linenum_system_prompt + system_prompt)
         else:
-            full_system_prompt = DEFAULT_SYSTEM_PROMPT + system_prompt
+            full_system_prompt = system_prompt
         user_prompt = build_user_prompt(
             task=task,
             context=context,
@@ -937,10 +958,23 @@ def main() -> int:
                 for content in getattr(item, "content", []):
                     if getattr(content, "type", None) == "reasoning_text":
                         reasoning = getattr(content, "text", "")
-        print(f"<reasoning>\n{reasoning}\n</reasoning>")
-        print(f"<response>\n{result}\n</response>")
+        output_str = (
+            f"<reasoning>\n{reasoning}\n</reasoning>\n"
+            f"<response>\n{result}\n</response>"
+        )
     else:
-        print(result)
+        output_str = result
+
+    if args.output_file:
+        try:
+            args.output_file.parent.mkdir(parents=True, exist_ok=True)
+            args.output_file.write_text(output_str, encoding="utf-8")
+        except Exception as exc:
+            print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
+            print(output_str)
+            return 1
+    else:
+        print(output_str)
 
     if not args.quiet:
         print_stats(
