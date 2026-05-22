@@ -663,6 +663,10 @@ def main() -> int:
 
     args = parse_args()
 
+    if args.init:
+        init_config_interactive()
+        return 0
+
     base_profile = args.profile or "config"
 
     if not base_profile.isidentifier():
@@ -771,10 +775,6 @@ def main() -> int:
         print("ERROR: Confliect between --system-prompt and --system-prompt-file", file=sys.stderr)
         return 1
 
-    if args.init:
-        init_config_interactive()
-        return 0
-
     add_line_numbers = not args.no_line_numbers
 
     ask_mode: bool = args.ask is not None or args.ask_file is not None
@@ -809,13 +809,13 @@ def main() -> int:
     elif ask_mode:
         system_prompt = ""
     else:
-        system_prompt = str(config.get("system_prompt", "")).strip()
+        system_prompt = str(config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)).strip()
 
     if args.linenum_system_prompt:
         linenum_system_prompt = str(args.linenum_system_prompt).strip()
     else:
         linenum_system_prompt = str(
-            config.get("linenum_system_prompt", "")
+            config.get("linenum_system_prompt", DEFAULT_LINENUM_SYSTEM_PROMPT)
         ).strip()
 
     temperature = (
