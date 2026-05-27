@@ -57,6 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_file_size_kb": 512,
     "response_format": "text",
     "llm_timeout": 300,
+    "openai_extra_body": "",
 }
 
 
@@ -149,6 +150,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
     prompt_config_value(config, "top_p", "Top P (0.0-1.0)", float)
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
+    prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
@@ -265,9 +267,9 @@ def build_context(
         sections.append(
             f"""
 ---
-path: {path}
----
+<file path='{path}' encoding='utf-8'>
 {numbered_content}
+</file>
 """.strip()
         )
 
@@ -290,6 +292,34 @@ def pretty_json(raw: str) -> str:
         return json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
     except Exception:
         return raw
+
+
+def parse_extra_body(s: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if not s:
+        return result
+    for pair in s.split(","):
+        if not pair:
+            continue
+        if "=" not in pair:
+            continue
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        low = value.lower()
+        if low == "true":
+            result[key] = True
+        elif low == "false":
+            result[key] = False
+        else:
+            try:
+                result[key] = int(value)
+            except ValueError:
+                try:
+                    result[key] = float(value)
+                except ValueError:
+                    result[key] = value
+    return result
 
 
 # -------------------------------------------------------------------
@@ -393,6 +423,7 @@ def call_openai(
     max_output_tokens: int | None = None,
     openai_service_tier: str | None = None,
     openai_reasoning: str | None = None,
+    extra_body: dict[str, Any] | None = None,
     llm_timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
@@ -415,7 +446,7 @@ def call_openai(
         "model": model,
         "instructions": system_prompt,
         "input": user_prompt,
-        "extra_body": {},
+        "extra_body": extra_body or {},
     }
 
     if temperature is not None:
@@ -461,198 +492,168 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="MinCE: read-only single command AI assistant for text files"
     )
-
     parser.add_argument(
         "--task",
         help="Task/prompt for the model with file context"
     )
-
     parser.add_argument(
         "--task-file",
         type=Path,
         help="Read the task/prompt from the given file",
     )
-
     parser.add_argument(
         "--files",
         nargs="+",
         help="Files to include as context",
     )
-
     parser.add_argument(
         "--ask",
         type=str,
         help="Prompt without file context or the configured system prompt",
     )
-
     parser.add_argument(
         "--ask-file",
         type=Path,
         help="Read the ask prompt from the given file",
     )
-
     parser.add_argument(
         "--output-file",
         type=Path,
         help="Write the response to the given file (overwrites if it exists)",
     )
-
     parser.add_argument(
         "--system-prompt",
         help="System prompt override",
     )
-
     parser.add_argument(
         "--system-prompt-file",
         type=Path,
         help="Read the system prompt from the given file",
     )
-
     parser.add_argument(
         "--model",
         help="Override configured model",
     )
-
     parser.add_argument(
         "--openai-base-url",
         help="OpenAI-compatible API base URL",
     )
-
     parser.add_argument(
         "--openai-proxy",
         help="HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)",
     )
-
     parser.add_argument(
         "--openai-organization",
         help="Optional OpenAI organization ID",
     )
-
     parser.add_argument(
         "--openai-project",
         help="Optional project name or ID",
     )
-
     parser.add_argument(
         "--openai-service-tier",
         choices=("auto", "default", "flex", "scale", "priority"),
         help="OpenAI service tier",
     )
-
     parser.add_argument(
         "--response-format",
         choices=("text", "json", "schema"),
         default="text",
         help="LLM response format in text, JSON or JSON-Schema",
     )
-
     parser.add_argument(
         "--schema-file",
         type=Path,
         help="Path to a JSON Schema file (required for --response-format schema)",
     )
-
     parser.add_argument(
         "--temperature",
         type=float,
         help="Sampling temperature (0.0-2.0)",
     )
-
     parser.add_argument(
         "--top-p",
         type=float,
         help="Top-p nucleus sampling (0.0-1.0)",
     )
-
     parser.add_argument(
         "--openai-reasoning",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),
         help="Reasoning effort level (low)",
     )
-
+    parser.add_argument(
+        "--openai-extra-body",
+        help="Custom model parameters (key=value pairs separated by commas)",
+    )
     parser.add_argument(
         "--token-limit",
         type=int,
         help="Maximum allowed input token count (65534)",
     )
-
     parser.add_argument(
         "--max-output-tokens",
         type=int,
         help="Maximum output tokens the LLM will use (65534)",
     )
-
     parser.add_argument(
         "--llm-timeout",
         type=int,
         help="Timeout in seconds for the API call (300)",
     )
-
     parser.add_argument(
         "--linenum-system-prompt",
         help="System prompt for handling context file line numbers",
     )
-
     parser.add_argument(
         "--no-line-numbers",
         action="store_true",
         help="Do not prefix line numbers to context files",
     )
-
     parser.add_argument(
         "--print-reasoning",
         action="store_true",
         help="Output the reasoning monolog in <reasoning> tags with the content in <response> tags"
     )
-
     parser.add_argument(
         "--print-default-config",
         action="store_true",
         help="Print the built-in default configuration as JSON"
     )
-
     parser.add_argument(
         "--print-current-config",
         action="store_true",
         help="Print the stored configuration file (creates it if missing)"
     )
-
     parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress printing of extra output (stats, information)",
     )
-
     parser.add_argument(
         "--init",
         action="store_true",
         help="Initialize and interactively change the configuration file",
     )
-
     parser.add_argument(
         "--profile",
         metavar="NAME",
         help="Select configuration profile",
     )
-
     parser.add_argument(
         "--init-profile",
         metavar="NAME",
         help="Interactively initialise a new configuration profile",
     )
-
     parser.add_argument(
         "--list-profiles",
         action="store_true",
         help="List available configuration profiles",
     )
-
     parser.add_argument(
         "--copy-profile",
         metavar="NEW_NAME",
         help="Copy the current configuration profile to a new profile",
     )
-
     parser.add_argument(
         "--remove-profile",
         metavar="NAME",
@@ -855,6 +856,16 @@ def main() -> int:
         else config.get("openai_reasoning", "low")
     )
 
+    extra_body_raw = (
+        args.openai_extra_body
+        if args.openai_extra_body is not None
+        else config.get("openai_extra_body")
+    )
+    if isinstance(extra_body_raw, dict):
+        extra_body = extra_body_raw
+    else:
+        extra_body = parse_extra_body(str(extra_body_raw or ""))
+
     llm_timeout = (
         args.llm_timeout
         if args.llm_timeout is not None
@@ -951,6 +962,7 @@ def main() -> int:
             max_output_tokens=max_output_tokens,
             openai_service_tier=openai_service_tier,
             openai_reasoning=openai_reasoning,
+            extra_body=extra_body,
             llm_timeout=llm_timeout,
         )
     except Exception as exc:
