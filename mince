@@ -1129,12 +1129,13 @@ def main() -> int:
     if patch_mode:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
-        system_prompt = (
+        patch_system_prompt = system_prompt + (
             "You are generating text edits (patches) using a JSON manifest for one or more text files. "
             "Return only JSON that matches the schema.\n"
             "Remove the numbers and single space at the start of any line that has them, "
             "they are line numbers that do not appear in the original content."
         )
+        system_prompt = patch_system_prompt
         add_line_numbers = True
 
 
