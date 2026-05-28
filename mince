@@ -492,11 +492,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="MinCE: read-only single command AI assistant for text files"
     )
-    parser.add_argument(
-        "--task",
-        help="Task/prompt for the model with file context"
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--ask",
+        type=str,
+        help="Prompt without file context or the configured system prompt",
     )
-    parser.add_argument(
+    mode_group.add_argument(
+        "--ask-file",
+        type=Path,
+        help="Read the ask prompt from the given file",
+    )
+    mode_group.add_argument(
+        "--task",
+        help="Task/prompt for the model with file context",
+    )
+    mode_group.add_argument(
         "--task-file",
         type=Path,
         help="Read the task/prompt from the given file",
@@ -507,25 +518,16 @@ def parse_args() -> argparse.Namespace:
         help="Files to include as context",
     )
     parser.add_argument(
-        "--ask",
-        type=str,
-        help="Prompt without file context or the configured system prompt",
-    )
-    parser.add_argument(
-        "--ask-file",
-        type=Path,
-        help="Read the ask prompt from the given file",
-    )
-    parser.add_argument(
         "--output-file",
         type=Path,
         help="Write the response to the given file (overwrites if it exists)",
     )
-    parser.add_argument(
+    sys_prompt_group = parser.add_mutually_exclusive_group()
+    sys_prompt_group.add_argument(
         "--system-prompt",
         help="System prompt override",
     )
-    parser.add_argument(
+    sys_prompt_group.add_argument(
         "--system-prompt-file",
         type=Path,
         help="Read the system prompt from the given file",
@@ -614,15 +616,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Output the reasoning monolog in <reasoning> tags with the content in <response> tags"
     )
-    parser.add_argument(
+    config_print_group = parser.add_mutually_exclusive_group()
+    config_print_group.add_argument(
         "--print-default-config",
         action="store_true",
-        help="Print the built-in default configuration as JSON"
+        help="Print the built-in default configuration as JSON",
     )
-    parser.add_argument(
+    config_print_group.add_argument(
         "--print-current-config",
         action="store_true",
-        help="Print the stored configuration file (creates it if missing)"
+        help="Print the stored configuration file (creates it if missing)",
     )
     parser.add_argument(
         "--quiet",
@@ -630,34 +633,35 @@ def parse_args() -> argparse.Namespace:
         help="Suppress printing of extra output (stats, information)",
     )
     parser.add_argument(
-        "--init",
-        action="store_true",
-        help="Initialize and interactively change the configuration file",
-    )
-    parser.add_argument(
         "--profile",
         metavar="NAME",
         help="Select configuration profile",
     )
-    parser.add_argument(
+    profile_action_group = parser.add_mutually_exclusive_group()
+    profile_action_group.add_argument(
+        "--init",
+        action="store_true",
+        help="Initialize and interactively change the configuration file",
+    )
+    profile_action_group.add_argument(
         "--init-profile",
         metavar="NAME",
         help="Interactively initialise a new configuration profile",
     )
-    parser.add_argument(
-        "--list-profiles",
-        action="store_true",
-        help="List available configuration profiles",
-    )
-    parser.add_argument(
+    profile_action_group.add_argument(
         "--copy-profile",
         metavar="NEW_NAME",
         help="Copy the current configuration profile to a new profile",
     )
-    parser.add_argument(
+    profile_action_group.add_argument(
         "--remove-profile",
         metavar="NAME",
         help="Remove a configuration profile",
+    )
+    profile_action_group.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="List available configuration profiles",
     )
 
     return parser.parse_args()
