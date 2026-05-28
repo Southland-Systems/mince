@@ -46,7 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_proxy": "",
     "openai_organization": "",
     "openai_project": "",
-    "openai_service_tier": "auto",
+    "openai_service_tier": "off",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
     "temperature": 1.0,
@@ -144,7 +144,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_proxy", "HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)")
     prompt_config_value(config, "openai_organization", "Organization name or ID")
     prompt_config_value(config, "openai_project", "Project name or ID")
-    prompt_config_value(config, "openai_service_tier", "Service tier")
+    prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
@@ -461,7 +461,7 @@ def call_openai(
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
 
-    if openai_service_tier:
+    if openai_service_tier and str(openai_service_tier).lower() != "off":
         kwargs["service_tier"] = openai_service_tier
 
     if response_format == "json":
@@ -554,7 +554,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openai-service-tier",
-        choices=("auto", "default", "flex", "scale", "priority"),
+        choices=("off", "auto", "default", "flex", "scale", "priority"),
         help="OpenAI service tier",
     )
     parser.add_argument(
