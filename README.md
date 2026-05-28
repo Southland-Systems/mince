@@ -72,7 +72,7 @@ mince --response-format json \
 mince --task "Add single-user locking to the provided script. \
 Only output the whole script with any changes. \
 Add commented notes at the end." \
-  --files taskedit.py >taskedit-new.py
+  --files taskedit.py --output-file taskedit-new.py
 ```
 
 ```bash
@@ -156,6 +156,7 @@ All the `mince` CLI arguments for reference.
 | `--temperature`        | Sampling temperature (0.0‑2.0). |
 | `--top-p`              | Top‑p nucleus sampling (0.0‑1.0). |
 | `--openai-reasoning`   | Reasoning effort level (low). |
+| `--openai-extra-body`  | Custom model parameters (key=value pairs separated by commas). |
 | `--token-limit`        | Maximum allowed input token count (65534). |
 | `--max-output-tokens`  | Maximum output tokens the LLM will use (65534). |
 | `--llm-timeout`        | Timeout in seconds for the API call (300). |
@@ -172,7 +173,7 @@ All the `mince` CLI arguments for reference.
 | `--copy-profile`       | Copy the current configuration profile to a new profile. |
 | `--remove-profile`     | Remove a configuration profile. |
 
-Environment variables supported.
+Environment variable reference.
 
 | Environment Variable | Description |
 |----------------------|-------------|
@@ -180,7 +181,7 @@ Environment variables supported.
 
 ## Make targets 🚀
 
-The project ships with a tiny **Makefile** that handles both *user* and *system‑wide* installations.
+The project ships with a **Makefile** that handles both *user* and *system‑wide* installations.
 All targets are **idempotent** – running them twice will simply refresh the existing install.
 
 | Target | What it does |
