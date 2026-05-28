@@ -78,27 +78,15 @@ Add commented notes at the end." \
 ```bash
 mince --task "Provide the file name and line count as JSON" \
   --files README.md requirements.txt --response-format schema \
-  --schema-file filemeta.json
+  --schema-file filemeta-schema.json
 ```
 
-```json
-- filemeta.json
-{
-  "type": "array",
-  "items": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string"
-      },
-      "line_count": {
-        "type": "integer"
-      }
-    },
-    "required": ["filename", "line_count"],
-    "additionalProperties": false
-  }
-}
+```bash
+mince --files passwd --task 'The provided `passwd` file is a \
+UNIX account file in "passwd" format. Remove lines 1-5 from `passwd` \
+and create a new file called `passwd-new` with those lines, \
+perform these changes with the provided JSON Schema.' \
+  --patch --patch-review --patch-suffix .patched
 ```
 
 ```bash

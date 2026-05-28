@@ -14,7 +14,10 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
+import difflib
+import pydoc
 import tiktoken
 from openai import (
     OpenAI,
@@ -60,6 +63,79 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_extra_body": "",
 }
 
+PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "name": "line_replace_manifest",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "files": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "document": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "path": {"type": "string", "minLength": 1},
+                                "encoding": {"type": "string", "enum": ["utf-8"]},
+                                "line_ending": {"type": "string", "enum": ["lf", "crlf"]},
+                                "total_lines": {"type": "integer", "minimum": 1},
+                            },
+                            "required": ["path", "encoding", "line_ending", "total_lines"],
+                        },
+                        "patches": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "patch_id": {"type": "string", "minLength": 1},
+                                    "block_id": {"type": "string", "minLength": 1},
+                                    "start_line": {"type": "integer", "minimum": 1},
+                                    "end_line": {"type": "integer", "minimum": 1},
+                                    "content_line_array": {
+                                        "type": "array",
+                                        "minItems": 0,
+                                        "items": {"type": "string"},
+                                    },
+                                    "summary": {"type": "string", "minLength": 1},
+                                    "confidence": {
+                                        "type": "number",
+                                        "minimum": 0.0,
+                                        "maximum": 1.0,
+                                    },
+                                    "needs_manual_review": {"type": "boolean"},
+                                },
+                                "required": [
+                                    "patch_id",
+                                    "block_id",
+                                    "start_line",
+                                    "end_line",
+                                    "content_line_array",
+                                    "summary",
+                                    "confidence",
+                                    "needs_manual_review",
+                                ],
+                            },
+                        },
+                    },
+                    "required": ["document", "patches"],
+                },
+            },
+        },
+        "required": ["files"],
+    },
+}
+
+VERBOSE = 1
+
 
 # -------------------------------------------------------------------
 # Config
@@ -100,7 +176,6 @@ def save_config(config: dict[str, Any]) -> None:
         json.dumps(merged, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
 
 def prompt_config_value(
     config: dict[str, Any],
@@ -165,6 +240,170 @@ def get_profile_path(name: str) -> Path:
     if name == "config":
         return DEFAULT_CONFIG_FILE
     return APP_DIR / f"{name}.json"
+
+
+
+# -------------------------------------------------------------------
+# Patch helpers
+# -------------------------------------------------------------------
+
+
+def append_suffix_to_path(original_path: Path, suffix: str) -> Path:
+    return original_path.with_name(original_path.name + suffix)
+
+def generate_unified_diff(original: str, updated: str, path: str) -> str:
+    original_lines = original.splitlines(keepends=True)
+    updated_lines = updated.splitlines(keepends=True)
+
+    fromfile = path if original else "/dev/null"
+    tofile = path
+
+    diff_lines = list(
+        difflib.unified_diff(
+            original_lines,
+            updated_lines,
+            fromfile=fromfile,
+            tofile=tofile,
+        )
+    )
+    if not diff_lines:
+        return ""
+    return "".join(diff_lines) + "\n"
+
+def detect_line_ending(text: str) -> str:
+    return "crlf" if "\r\n" in text else "lf"
+
+
+def eol_for(line_ending: str) -> str:
+    return "\r\n" if line_ending == "crlf" else "\n"
+
+
+def normalize_line_for_write(text: str) -> str:
+    if "\n" in text or "\r" in text:
+        raise ValueError("content_line_array entries must be single logical lines without embedded newlines.")
+    return text
+
+def prefix_line_numbers(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    return "".join(f"{i} {line}" for i, line in enumerate(lines, start=1))
+
+@dataclass(frozen=True)
+class PatchRange:
+    patch_id: str
+    start_line: int
+    end_line: int
+
+
+def validate_patch_ranges(patches: list[dict[str, Any]], total_lines: int) -> list[PatchRange]:
+    ranges: list[PatchRange] = []
+
+    for patch in patches:
+        patch_id = str(patch["patch_id"])
+        start_line = int(patch["start_line"])
+        end_line = int(patch["end_line"])
+
+        if start_line < 1:
+            raise ValueError(f"{patch_id}: start_line must be >= 1")
+        if end_line < 1:
+            raise ValueError(f"{patch_id}: end_line must be >= 1")
+        if start_line > end_line:
+            raise ValueError(f"{patch_id}: start_line cannot be greater than end_line")
+
+        ranges.append(PatchRange(patch_id=patch_id, start_line=start_line, end_line=end_line))
+
+    ranges_sorted = sorted(ranges, key=lambda r: (r.start_line, r.end_line, r.patch_id))
+    prev = ranges_sorted[0]
+    for current in ranges_sorted[1:]:
+        if current.start_line <= prev.end_line:
+            raise ValueError(
+                f"Overlapping or nested blocks detected: "
+                f"{prev.patch_id} [{prev.start_line}, {prev.end_line}] and "
+                f"{current.patch_id} [{current.start_line}, {current.end_line}]"
+            )
+        prev = current
+
+    return ranges
+
+def apply_combined_patch_manifest(
+    original_texts: dict[str, str],
+    manifest: dict[str, Any],
+) -> dict[str, str]:
+    updated_texts: dict[str, str] = {}
+
+    for file_entry in manifest.get("files", []):
+        document = file_entry["document"]
+        path = document["path"]
+        if path not in original_texts:
+            original = ""
+        else:
+            original = original_texts[path]
+
+        updated = apply_file_patch_manifest(original, file_entry)
+        updated_texts[path] = updated
+
+    for path, text in original_texts.items():
+        if path not in updated_texts:
+            updated_texts[path] = text
+
+    return updated_texts
+
+def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any]) -> str:
+    if not file_manifest.get("patches"):
+        return original_text
+
+    document = file_manifest["document"]
+    line_ending = document["line_ending"]
+    eol = eol_for(line_ending)
+
+    lines = original_text.splitlines(keepends=False)
+    total_lines = len(lines)
+
+    validate_patch_ranges(file_manifest["patches"], total_lines)
+
+    # Apply patches in reverse order so earlier line numbers stay valid
+    patches = sorted(
+        file_manifest["patches"],
+        key=lambda p: int(p["start_line"]),
+        reverse=True,
+    )
+
+    for patch in patches:
+        start_line = int(patch["start_line"])
+        end_line = int(patch["end_line"])
+
+        removed = lines[start_line - 1 : end_line]
+
+        replacement = [
+            normalize_line_for_write(line)
+            for line in patch["content_line_array"]
+        ]
+
+# TODO debugging
+#        patch_id = patch.get("patch_id", "<unknown>")
+#        print(
+#            f"Applying patch {patch_id}: remove lines {start_line}-{end_line}",
+#            file=sys.stderr,
+#        )
+#        for line in removed:
+#            print(f"- {line}", file=sys.stderr)
+#        if replacement:
+#            print(
+#                f"Add {len(replacement)} line(s) at {start_line}:",
+#                file=sys.stderr,
+#            )
+#            for line in replacement:
+#                print(f"+ {line}", file=sys.stderr)
+#        else:
+#            print("No lines added (pure deletion).", file=sys.stderr)
+
+        # Perform the slice replacement
+        lines[start_line - 1 : end_line] = replacement
+
+    result = eol.join(lines)
+    if original_text.endswith(eol):
+        result += eol
+    return result
+
 
 # -------------------------------------------------------------------
 # Helpers
@@ -469,14 +708,7 @@ def call_openai(
     elif response_format == "schema":
         if not json_schema:
             raise ValueError("--response-format schema requires --schema-file")
-        kwargs["text"] = {
-            "format": {
-                "type": "json_schema",
-                "name": "mince",
-                "strict": True,
-                "schema": json_schema,
-            }
-        }
+        kwargs["text"] = {"format": json_schema}
     try:
         response = client.responses.create(**kwargs)
     except Exception as exc:
@@ -490,7 +722,7 @@ def call_openai(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MinCE: read-only single command AI assistant for text files"
+        description="MinCE: a single command AI assistant for text files"
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -521,6 +753,21 @@ def parse_args() -> argparse.Namespace:
         "--output-file",
         type=Path,
         help="Write the response to the given file (overwrites if it exists)",
+    )
+    parser.add_argument(
+        "--patch",
+        action="store_true",
+        help="Patch specified files and write changes to the filename + patch suffix",
+    )
+    parser.add_argument(
+        "--patch-review",
+        action="store_true",
+        help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",
+    )
+    parser.add_argument(
+        "--patch-suffix",
+        type=str,
+        help="Suffix for patched files (default: .mcepatched)",
     )
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
@@ -675,9 +922,15 @@ def main() -> int:
     # TODO hardcoded variables
     tokenizer_padding = 14
 
+    json_schema = None
+
     global CONFIG_FILE
+    global VERBOSE
 
     args = parse_args()
+
+    if args.quiet:
+        VERBOSE = 0
 
     if args.init:
         init_config_interactive()
@@ -695,13 +948,6 @@ def main() -> int:
         args.remove_profile,
         args.list_profiles,
     ])
-
-    if profile_actions > 1:
-        print(
-            "ERROR: Only one of --init-profile, --copy-profile, --remove-profile may be used at a time.",
-            file=sys.stderr,
-        )
-        return 1
 
     if args.list_profiles:
         ensure_config_exists()
@@ -778,18 +1024,19 @@ def main() -> int:
             return 1
         return 0
 
-    if args.ask is not None and args.ask_file is not None:
-        print("ERROR: Confliect between --ask and --ask-file", file=sys.stderr)
+    if args.patch and not args.task:
+        print("ERROR: --patch requires --task", file=sys.stderr)
         return 1
-    if (args.ask is not None or args.ask_file) and (args.task is not None or args.task_file is not None):
-        print("ERROR: Conflict between --ask / --ask-file and --task / --task-file", file=sys.stderr)
+    if args.patch and (args.ask or args.ask_file or args.task_file):
+        print("ERROR: --patch only supports --task (not --ask/--ask-file)", file=sys.stderr)
         return 1
-    if args.task is not None and args.task_file is not None:
-        print("ERROR: Confliect between --task and --task-file", file=sys.stderr)
-        return 1
-    if args.system_prompt is not None and args.system_prompt_file is not None:
-        print("ERROR: Confliect between --system-prompt and --system-prompt-file", file=sys.stderr)
-        return 1
+
+    patch_mode = args.patch
+    suffix_provided = args.patch_suffix is not None
+    patch_suffix = args.patch_suffix or ".mcepatched"
+    if not patch_suffix.startswith("."):
+        patch_suffix = f".{patch_suffix}"
+
 
     add_line_numbers = not args.no_line_numbers
 
@@ -876,11 +1123,23 @@ def main() -> int:
         else config.get("llm_timeout", 300)
     )
 
-    openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "auto")).strip()
+    openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
 
-    json_schema: dict[str, Any] | None = None
-    if response_format == "schema":
+    if patch_mode:
+        response_format = "schema"
+        json_schema = PATCH_MANIFEST_SCHEMA
+        system_prompt = (
+            "You are generating text edits (patches) using a JSON manifest for one or more text files. "
+            "Return only JSON that matches the schema.\n"
+            "Remove the numbers and single space at the start of any line that has them, "
+            "they are line numbers that do not appear in the original content."
+        )
+        add_line_numbers = True
+
+
+    json_schema: dict[str, Any] | None = json_schema
+    if response_format == "schema" and json_schema is None:
         if not args.schema_file:
             print(
                 "ERROR: --schema-file is required when --response-format schema",
@@ -888,7 +1147,7 @@ def main() -> int:
             )
             return 1
         json_schema = load_json_schema(args.schema_file)
-    elif args.schema_file:
+    elif args.schema_file and response_format != "schema":
         print(
             "ERROR: --schema-file only applies to --response-format schema",
             file=sys.stderr,
@@ -929,6 +1188,18 @@ def main() -> int:
             response_format=response_format,
             json_schema=json_schema,
         )
+        if patch_mode:
+            original_texts: dict[str, str] = {}
+            for f in args.files:
+                try:
+                    abs_path = Path(f).resolve()
+                    original_texts[str(abs_path)] = abs_path.read_text(encoding="utf-8")
+                except Exception as exc:
+                    print(f"ERROR: Could not read '{f}': {exc}", file=sys.stderr)
+                    return 1
+            if not original_texts:
+                print("ERROR: No readable input files.", file=sys.stderr)
+                return 1
 
     request_tokens = estimate_request_tokens(
         model=model,
@@ -944,7 +1215,8 @@ def main() -> int:
 
     request_characters = len(full_system_prompt + user_prompt)
 
-    if not args.quiet:
+
+    if VERBOSE:
         print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}", file=sys.stderr)
 
     start_time = time.perf_counter()
@@ -976,19 +1248,85 @@ def main() -> int:
     elapsed = time.perf_counter() - start_time
     result = getattr(response_obj, "output_text", "")
 
+    if patch_mode:
+        try:
+            if not result or not result.strip():
+                print("ERROR: LLM returned empty response for patch manifest", file=sys.stderr)
+                return 1
+            manifest = json.loads(result)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: Failed to parse patch manifest JSON: {exc}", file=sys.stderr)
+            return 1
+
+        updated_texts = apply_combined_patch_manifest(original_texts, manifest)
+        diffs = []
+        for fp, ut in updated_texts.items():
+            ot = original_texts.get(fp, "")
+            if ut != ot:
+                d = generate_unified_diff(ot, ut, fp)
+                if d: diffs.append(d)
+        if not diffs:
+            if VERBOSE:
+                print("No changes.", file=sys.stderr)
+            return 0
+        if VERBOSE or args.patch_review:
+            print()
+            print("\n".join(diffs))
+        if args.patch_review:
+            if input("\nApply these changes? [y/N]: ").strip().lower() not in ("y", "yes", "Y"):
+                if VERBOSE:
+                    print("Aborted.", file=sys.stderr)
+                    print_stats(
+                        request_characters=request_characters,
+                        request_tokens=request_tokens,
+                        processing_time=elapsed,
+                        response_text=result,
+                        usage=usage,
+                    )
+                return 0
+            for fp, ut in updated_texts.items():
+                if ut == original_texts.get(fp, ""): continue
+                tgt = append_suffix_to_path(Path(fp), patch_suffix) if suffix_provided else Path(fp)
+                tgt.write_text(ut, encoding="utf-8")
+                print(f"file_written={str(tgt) if suffix_provided else fp}")
+        else:
+            for fp, ut in updated_texts.items():
+                if ut == original_texts.get(fp, ""): continue
+                outp = append_suffix_to_path(Path(fp), patch_suffix)
+                outp.write_text(ut, encoding="utf-8")
+                print(f"file_written={outp}")
+
+        if VERBOSE:
+            print_stats(
+                request_characters=request_characters,
+                request_tokens=request_tokens,
+                processing_time=elapsed,
+                response_text=result,
+                usage=usage,
+            )
+
+        return 0
+
+
     if response_format in ("json", "schema"):
         result = pretty_json(result)
 
     if args.print_reasoning:
-        for item in getattr(response_obj, "output", []):
-            if getattr(item, "type", None) == "reasoning":
-                for content in getattr(item, "content", []):
-                    if getattr(content, "type", None) == "reasoning_text":
-                        reasoning = getattr(content, "text", "")
-        output_str = (
-            f"<reasoning>\n{reasoning}\n</reasoning>\n"
-            f"<response>\n{result}\n</response>"
-        )
+        try:
+            for item in getattr(response_obj, "output", []):
+                if getattr(item, "type", None) == "reasoning":
+                    for content in getattr(item, "content", []):
+                        if getattr(content, "type", None) == "reasoning_text":
+                            reasoning = getattr(content, "text", "")
+            output_str = (
+                f"<reasoning>\n{reasoning}\n</reasoning>\n"
+                f"<response>\n{result}\n</response>"
+            )
+        except:
+            output_str = (
+                f"<reasoning>\n</reasoning>\n"
+                f"<response>\n{result}\n</response>"
+            )
     else:
         output_str = result
 
@@ -1003,7 +1341,7 @@ def main() -> int:
     else:
         print(output_str)
 
-    if not args.quiet:
+    if VERBOSE:
         print_stats(
             request_characters=request_characters,
             request_tokens=request_tokens,
