@@ -1303,8 +1303,14 @@ def main() -> int:
             if not result or not result.strip():
                 print("ERROR: LLM returned empty response for patch manifest", file=sys.stderr)
                 return 1
-            manifest = json.loads(result)
+
+            start = result.find('{')
+            if start == -1:
+                print("ERROR: No JSON object found in response", file=sys.stderr)
+                return 1
+            manifest = json.loads(result[start:])
         except json.JSONDecodeError as exc:
+            print(result)
             print(f"ERROR: Failed to parse patch manifest JSON: {exc}", file=sys.stderr)
             return 1
 
