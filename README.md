@@ -112,6 +112,14 @@ mince --openai-base-url http://localhost:11434/v1 \
   --files README.md
 ```
 
+## Tested Providers ⚒️
+
+| OpenAI | GPT 5.5 | ✅ |
+| Alibaba | Qwen 3.7 |  ✅ |
+| Oracle | GPT-OSS-120b | ✅ |
+| xAI | Grok 4.3 | ✅ |
+
+
 ## Notes 🗒️
 
 - Large files are skipped automatically
@@ -131,6 +139,9 @@ All the `mince` CLI arguments for reference.
 | `--ask`                | Prompt without file context or the configured system prompt. |
 | `--ask-file`           | Read the ask prompt from the given file. |
 | `--output-file`        | Write the response to the given file (overwrites if it exists). |
+| `--patch`              | Patch specified files and write changes to the filename + patch suffix. |
+| `--patch-review`       | Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix). |
+| `--patch-suffix`       | Suffix for patched files. |
 | `--system-prompt`      | System prompt override. |
 | `--system-prompt-file` | Read the system prompt from the given file. |
 | `--model`              | Override configured model. |

@@ -1206,7 +1206,7 @@ def main() -> int:
             add_line_numbers=add_line_numbers
         )
         if add_line_numbers:
-            full_system_prompt = (linenum_system_prompt + system_prompt)
+            full_system_prompt = (linenum_system_prompt + "\n" + system_prompt)
         else:
             full_system_prompt = system_prompt
         user_prompt = build_user_prompt(
