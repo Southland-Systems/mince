@@ -5,6 +5,12 @@ mince
 A small, single-command assistant for turning local files into useful answers.
 """
 
+## TODO
+##
+# - move patch system prompt into config / cli arg
+# - output patch files to /tmp/filename-unixtime-pid before displaying
+
+
 from __future__ import annotations
 
 import os
@@ -52,8 +58,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_service_tier": "off",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
-    "temperature": 1.0,
-    "top_p": 1.0,
+    "temperature": "off",
+    "top_p": "off",
     "openai_reasoning": "low",
     "token_limit": 65534,
     "max_output_tokens": 65534,
@@ -222,8 +228,8 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
-    prompt_config_value(config, "temperature", "Temperature (0.0-2.0)", float)
-    prompt_config_value(config, "top_p", "Top P (0.0-1.0)", float)
+    prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
+    prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
     prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
@@ -817,13 +823,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--temperature",
-        type=float,
-        help="Sampling temperature (0.0-2.0)",
+        type=str,
+        help="Sampling temperature (0.0-2.0) or 'off' to disable",
     )
     parser.add_argument(
         "--top-p",
-        type=float,
-        help="Top-p nucleus sampling (0.0-1.0)",
+        type=str,
+        help="Top-p nucleus sampling (0.0-1.0) or 'off' to disable",
     )
     parser.add_argument(
         "--openai-reasoning",
@@ -1084,10 +1090,30 @@ def main() -> int:
     temperature = (
         args.temperature
         if args.temperature is not None
-        else config.get("temperature", 1.0)
+        else config.get("temperature", "off")
     )
+    if isinstance(temperature, str):
+        if temperature.lower() == "off":
+            temperature = None
+        else:
+            try:
+                temperature = float(temperature)
+            except ValueError:
+                print("ERROR: Invalid temperature value.", file=sys.stderr)
+                return 1
 
-    top_p = args.top_p if args.top_p is not None else config.get("top_p", 1.0)
+    top_p_raw = args.top_p if args.top_p is not None else config.get("top_p", "off")
+    if isinstance(top_p_raw, str):
+        if top_p_raw.lower() == "off":
+            top_p = None
+        else:
+            try:
+                top_p = float(top_p_raw)
+            except ValueError:
+                print("ERROR: Invalid top-p value.", file=sys.stderr)
+                return 1
+    else:
+        top_p = top_p_raw
 
     token_limit = (
         args.token_limit
