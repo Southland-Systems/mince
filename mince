@@ -943,7 +943,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     # TODO hardcoded variables
-    tokenizer_padding = 14
+    tokenizer_padding = 0
 
     json_schema = None
 
@@ -1178,11 +1178,9 @@ def main() -> int:
     if patch_mode:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
-        patch_system_prompt = system_prompt + (
+        patch_system_prompt = system_prompt + "\n" + (
             "You are generating text edits (patches) using a JSON manifest for one or more text files. "
             "Return only JSON that matches the schema.\n"
-            "Remove the numbers and single space at the start of any line that has them, "
-            "they are line numbers that do not appear in the original content."
         )
         system_prompt = patch_system_prompt
         add_line_numbers = True
@@ -1228,7 +1226,7 @@ def main() -> int:
             max_file_size_kb=max_file_size_kb,
             add_line_numbers=add_line_numbers
         )
-        if add_line_numbers:
+        if add_line_numbers or patch_mode:
             full_system_prompt = (linenum_system_prompt + "\n" + system_prompt)
         else:
             full_system_prompt = system_prompt
@@ -1305,7 +1303,7 @@ def main() -> int:
                 print("ERROR: LLM returned empty response for patch manifest", file=sys.stderr)
                 return 1
 
-            result = re.sub(r'^.+(?:<\|message\|>)', '', result).strip()
+            result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
             manifest = json.loads(result)
         except json.JSONDecodeError as exc:
             print(result)
@@ -1368,7 +1366,7 @@ def main() -> int:
                 print("ERROR: LLM returned empty response", file=sys.stderr)
                 return 1
 
-            result = re.sub(r'^.+(?:<\|message\|>)', '', result).strip()
+            result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
             result = json.loads(result)
         except json.JSONDecodeError as exc:
             print(result)
