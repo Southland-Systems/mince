@@ -65,6 +65,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_output_tokens": 65534,
     "max_file_size_kb": 512,
     "response_format": "text",
+    "response_verbosity": "off",
     "llm_timeout": 300,
     "openai_extra_body": "",
 }
@@ -230,6 +231,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
+    prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
     prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
@@ -663,6 +665,7 @@ def call_openai(
     user_prompt: str = "",
     response_format: str = "text",
     json_schema: dict[str, Any] | None = None,
+    response_verbosity: str | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
     max_output_tokens: int | None = None,
@@ -715,10 +718,17 @@ def call_openai(
         if not json_schema:
             raise ValueError("--response-format schema requires --schema-file")
         kwargs["text"] = {"format": json_schema}
+    else:
+        text_payload: dict[str, Any] = {"format": {"type": "text"}}
+        if response_verbosity and response_verbosity != "off":
+            text_payload["verbosity"] = response_verbosity
+        kwargs["text"] = text_payload
+
     try:
         response = client.responses.create(**kwargs)
     except Exception as exc:
         _handle_openai_error(exc)
+
     return response, usage_to_dict(getattr(response, "usage", None))
 
 
@@ -820,6 +830,12 @@ def parse_args() -> argparse.Namespace:
         "--schema-file",
         type=Path,
         help="Path to a JSON Schema file (required for --response-format schema)",
+    )
+    parser.add_argument(
+        "--response-verbosity",
+        choices=("low", "medium", "high", "off"),
+        default="off",
+        help="Verbosity level for text responses (default: off)",
     )
     parser.add_argument(
         "--temperature",
@@ -1152,6 +1168,12 @@ def main() -> int:
     openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
 
+    response_verbosity: str = (
+        args.response_verbosity
+        if args.response_verbosity is not None
+        else config.get("response_verbosity", "off")
+    ).lower()
+
     if patch_mode:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
@@ -1260,6 +1282,7 @@ def main() -> int:
             user_prompt=user_prompt,
             response_format=response_format,
             json_schema=json_schema,
+            response_verbosity=response_verbosity,
             temperature=temperature,
             top_p=top_p,
             max_output_tokens=max_output_tokens,

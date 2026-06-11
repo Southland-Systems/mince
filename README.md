@@ -154,9 +154,10 @@ All the `mince` CLI arguments for reference.
 | `--openai-service-tier`| OpenAI service tier. |
 | `--response-format`    | LLM response format in text, JSON or JSON‑Schema. |
 | `--schema-file`        | Path to a JSON Schema file (required for --response-format schema). |
-| `--temperature`        | Sampling temperature (0.0‑2.0). |
-| `--top-p`              | Top‑p nucleus sampling (0.0‑1.0). |
-| `--openai-reasoning`   | Reasoning effort level (low). |
+| `--response-verbosity` | Verbosity level for text responses (off, low, medium, high). |
+| `--temperature`        | Sampling temperature (off, 0.0‑2.0). |
+| `--top-p`              | Top‑p nucleus sampling (off, 0.0‑1.0). |
+| `--openai-reasoning`   | Reasoning effort level (none, minimal, low, medium, high, xhigh). |
 | `--openai-extra-body`  | Custom model parameters (key=value pairs separated by commas). |
 | `--token-limit`        | Maximum allowed input token count (65534). |
 | `--max-output-tokens`  | Maximum output tokens the LLM will use (65534). |
