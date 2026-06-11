@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 import time
+import re
 from pathlib import Path
 from typing import Any
 from dataclasses import dataclass
@@ -1304,11 +1305,8 @@ def main() -> int:
                 print("ERROR: LLM returned empty response for patch manifest", file=sys.stderr)
                 return 1
 
-            start = result.find('{')
-            if start == -1:
-                print("ERROR: No JSON object found in response", file=sys.stderr)
-                return 1
-            manifest = json.loads(result[start:])
+            result = re.sub(r'^.+(?:<\|message\|>)', '', result).strip()
+            manifest = json.loads(result)
         except json.JSONDecodeError as exc:
             print(result)
             print(f"ERROR: Failed to parse patch manifest JSON: {exc}", file=sys.stderr)
@@ -1365,7 +1363,19 @@ def main() -> int:
 
 
     if response_format in ("json", "schema"):
-        result = pretty_json(result)
+        try:
+            if not result or not result.strip():
+                print("ERROR: LLM returned empty response", file=sys.stderr)
+                return 1
+
+            result = re.sub(r'^.+(?:<\|message\|>)', '', result).strip()
+            result = json.loads(result)
+        except json.JSONDecodeError as exc:
+            print(result)
+            print(f"ERROR: Failed to parse JSON: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            result = pretty_json(result)
 
     if args.print_reasoning:
         try:
