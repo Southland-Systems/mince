@@ -114,6 +114,8 @@ mince --openai-base-url http://localhost:11434/v1 \
 
 ## Tested Providers ⚒️
 
+| Provider | Model | Status |
+|----------|-------|--------|
 | OpenAI | GPT 5.5 | ✅ |
 | Alibaba | Qwen 3.7 |  ✅ |
 | Oracle | GPT-OSS-120b | ✅ |
