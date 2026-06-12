@@ -3,9 +3,10 @@
 ## What it does ✨
 
 - Reads one or more local files as context
+- Can optionally patch files
 - Prefixes line numbers to content for improved LLM understanding
 - Sends a single request to an OpenAI‑compatible model endpoint
-- Supports plain text, JSON, and JSON Schema outputs
+- Supports text, JSON, and JSON Schema Structured Outputs
 - Works with hosted APIs and local OpenAI‑compatible servers
 - Creates a context controlled, continuously verified workflow
 
@@ -84,8 +85,7 @@ mince --task "Provide the file name and line count as JSON" \
 ```bash
 mince --files passwd --task 'The provided `passwd` file is a \
 UNIX account file in "passwd" format. Remove lines 1-5 from `passwd` \
-and create a new file called `passwd-new` with those lines, \
-perform these changes with the provided JSON Schema.' \
+and create a new file called `passwd-new` with those lines.' \
   --patch --patch-review --patch-suffix .patched
 ```
 
@@ -120,6 +120,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 | Alibaba | Qwen 3.7 |  ✅ |
 | Oracle | GPT-OSS-120b | ✅ |
 | xAI | Grok 4.3 | ✅ |
+| AWS | GPT-OSS-120b | ✅ |
 
 
 ## Notes 🗒️
@@ -147,6 +148,7 @@ All the `mince` CLI arguments for reference.
 | `--system-prompt`      | System prompt override. |
 | `--system-prompt-file` | Read the system prompt from the given file. |
 | `--model`              | Override configured model. |
+| `--list-models`        | List available models. |
 | `--openai-base-url`    | OpenAI-compatible API base URL. |
 | `--openai-proxy`       | HTTP(S) proxy URL (eg: http://user:pass@proxy:8080). |
 | `--openai-organization`| Optional OpenAI organization ID. |

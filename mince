@@ -801,6 +801,11 @@ def parse_args() -> argparse.Namespace:
         help="Override configured model",
     )
     parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available models",
+    )
+    parser.add_argument(
         "--openai-base-url",
         help="OpenAI-compatible API base URL",
     )
@@ -1065,7 +1070,7 @@ def main() -> int:
 
     ask_mode: bool = args.ask is not None or args.ask_file is not None
 
-    if not ask_mode:
+    if not ask_mode and not args.list_models:
         if args.task:
             task = args.task
         elif args.task_file:
@@ -1082,11 +1087,35 @@ def main() -> int:
 
     config = load_config()
 
+    llm_timeout = (
+        args.llm_timeout
+        if args.llm_timeout is not None
+        else config.get("llm_timeout", 300)
+    )
+
     model = str(args.model or config.get("model")).strip()
     openai_base_url = str(args.openai_base_url or config.get("openai_base_url")).strip()
     openai_proxy = str(args.openai_proxy or config.get("openai_proxy", "")).strip()
     openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
     openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
+
+    if args.list_models:
+        api_key = resolve_api_key(config)
+        client = OpenAI(
+            api_key=api_key,
+            base_url=openai_base_url,
+        )
+        try:
+            models = client.models.list()
+            modelnames = []
+            for m in models:
+                modelnames.append(m.id)
+            modelnames.sort()
+            for m in modelnames:
+                print(m)
+        except Exception as exc:
+            _handle_openai_error(exc)
+        return 0
 
     if args.system_prompt:
         system_prompt = str(args.system_prompt).strip()
@@ -1159,12 +1188,6 @@ def main() -> int:
         extra_body = extra_body_raw
     else:
         extra_body = parse_extra_body(str(extra_body_raw or ""))
-
-    llm_timeout = (
-        args.llm_timeout
-        if args.llm_timeout is not None
-        else config.get("llm_timeout", 300)
-    )
 
     openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
