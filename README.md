@@ -169,7 +169,7 @@ All the `mince` CLI arguments for reference.
 | `--print-reasoning`    | Output the reasoning monolog in <reasoning> tags with the content in <response> tags. |
 | `--print-default-config` | Print the built‑in default configuration as JSON. |
 | `--print-current-config` | Print the stored configuration file (creates it if missing). |
-| `--log`                | Log to HOME/.local/state/mince/logs/. |
+| `--log`                | Log session to HOME/.local/state/mince/logs/. |
 | `--quiet`              | Suppress printing of extra output (stats, information). |
 | `--init`               | Initialize and interactively change the configuration file. |
 | `--profile`            | Select configuration profile. |

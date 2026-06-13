@@ -3,20 +3,27 @@
   "name": "filemeta-schema",
   "strict": true,
   "schema": {
-
-    "type": "array",
-    "items": {
-      "type": "object",
-      "properties": {
-        "filename": {
-          "type": "string"
-        },
-        "line_count": {
-          "type": "integer"
+    "type": "object",
+    "properties": {
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string"
+            },
+            "line_count": {
+              "type": "integer"
+            }
+          },
+          "required": ["filename", "line_count"],
+          "additionalProperties": false
         }
-      },
-      "required": ["filename", "line_count"],
-      "additionalProperties": false
-    }
+      }
+    },
+    "required": ["items"],
+    "additionalProperties": false
   }
 }
+

@@ -5,12 +5,6 @@ mince
 A small, single-command assistant for turning local files into useful answers.
 """
 
-## TODO
-##
-# - move patch system prompt into config / cli arg
-# - output patch files to /tmp/filename-unixtime-pid before displaying
-
-
 from __future__ import annotations
 
 import os
@@ -42,6 +36,7 @@ from openai import (
 )
 import httpx
 
+VERBOSE = 1
 
 APP_DIR = Path.home() / ".local/state/mince"
 DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
@@ -144,8 +139,6 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
     },
 }
 
-VERBOSE = 1
-
 
 # -------------------------------------------------------------------
 # Config
@@ -220,8 +213,7 @@ def init_config_interactive() -> None:
     ensure_config_exists()
     config = load_config()
 
-    print(f"Config file: {CONFIG_FILE}")
-    print()
+    print(f"Config file: {CONFIG_FILE}\n")
 
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
@@ -241,18 +233,16 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
     prompt_config_value(config, "llm_timeout", "API timeout in seconds", int)
-    prompt_config_value(config, "log", "Log to HOME/.local/state/mince/logs/ (off, on)")
+    prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs/ (off, on)")
 
     save_config(config)
 
-    print()
-    print(f"Configuration saved.")
+    print(f"\nConfiguration saved.")
 
 def get_profile_path(name: str) -> Path:
     if name == "config":
         return DEFAULT_CONFIG_FILE
     return APP_DIR / f"{name}.json"
-
 
 
 # -------------------------------------------------------------------
@@ -517,7 +507,6 @@ def build_context(
 
         sections.append(
             f"""
----
 <file path='{path}' encoding='utf-8'>
 {numbered_content}
 </file>
@@ -587,16 +576,18 @@ def build_user_prompt(
 
     if response_format == "schema" and json_schema is not None:
         schema_block = (
-            "\n\nReturn ONLY valid JSON that matches this schema exactly:\n"
-            f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}"
+            "<json_schema instructions='Return ONLY valid JSON that matches this schema exactly'>\n"
+            f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
+            "</json_schema>\n"
         )
 
     return f"""
-TASK:
+<task>
 {task}
-
-CONTEXT:
+</task>
+<files>
 {context}
+</files>
 {schema_block}
 """.strip()
 
@@ -643,6 +634,7 @@ def _handle_openai_error(exc: Exception) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     raise SystemExit(code)
 
+
 def resolve_api_key(config: dict[str, Any]) -> str:
     env_key = os.getenv("OPENAI_API_KEY")
     if env_key:
@@ -652,11 +644,6 @@ def resolve_api_key(config: dict[str, Any]) -> str:
         return key
     raise SystemExit("No API key found. Set it in the config file or 'export OPENAI_API_KEY=key'.")
 
-def validate_model(model: str, client: OpenAI) -> None:
-    try:
-        client.models.retrieve(model)
-    except:
-        raise SystemExit(f"Model '{model}' does not exist or you do not have access.")
 
 def call_openai(
     api_key: str = "",
@@ -691,8 +678,6 @@ def call_openai(
         max_retries=2,
         http_client=http_client,
     )
-
-#    validate_model(model, client)
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -951,7 +936,6 @@ def parse_args() -> argparse.Namespace:
 # -------------------------------------------------------------------
 
 def main() -> int:
-    # TODO hardcoded variables
     tokenizer_padding = 0
 
     json_schema = None
@@ -974,13 +958,6 @@ def main() -> int:
     if not base_profile.isidentifier():
         print(f"ERROR: Invalid profile name '{base_profile}'.", file=sys.stderr)
         return 1
-
-    profile_actions = sum(bool(x) for x in [
-        args.init_profile,
-        args.copy_profile,
-        args.remove_profile,
-        args.list_profiles,
-    ])
 
     if args.list_profiles:
         ensure_config_exists()
@@ -1403,7 +1380,6 @@ def main() -> int:
 
         return 0
 
-
     if response_format in ("json", "schema"):
         try:
             if not result or not result.strip():
@@ -1469,18 +1445,13 @@ def main() -> int:
             usage=usage,
         )
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write("<response>\n")
-            f.write(f"{result}\n")
-            f.write("</response>\n")
+            f.write(f"<response>\n{result}\n</response>\n")
             if reasoning:
-                f.write("<reasoning>\n")
-                f.write(f"{reasoning}\n")
-                f.write("</reasoning>\n")
+                f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
             f.write(f"{statsline}\n")
             f.write(f"end_time={time.ctime(timestamp)}\n")
         if VERBOSE:
             print(f"log_file={log_path}", file=sys.stderr)
-
 
 #    json.dumps(response_obj.model_dump(), indent=2)
 
