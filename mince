@@ -21,6 +21,7 @@ import time
 import re
 from pathlib import Path
 from typing import Any
+import random, string
 from dataclasses import dataclass
 
 import difflib
@@ -69,6 +70,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "response_verbosity": "off",
     "llm_timeout": 300,
     "openai_extra_body": "",
+    "log": "off",
 }
 
 PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
@@ -239,6 +241,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
     prompt_config_value(config, "llm_timeout", "API timeout in seconds", int)
+    prompt_config_value(config, "log", "Log to HOME/.local/state/mince/logs/ (off, on)")
 
     save_config(config)
 
@@ -468,7 +471,7 @@ def print_stats(
             if key in usage:
                 stats.append(f"response_{key}={usage[key]}")
 
-    print(" ".join(stats), file=sys.stderr)
+    return " ".join(stats)
 
 
 def coerce_int(value: Any, default: int) -> int:
@@ -902,6 +905,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the stored configuration file (creates it if missing)",
     )
+    parser.add_argument("--log", action="store_true", help="Log session to HOME/.local/state/mince/logs/")
     parser.add_argument(
         "--quiet",
         action="store_true",
@@ -951,6 +955,7 @@ def main() -> int:
     tokenizer_padding = 0
 
     json_schema = None
+    reasoning = ""
 
     global CONFIG_FILE
     global VERBOSE
@@ -1062,9 +1067,6 @@ def main() -> int:
     patch_mode = args.patch
     suffix_provided = args.patch_suffix is not None
     patch_suffix = args.patch_suffix or ".mcepatched"
-    if not patch_suffix.startswith("."):
-        patch_suffix = f".{patch_suffix}"
-
 
     add_line_numbers = not args.no_line_numbers
 
@@ -1233,6 +1235,16 @@ def main() -> int:
         print("  mince --init")
         return 1
 
+    log_enabled = args.log or str(config.get("log", "off")).lower() in ("on", "true", "yes", "1") or 0
+    log_path = None
+    if log_enabled:
+        LOG_DIR = APP_DIR / "logs"
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
+        timestamp = int(time.time())
+        log_path = LOG_DIR / f"{timestamp}-{rand_part}.txt"
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"start_time={time.ctime(timestamp)}\n")
 
     if ask_mode:
         context = ""
@@ -1286,6 +1298,13 @@ def main() -> int:
 
     request_characters = len(full_system_prompt + user_prompt)
 
+    if log_enabled and log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"request_characters={request_characters} request_tokens_estimate={request_tokens}\n")
+            f.write("<request>\n")
+            f.write(f"system_prompt:\n{full_system_prompt}\n")
+            f.write(f"user_prompt:\n{user_prompt}\n")
+            f.write("</request>\n")
 
     if VERBOSE:
         print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}", file=sys.stderr)
@@ -1348,16 +1367,17 @@ def main() -> int:
             print()
             print("\n".join(diffs))
         if args.patch_review:
-            if input("\nApply these changes? [y/N]: ").strip().lower() not in ("y", "yes", "Y"):
+            if input("\nApply these changes? [y/N]: ").strip().lower() not in ("y", "yes"):
                 if VERBOSE:
                     print("Aborted.", file=sys.stderr)
-                    print_stats(
+                    statsline = print_stats(
                         request_characters=request_characters,
                         request_tokens=request_tokens,
                         processing_time=elapsed,
                         response_text=result,
                         usage=usage,
                     )
+                    print(statsline, file=sys.stderr)
                 return 0
             for fp, ut in updated_texts.items():
                 if ut == original_texts.get(fp, ""): continue
@@ -1372,13 +1392,14 @@ def main() -> int:
                 print(f"file_written={outp}")
 
         if VERBOSE:
-            print_stats(
+            statsline = print_stats(
                 request_characters=request_characters,
                 request_tokens=request_tokens,
                 processing_time=elapsed,
                 response_text=result,
                 usage=usage,
             )
+            print(statsline, file=sys.stderr)
 
         return 0
 
@@ -1429,16 +1450,39 @@ def main() -> int:
         print(output_str)
 
     if VERBOSE:
-        print_stats(
+        statsline = print_stats(
             request_characters=request_characters,
             request_tokens=request_tokens,
             processing_time=elapsed,
             response_text=result,
             usage=usage,
         )
+        print(statsline, file=sys.stderr)
 
-# TODO debugging response
-#    print(json.dumps(response_obj.model_dump(), indent=2))
+
+    if log_enabled and log_path:
+        statsline = print_stats(
+            request_characters=request_characters,
+            request_tokens=request_tokens,
+            processing_time=elapsed,
+            response_text=result,
+            usage=usage,
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("<response>\n")
+            f.write(f"{result}\n")
+            f.write("</response>\n")
+            if reasoning:
+                f.write("<reasoning>\n")
+                f.write(f"{reasoning}\n")
+                f.write("</reasoning>\n")
+            f.write(f"{statsline}\n")
+            f.write(f"end_time={time.ctime(timestamp)}\n")
+        if VERBOSE:
+            print(f"log_file={log_path}", file=sys.stderr)
+
+
+#    json.dumps(response_obj.model_dump(), indent=2)
 
     return 0
 
