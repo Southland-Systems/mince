@@ -1260,6 +1260,12 @@ def main() -> int:
             if not original_texts:
                 print("ERROR: No readable input files.", file=sys.stderr)
                 return 1
+            patch_user_prompt = user_prompt + "\n\n" + (
+                "You are generating a patch using the provided JSON Schema for one or more text files. "
+                "Return only JSON that matches the provided schema.\n"
+            )
+            user_prompt = patch_user_prompt
+
 
     request_tokens = estimate_request_tokens(
         model=model,
@@ -1316,6 +1322,31 @@ def main() -> int:
     elapsed = time.perf_counter() - start_time
     result = getattr(response_obj, "output_text", "")
 
+    try:
+        for item in getattr(response_obj, "output", []):
+            if getattr(item, "type", None) == "reasoning":
+                for content in getattr(item, "content", []):
+                    if getattr(content, "type", None) == "reasoning_text":
+                        reasoning = getattr(content, "text", "")
+    except:
+        reasoning = ""
+
+    statsline = print_stats(
+        request_characters=request_characters,
+        request_tokens=request_tokens,
+        processing_time=elapsed,
+        response_text=result,
+        usage=usage,
+    )
+
+    if log_enabled and log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"<response>\n{result}\n</response>\n")
+            if reasoning:
+                f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
+            f.write(f"{statsline}\n")
+            f.write(f"end_time={time.ctime(timestamp)}\n")
+
     if patch_mode:
         try:
             if not result or not result.strip():
@@ -1339,6 +1370,8 @@ def main() -> int:
         if not diffs:
             if VERBOSE:
                 print("No changes.", file=sys.stderr)
+                if log_enabled and log_path:
+                    print(f"log_file={log_path}", file=sys.stderr)
             return 0
         if VERBOSE or args.patch_review:
             print()
@@ -1347,14 +1380,9 @@ def main() -> int:
             if input("\nApply these changes? [y/N]: ").strip().lower() not in ("y", "yes"):
                 if VERBOSE:
                     print("Aborted.", file=sys.stderr)
-                    statsline = print_stats(
-                        request_characters=request_characters,
-                        request_tokens=request_tokens,
-                        processing_time=elapsed,
-                        response_text=result,
-                        usage=usage,
-                    )
                     print(statsline, file=sys.stderr)
+                    if log_enabled and log_path:
+                        print(f"log_file={log_path}", file=sys.stderr)
                 return 0
             for fp, ut in updated_texts.items():
                 if ut == original_texts.get(fp, ""): continue
@@ -1368,24 +1396,9 @@ def main() -> int:
                 outp.write_text(ut, encoding="utf-8")
                 print(f"file_written={outp}")
 
-        statsline = print_stats(
-            request_characters=request_characters,
-            request_tokens=request_tokens,
-            processing_time=elapsed,
-            response_text=result,
-            usage=usage,
-        )
         if VERBOSE:
             print(statsline, file=sys.stderr)
-
-        if log_enabled and log_path:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"<response>\n{result}\n</response>\n")
-                if reasoning:
-                    f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
-                f.write(f"{statsline}\n")
-                f.write(f"end_time={time.ctime(timestamp)}\n")
-            if VERBOSE:
+            if log_enabled and log_path:
                 print(f"log_file={log_path}", file=sys.stderr)
 
         return 0
@@ -1406,21 +1419,10 @@ def main() -> int:
             result = pretty_json(result)
 
     if args.print_reasoning:
-        try:
-            for item in getattr(response_obj, "output", []):
-                if getattr(item, "type", None) == "reasoning":
-                    for content in getattr(item, "content", []):
-                        if getattr(content, "type", None) == "reasoning_text":
-                            reasoning = getattr(content, "text", "")
-            output_str = (
-                f"<reasoning>\n{reasoning}\n</reasoning>\n"
-                f"<response>\n{result}\n</response>"
-            )
-        except:
-            output_str = (
-                f"<reasoning>\n</reasoning>\n"
-                f"<response>\n{result}\n</response>"
-            )
+        output_str = (
+            f"<reasoning>\n{reasoning}\n</reasoning>\n"
+            f"<response>\n{result}\n</response>"
+        )
     else:
         output_str = result
 
@@ -1436,31 +1438,8 @@ def main() -> int:
         print(output_str)
 
     if VERBOSE:
-        statsline = print_stats(
-            request_characters=request_characters,
-            request_tokens=request_tokens,
-            processing_time=elapsed,
-            response_text=result,
-            usage=usage,
-        )
         print(statsline, file=sys.stderr)
-
-
-    if log_enabled and log_path:
-        statsline = print_stats(
-            request_characters=request_characters,
-            request_tokens=request_tokens,
-            processing_time=elapsed,
-            response_text=result,
-            usage=usage,
-        )
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"<response>\n{result}\n</response>\n")
-            if reasoning:
-                f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
-            f.write(f"{statsline}\n")
-            f.write(f"end_time={time.ctime(timestamp)}\n")
-        if VERBOSE:
+        if log_enabled and log_path:
             print(f"log_file={log_path}", file=sys.stderr)
 
 #    json.dumps(response_obj.model_dump(), indent=2)
