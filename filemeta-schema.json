@@ -5,7 +5,7 @@
   "schema": {
     "type": "object",
     "properties": {
-      "items": {
+      "files": {
         "type": "array",
         "items": {
           "type": "object",
@@ -22,7 +22,7 @@
         }
       }
     },
-    "required": ["items"],
+    "required": ["files"],
     "additionalProperties": false
   }
 }

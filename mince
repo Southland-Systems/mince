@@ -576,7 +576,7 @@ def build_user_prompt(
 
     if response_format == "schema" and json_schema is not None:
         schema_block = (
-            "<json_schema instructions='Return ONLY valid JSON that matches this schema exactly'>\n"
+            "<json_schema instructions='Return JSON that matches this schema exactly'>\n"
             f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
             "</json_schema>\n"
         )
@@ -1181,8 +1181,8 @@ def main() -> int:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
         patch_system_prompt = system_prompt + "\n" + (
-            "You are generating text edits (patches) using a JSON manifest for one or more text files. "
-            "Return only JSON that matches the schema.\n"
+            "You are generating a patch using the provided JSON Schema for one or more text files. "
+            "Return only JSON that matches the provided schema.\n"
         )
         system_prompt = patch_system_prompt
         add_line_numbers = True
@@ -1368,15 +1368,25 @@ def main() -> int:
                 outp.write_text(ut, encoding="utf-8")
                 print(f"file_written={outp}")
 
+        statsline = print_stats(
+            request_characters=request_characters,
+            request_tokens=request_tokens,
+            processing_time=elapsed,
+            response_text=result,
+            usage=usage,
+        )
         if VERBOSE:
-            statsline = print_stats(
-                request_characters=request_characters,
-                request_tokens=request_tokens,
-                processing_time=elapsed,
-                response_text=result,
-                usage=usage,
-            )
             print(statsline, file=sys.stderr)
+
+        if log_enabled and log_path:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"<response>\n{result}\n</response>\n")
+                if reasoning:
+                    f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
+                f.write(f"{statsline}\n")
+                f.write(f"end_time={time.ctime(timestamp)}\n")
+            if VERBOSE:
+                print(f"log_file={log_path}", file=sys.stderr)
 
         return 0
 
