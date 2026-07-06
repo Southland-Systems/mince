@@ -1181,7 +1181,7 @@ def main() -> int:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
         patch_system_prompt = system_prompt + "\n" + (
-            "You are generating a patch using the provided JSON Schema for one or more text files. "
+            "Generate a patch using the provided JSON Schema for one or more text files. "
             "Return only JSON that matches the provided schema.\n"
         )
         system_prompt = patch_system_prompt
@@ -1219,7 +1219,7 @@ def main() -> int:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
         timestamp = int(time.time())
-        log_path = LOG_DIR / f"{timestamp}-{rand_part}.txt"
+        log_path = LOG_DIR / f"{base_profile}-{timestamp}-{rand_part}.txt"
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"start_time={time.ctime(timestamp)}\n")
 
@@ -1261,11 +1261,10 @@ def main() -> int:
                 print("ERROR: No readable input files.", file=sys.stderr)
                 return 1
             patch_user_prompt = user_prompt + "\n\n" + (
-                "You are generating a patch using the provided JSON Schema for one or more text files. "
+                "Generate a patch using the provided JSON Schema for one or more text files. "
                 "Return only JSON that matches the provided schema.\n"
             )
             user_prompt = patch_user_prompt
-
 
     request_tokens = estimate_request_tokens(
         model=model,
@@ -1281,15 +1280,17 @@ def main() -> int:
 
     request_characters = len(full_system_prompt + user_prompt)
 
-    if log_enabled and log_path:
+    if log_enabled:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"request_characters={request_characters} request_tokens_estimate={request_tokens}\n")
             f.write("<request>\n")
-            f.write(f"system_prompt:\n{full_system_prompt}\n")
-            f.write(f"user_prompt:\n{user_prompt}\n")
+            f.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
+            f.write(f"<user_prompt>\n{user_prompt}\n</user_prompt>\n")
             f.write("</request>\n")
 
     if VERBOSE:
+        if log_enabled:
+            print(f"log_file={log_path}", file=sys.stderr)
         print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}", file=sys.stderr)
 
     start_time = time.perf_counter()
@@ -1339,11 +1340,11 @@ def main() -> int:
         usage=usage,
     )
 
-    if log_enabled and log_path:
+    if log_enabled:
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"<response>\n{result}\n</response>\n")
             if reasoning:
                 f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
+            f.write(f"<response>\n{result}\n</response>\n")
             f.write(f"{statsline}\n")
             f.write(f"end_time={time.ctime(timestamp)}\n")
 
@@ -1357,6 +1358,8 @@ def main() -> int:
             manifest = json.loads(result)
         except json.JSONDecodeError as exc:
             print(result)
+            if VERBOSE:
+                print(statsline, file=sys.stderr)
             print(f"ERROR: Failed to parse patch manifest JSON: {exc}", file=sys.stderr)
             return 1
 
@@ -1370,7 +1373,8 @@ def main() -> int:
         if not diffs:
             if VERBOSE:
                 print("No changes.", file=sys.stderr)
-                if log_enabled and log_path:
+                print(statsline, file=sys.stderr)
+                if log_enabled:
                     print(f"log_file={log_path}", file=sys.stderr)
             return 0
         if VERBOSE or args.patch_review:
@@ -1381,8 +1385,6 @@ def main() -> int:
                 if VERBOSE:
                     print("Aborted.", file=sys.stderr)
                     print(statsline, file=sys.stderr)
-                    if log_enabled and log_path:
-                        print(f"log_file={log_path}", file=sys.stderr)
                 return 0
             for fp, ut in updated_texts.items():
                 if ut == original_texts.get(fp, ""): continue
@@ -1398,8 +1400,6 @@ def main() -> int:
 
         if VERBOSE:
             print(statsline, file=sys.stderr)
-            if log_enabled and log_path:
-                print(f"log_file={log_path}", file=sys.stderr)
 
         return 0
 
@@ -1413,6 +1413,8 @@ def main() -> int:
             result = json.loads(result)
         except json.JSONDecodeError as exc:
             print(result)
+            if VERBOSE:
+                print(statsline, file=sys.stderr)
             print(f"ERROR: Failed to parse JSON: {exc}", file=sys.stderr)
             return 1
         finally:
@@ -1433,14 +1435,14 @@ def main() -> int:
         except Exception as exc:
             print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
             print(output_str)
+            if VERBOSE:
+                print(statsline, file=sys.stderr)
             return 1
     else:
         print(output_str)
 
     if VERBOSE:
         print(statsline, file=sys.stderr)
-        if log_enabled and log_path:
-            print(f"log_file={log_path}", file=sys.stderr)
 
 #    json.dumps(response_obj.model_dump(), indent=2)
 
