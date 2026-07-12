@@ -44,6 +44,7 @@ CONFIG_FILE = DEFAULT_CONFIG_FILE
 
 DEFAULT_SYSTEM_PROMPT = "You are a concise and technically accurate software engineering assistant."
 DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from the start of each line."
+DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a patch using the provided JSON Schema for one or more text files. Return only JSON that matches the provided schema."
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.5",
@@ -53,8 +54,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_organization": "",
     "openai_project": "",
     "openai_service_tier": "off",
+    "safety_identifier": "",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
+    "patch_system_prompt": DEFAULT_PATCH_SYSTEM_PROMPT,
     "temperature": "off",
     "top_p": "off",
     "openai_reasoning": "low",
@@ -219,11 +222,13 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
     prompt_config_value(config, "openai_base_url", "OpenAI-compatible base URL")
     prompt_config_value(config, "openai_proxy", "HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)")
-    prompt_config_value(config, "openai_organization", "Organization name or ID")
-    prompt_config_value(config, "openai_project", "Project name or ID")
+    prompt_config_value(config, "openai_organization", "Organization name or ID (optional)")
+    prompt_config_value(config, "openai_project", "Project name or ID (optional)")
+    prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
+    prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
@@ -480,6 +485,11 @@ def read_file(path: Path) -> str:
         return f"ERROR: cannot read file {path} ({exc})"
 
 
+def read_prompt_argument(value: str) -> str:
+    if value == "-":
+        return sys.stdin.read().strip()
+    return value.strip()
+
 def build_context(
     file_paths: list[Path],
     max_file_size_kb: int,
@@ -506,14 +516,10 @@ def build_context(
             numbered_content = content
 
         sections.append(
-            f"""
-<file path='{path}' encoding='utf-8'>
-{numbered_content}
-</file>
-""".strip()
+            f"<file path='{path}' encoding='utf-8'>\n{numbered_content}\n</file>".strip()
         )
 
-    return "\n\n".join(sections)
+    return "\n".join(sections)
 
 
 def load_json_schema(path: Path) -> dict[str, Any]:
@@ -585,7 +591,7 @@ def build_user_prompt(
 <task>
 {task}
 </task>
-<files>
+<files current_working_directory='{os.getcwd()}'>
 {context}
 </files>
 {schema_block}
@@ -664,6 +670,7 @@ def call_openai(
     openai_reasoning: str | None = None,
     extra_body: dict[str, Any] | None = None,
     llm_timeout: int | None = None,
+    safety_identifier: str | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
     if openai_proxy:
@@ -685,6 +692,9 @@ def call_openai(
         "input": user_prompt,
         "extra_body": extra_body or {},
     }
+
+    if safety_identifier is not None and str(safety_identifier).strip():
+        kwargs["safety_identifier"] = str(safety_identifier).strip()
 
     if temperature is not None:
         kwargs["temperature"] = temperature
@@ -733,7 +743,7 @@ def parse_args() -> argparse.Namespace:
     mode_group.add_argument(
         "--ask",
         type=str,
-        help="Prompt without file context or the configured system prompt",
+        help="Prompt without file context or the configured system prompt (use - to read from STDIN)",
     )
     mode_group.add_argument(
         "--ask-file",
@@ -742,7 +752,7 @@ def parse_args() -> argparse.Namespace:
     )
     mode_group.add_argument(
         "--task",
-        help="Task/prompt for the model with file context",
+        help="Task/prompt for the model with file context (use - to read from STDIN)",
     )
     mode_group.add_argument(
         "--task-file",
@@ -783,6 +793,10 @@ def parse_args() -> argparse.Namespace:
         "--system-prompt-file",
         type=Path,
         help="Read the system prompt from the given file",
+    )
+    parser.add_argument(
+        "--patch-system-prompt",
+        help="System prompt for patch mode",
     )
     parser.add_argument(
         "--model",
@@ -854,6 +868,11 @@ def parse_args() -> argparse.Namespace:
         "--token-limit",
         type=int,
         help="Maximum allowed input token count (65534)",
+    )
+    parser.add_argument(
+        "--estimate-only",
+        action="store_true",
+        help="Print only the estimated input token count",
     )
     parser.add_argument(
         "--max-output-tokens",
@@ -1051,7 +1070,7 @@ def main() -> int:
 
     if not ask_mode and not args.list_models:
         if args.task:
-            task = args.task
+            task = read_prompt_argument(args.task)
         elif args.task_file:
             task = read_file(args.task_file).strip()
         else:
@@ -1077,6 +1096,7 @@ def main() -> int:
     openai_proxy = str(args.openai_proxy or config.get("openai_proxy", "")).strip()
     openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
     openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
+    safety_identifier = config.get("safety_identifier")
 
     if args.list_models:
         api_key = resolve_api_key(config)
@@ -1110,6 +1130,13 @@ def main() -> int:
     else:
         linenum_system_prompt = str(
             config.get("linenum_system_prompt", DEFAULT_LINENUM_SYSTEM_PROMPT)
+        ).strip()
+
+    if args.patch_system_prompt:
+        patch_system_prompt = str(args.patch_system_prompt).strip()
+    else:
+        patch_system_prompt = str(
+            config.get("patch_system_prompt", DEFAULT_PATCH_SYSTEM_PROMPT)
         ).strip()
 
     temperature = (
@@ -1180,11 +1207,7 @@ def main() -> int:
     if patch_mode:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
-        patch_system_prompt = system_prompt + "\n" + (
-            "Generate a patch using the provided JSON Schema for one or more text files. "
-            "Return only JSON that matches the provided schema.\n"
-        )
-        system_prompt = patch_system_prompt
+        system_prompt = system_prompt + "\n" + patch_system_prompt + "\n"
         add_line_numbers = True
 
 
@@ -1226,7 +1249,7 @@ def main() -> int:
     if ask_mode:
         context = ""
         if args.ask is not None:
-            user_prompt = args.ask.strip()
+            user_prompt = read_prompt_argument(args.ask)
         else:
             user_prompt = read_file(args.ask_file).strip()
         full_system_prompt = system_prompt
@@ -1260,11 +1283,7 @@ def main() -> int:
             if not original_texts:
                 print("ERROR: No readable input files.", file=sys.stderr)
                 return 1
-            patch_user_prompt = user_prompt + "\n\n" + (
-                "Generate a patch using the provided JSON Schema for one or more text files. "
-                "Return only JSON that matches the provided schema.\n"
-            )
-            user_prompt = patch_user_prompt
+            user_prompt = user_prompt + "\n" + patch_system_prompt + "\n"
 
     request_tokens = estimate_request_tokens(
         model=model,
@@ -1274,6 +1293,10 @@ def main() -> int:
 
     request_tokens += tokenizer_padding
 
+    if args.estimate_only:
+        print(f"request_tokens_estimate={request_tokens}")
+        return 0
+
     if request_tokens > token_limit:
         print(f"ERROR: Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
         return 1
@@ -1282,7 +1305,7 @@ def main() -> int:
 
     if log_enabled:
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"request_characters={request_characters} request_tokens_estimate={request_tokens}\n")
+            f.write(f"request_characters={request_characters} request_tokens_estimate={request_tokens} model={model}\n")
             f.write("<request>\n")
             f.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
             f.write(f"<user_prompt>\n{user_prompt}\n</user_prompt>\n")
@@ -1291,7 +1314,7 @@ def main() -> int:
     if VERBOSE:
         if log_enabled:
             print(f"log_file={log_path}", file=sys.stderr)
-        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}", file=sys.stderr)
+        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens} model={model}", file=sys.stderr)
 
     start_time = time.perf_counter()
 
@@ -1315,6 +1338,7 @@ def main() -> int:
             openai_reasoning=openai_reasoning,
             extra_body=extra_body,
             llm_timeout=llm_timeout,
+            safety_identifier=safety_identifier,
         )
     except Exception as exc:
         print(f"OpenAI API error: {exc}", file=sys.stderr)
@@ -1346,7 +1370,7 @@ def main() -> int:
                 f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
             f.write(f"<response>\n{result}\n</response>\n")
             f.write(f"{statsline}\n")
-            f.write(f"end_time={time.ctime(timestamp)}\n")
+            f.write(f"end_time={time.ctime(int(time.time()))}\n")
 
     if patch_mode:
         try:
@@ -1374,8 +1398,6 @@ def main() -> int:
             if VERBOSE:
                 print("No changes.", file=sys.stderr)
                 print(statsline, file=sys.stderr)
-                if log_enabled:
-                    print(f"log_file={log_path}", file=sys.stderr)
             return 0
         if VERBOSE or args.patch_review:
             print()

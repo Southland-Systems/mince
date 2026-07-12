@@ -83,9 +83,8 @@ mince --task "Provide the file name and line count as JSON" \
 ```
 
 ```bash
-mince --files passwd --task 'The provided `passwd` file is a \
-UNIX account file in "passwd" format. Remove lines 1-5 from `passwd` \
-and create a new file called `passwd-new` with those lines.' \
+mince --files passwd --task "Remove lines 1-5 from 'passwd' \
+and create a new file called 'passwd-new' with those lines." \
   --patch --patch-review --patch-suffix .patched
 ```
 
@@ -116,7 +115,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 
 | Provider | Model | Status |
 |----------|-------|--------|
-| OpenAI | GPT 5.5 | ✅ |
+| OpenAI | GPT 5.6 | ✅ |
 | Alibaba | Qwen 3.7 |  ✅ |
 | Oracle | GPT-OSS-120b | ✅ |
 | xAI | Grok 4.3 | ✅ |
@@ -128,7 +127,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 - Large files are skipped automatically
 - Binary files are not supported
 - JSON Schema mode is best when you need machine‑readable output
-- MinCE is tested on and assisted by `gpt-oss-120b`
+- MinCE is tested on and assisted by `GPT 5.6 Luna`
 
 ## Command line arguments 📋
 
@@ -147,6 +146,7 @@ All the `mince` CLI arguments for reference.
 | `--patch-suffix`       | Suffix for patched files. |
 | `--system-prompt`      | System prompt override. |
 | `--system-prompt-file` | Read the system prompt from the given file. |
+| `--patch-system-prompt` | System prompt for patch mode. |
 | `--model`              | Override configured model. |
 | `--list-models`        | List available models. |
 | `--openai-base-url`    | OpenAI-compatible API base URL. |
@@ -162,6 +162,7 @@ All the `mince` CLI arguments for reference.
 | `--openai-reasoning`   | Reasoning effort level (none, minimal, low, medium, high, xhigh). |
 | `--openai-extra-body`  | Custom model parameters (key=value pairs separated by commas). |
 | `--token-limit`        | Maximum allowed input token count (65534). |
+| `--estimate-only`      | Print only the estimated input token count. |
 | `--max-output-tokens`  | Maximum output tokens the LLM will use (65534). |
 | `--llm-timeout`        | Timeout in seconds for the API call (300). |
 | `--linenum-system-prompt` | System prompt for handling context file line numbers. |
