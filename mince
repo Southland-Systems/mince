@@ -233,7 +233,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
-    prompt_config_value(config, "system_prompt", "System prompt")
+    prompt_config_value(config, "system_prompt", "System prompt (use - to disable)")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "patch", "Patch files (off, on)")
@@ -811,27 +811,31 @@ def call_openai(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MinCE: a single command AI assistant for text files"
+        description="MinCE: minimal AI assistant for text files"
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "-a",
         "--ask",
+        metavar="TEXT",
         type=str,
         help="Prompt without file context or the configured system prompt (use - to read from STDIN)",
     )
     mode_group.add_argument(
         "--ask-file",
+        metavar="FILE",
         type=Path,
         help="Read the ask prompt from the given file",
     )
     mode_group.add_argument(
         "-t",
         "--task",
+        metavar="TEXT",
         help="Task/prompt for the model with file context (use - to read from STDIN)",
     )
     mode_group.add_argument(
         "--task-file",
+        metavar="FILE",
         type=Path,
         help="Read the task/prompt from the given file",
     )
@@ -844,11 +848,13 @@ def parse_args() -> argparse.Namespace:
     )
     files_group.add_argument(
         "--files-list",
+        metavar="FILE",
         type=Path,
         help="Read context file paths from a file (one file per line)",
     )
     parser.add_argument(
         "--output-file",
+        metavar="FILE",
         type=Path,
         help="Write the response to the given file (overwrites if it exists)",
     )
@@ -870,19 +876,23 @@ def parse_args() -> argparse.Namespace:
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
         "--system-prompt",
+        metavar="TEXT",
         help="System prompt override",
     )
     sys_prompt_group.add_argument(
         "--system-prompt-file",
+        metavar="FILE",
         type=Path,
         help="Read the system prompt from the given file",
     )
     parser.add_argument(
         "--patch-system-prompt",
+        metavar="TEXT",
         help="System prompt for patch mode",
     )
     parser.add_argument(
         "--model",
+        metavar="MODEL",
         help="Override configured model",
     )
     parser.add_argument(
@@ -892,24 +902,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openai-base-url",
+        metavar="URL",
         help="OpenAI-compatible API base URL",
     )
     parser.add_argument(
         "--openai-proxy",
+        metavar="URL",
         help="HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)",
     )
     parser.add_argument(
         "--openai-organization",
-        help="Optional OpenAI organization ID",
+        metavar="TEXT",
+        help="Optional organization ID",
     )
     parser.add_argument(
         "--openai-project",
+        metavar="TEXT",
         help="Optional project name or ID",
     )
     parser.add_argument(
         "--openai-service-tier",
         choices=("off", "auto", "default", "flex", "scale", "priority"),
-        help="OpenAI service tier",
+        help="Service tier",
     )
     parser.add_argument(
         "--response-format",
@@ -919,6 +933,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--schema-file",
+        metavar="FILE",
         type=Path,
         help="Path to a JSON Schema file (required for --response-format schema)",
     )
@@ -930,11 +945,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--temperature",
+        metavar="FLOAT",
         type=str,
         help="Sampling temperature (0.0-2.0) or 'off' to disable",
     )
     parser.add_argument(
         "--top-p",
+        metavar="FLOAT",
         type=str,
         help="Top-p nucleus sampling (0.0-1.0) or 'off' to disable",
     )
@@ -945,17 +962,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openai-extra-body",
-        help="Custom model parameters (key=value pairs separated by commas)",
+        metavar="KEY=VALUE[,KEY=VALUE,...]",
+        help="Custom model parameters",
     )
     parser.add_argument(
         "--token-limit",
+        metavar="LIMIT",
         type=int,
         help="Maximum allowed input token count (65534)",
     )
     parser.add_argument(
         "--token-cost",
+        metavar="INPUT:OUTPUT",
         type=str,
-        help='Token cost per million tokens as input:output or off',
+        help="Token cost per million tokens ('off' to disable)",
     )
     parser.add_argument(
         "--estimate-only",
@@ -964,16 +984,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-output-tokens",
+        metavar="LIMIT",
         type=int,
         help="Maximum output tokens the LLM will use (65534)",
     )
     parser.add_argument(
         "--llm-timeout",
+        metavar="SECONDS",
         type=int,
-        help="Timeout in seconds for the API call (300)",
+        help="Timeout for the API request (300)",
     )
     parser.add_argument(
         "--linenum-system-prompt",
+        metavar="TEXT",
         help="System prompt for handling context file line numbers",
     )
     parser.add_argument(
@@ -1044,7 +1067,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List available configuration profiles",
     )
-
     return parser.parse_args()
 
 
@@ -1244,10 +1266,9 @@ def main() -> int:
         system_prompt = str(args.system_prompt).strip()
     elif args.system_prompt_file:
         system_prompt = read_file(args.system_prompt_file).strip()
-    elif ask_mode:
-        system_prompt = ""
     else:
-        system_prompt = str(config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)).strip()
+        configured_system_prompt = str(config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)).strip()
+        system_prompt = "" if configured_system_prompt == "-" else configured_system_prompt
 
     if args.linenum_system_prompt:
         linenum_system_prompt = str(args.linenum_system_prompt).strip()
@@ -1593,7 +1614,7 @@ def main() -> int:
     if args.print_reasoning:
         output_str = (
             f"<think>\n{reasoning}\n</think>\n\n"
-            f"{result}\n"
+            f"{result}"
         )
     else:
         output_str = result
