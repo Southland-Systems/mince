@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import argparse
 import json
+import math
 import sys
 import time
 import re
@@ -47,7 +48,7 @@ DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from th
 DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a patch using the provided JSON Schema for one or more text files. Return only JSON that matches the provided schema."
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-luna",
     "api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "openai_proxy": "",
@@ -58,17 +59,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
     "patch_system_prompt": DEFAULT_PATCH_SYSTEM_PROMPT,
+    "patch": "off",
+    "patch_review": "off",
+    "patch_suffix": ".mcepatched",
+    "quiet": "off",
     "temperature": "off",
     "top_p": "off",
-    "openai_reasoning": "low",
+    "openai_reasoning": "medium",
     "token_limit": 65534,
     "max_output_tokens": 65534,
+    "token_cost": "1.00:6.00",
     "max_file_size_kb": 512,
     "response_format": "text",
     "response_verbosity": "off",
     "llm_timeout": 300,
     "openai_extra_body": "",
-    "log": "off",
+    "log": "on",
+    "api_log": "on",
 }
 
 PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
@@ -229,16 +236,22 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
+    prompt_config_value(config, "patch", "Patch files (off, on)")
+    prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
+    prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
-    prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh)")
+    prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh, max)")
     prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
+    prompt_config_value(config, "token_cost", "Token cost per million tokens (input:output, off)")
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
     prompt_config_value(config, "llm_timeout", "API timeout in seconds", int)
-    prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs/ (off, on)")
+    prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs (off, on)")
+    prompt_config_value(config, "api_log", "Store logs within the OpenAI-compatible API (off, on)")
+    prompt_config_value(config, "quiet", "Quiet mode (off, on)")
 
     save_config(config)
 
@@ -434,6 +447,38 @@ def estimate_request_tokens(model: str, system_prompt: str, user_prompt: str) ->
     request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
     return len(encoding.encode(request_text))
 
+def parse_token_cost(value: Any) -> tuple[float, float] | None:
+    raw = str(value).strip()
+    if raw.lower() == "off":
+        return None
+    parts = raw.split(":")
+    if len(parts) != 2:
+        raise ValueError("expected input_float:output_float or 'off' (ex: 0.55:1.55)")
+    try:
+        input_cost = float(parts[0].strip())
+        output_cost = float(parts[1].strip())
+    except ValueError as exc:
+        raise ValueError("expected input_float:output_float or 'off' (ex: 0.55:1.55)") from exc
+    if not all(math.isfinite(cost) and cost >= 0 for cost in (input_cost, output_cost)):
+        raise ValueError("token costs must be finite non-negative floats")
+    return input_cost, output_cost
+
+def response_cost_line(
+    token_cost: tuple[float, float] | None,
+    usage: dict[str, Any] | None,
+ ) -> str | None:
+    if token_cost is None or not usage:
+        return None
+    try:
+        input_tokens = int(usage["input_tokens"])
+        output_tokens = int(usage["output_tokens"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    input_cost = input_tokens * token_cost[0] / 1_000_000
+    output_cost = output_tokens * token_cost[1] / 1_000_000
+    total_cost = input_cost + output_cost
+    return f"response_cost={input_cost:.4f}:{output_cost:.4f}:{total_cost:.4f}"
 
 def usage_to_dict(usage: Any) -> dict[str, Any] | None:
     if usage is None:
@@ -454,7 +499,8 @@ def print_stats(
     processing_time: float | None = None,
     response_text: str,
     usage: dict[str, Any] | None = None,
-) -> None:
+    response_cost: str | None = None,
+ ) -> str:
     stats: list[str] = [
         f"processing_time={int(processing_time)}s",
         f"request_characters={request_characters}",
@@ -465,16 +511,27 @@ def print_stats(
         for key in ("input_tokens", "output_tokens", "total_tokens"):
             if key in usage:
                 stats.append(f"response_{key}={usage[key]}")
-
+    if response_cost is not None:
+        stats.append(response_cost)
     return " ".join(stats)
 
+
+def coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("on", "true", "yes", "1"):
+            return True
+        if normalized in ("off", "false", "no", "0"):
+            return False
+    return default
 
 def coerce_int(value: Any, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
-
 
 def read_file(path: Path) -> str:
     try:
@@ -489,6 +546,21 @@ def read_prompt_argument(value: str) -> str:
     if value == "-":
         return sys.stdin.read().strip()
     return value.strip()
+
+
+def read_files_list(path: Path) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        raise ValueError(f"cannot read files list {path} ({exc})") from exc
+
+    files: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        files.append(line)
+    return files
 
 def build_context(
     file_paths: list[Path],
@@ -671,6 +743,7 @@ def call_openai(
     extra_body: dict[str, Any] | None = None,
     llm_timeout: int | None = None,
     safety_identifier: str | None = None,
+    store: bool = True,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
     if openai_proxy:
@@ -682,7 +755,7 @@ def call_openai(
         project=openai_project or None,
         organization=openai_organization or None,
         timeout=llm_timeout if llm_timeout is not None else 300,
-        max_retries=2,
+        max_retries=0,
         http_client=http_client,
     )
 
@@ -691,6 +764,7 @@ def call_openai(
         "instructions": system_prompt,
         "input": user_prompt,
         "extra_body": extra_body or {},
+        "store": store,
     }
 
     if safety_identifier is not None and str(safety_identifier).strip():
@@ -759,10 +833,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Read the task/prompt from the given file",
     )
-    parser.add_argument(
+    files_group = parser.add_mutually_exclusive_group()
+    files_group.add_argument(
         "--files",
         nargs="+",
         help="Files to include as context",
+    )
+    files_group.add_argument(
+        "--files-list",
+        type=Path,
+        help="Read context file paths from a file (one file per line)",
     )
     parser.add_argument(
         "--output-file",
@@ -857,7 +937,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openai-reasoning",
-        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
         help="Reasoning effort level (low)",
     )
     parser.add_argument(
@@ -868,6 +948,11 @@ def parse_args() -> argparse.Namespace:
         "--token-limit",
         type=int,
         help="Maximum allowed input token count (65534)",
+    )
+    parser.add_argument(
+        "--token-cost",
+        type=str,
+        help='Token cost per million tokens as input:output or off',
     )
     parser.add_argument(
         "--estimate-only",
@@ -909,7 +994,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the stored configuration file (creates it if missing)",
     )
-    parser.add_argument("--log", action="store_true", help="Log session to HOME/.local/state/mince/logs/")
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Log session to HOME/.local/state/mince/logs"
+    )
+    parser.add_argument(
+        "--no-api-log",
+        action="store_false",
+        help="Do not store requests and responses in the OpenAI API",
+    )
     parser.add_argument(
         "--quiet",
         action="store_true",
@@ -1053,20 +1147,10 @@ def main() -> int:
             return 1
         return 0
 
-    if args.patch and not args.task:
-        print("ERROR: --patch requires --task", file=sys.stderr)
-        return 1
-    if args.patch and (args.ask or args.ask_file or args.task_file):
-        print("ERROR: --patch only supports --task (not --ask/--ask-file)", file=sys.stderr)
-        return 1
-
-    patch_mode = args.patch
-    suffix_provided = args.patch_suffix is not None
-    patch_suffix = args.patch_suffix or ".mcepatched"
-
     add_line_numbers = not args.no_line_numbers
 
     ask_mode: bool = args.ask is not None or args.ask_file is not None
+    file_names: list[str] = []
 
     if not ask_mode and not args.list_models:
         if args.task:
@@ -1077,13 +1161,46 @@ def main() -> int:
             print("ERROR: --ask or --task required (--help for help)", file=sys.stderr)
             return 1
 
-        if not args.files:
-            print("ERROR: --files required (--help for help)", file=sys.stderr)
+        if args.files_list:
+            try:
+                file_names = read_files_list(args.files_list)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+        elif args.files:
+            file_names = args.files
+
+        if not file_names:
+            print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
             return 1
     else:
         task = ""
 
     config = load_config()
+
+    if args.quiet or coerce_bool(config.get("quiet", "off")):
+        VERBOSE = 0
+
+    patch_mode = args.patch or coerce_bool(config.get("patch", "off"))
+    patch_review = args.patch_review or coerce_bool(config.get("patch_review", "off"))
+
+    configured_patch_suffix = str(config.get("patch_suffix", DEFAULT_CONFIG["patch_suffix"]) or "").strip()
+    if args.patch_suffix is not None:
+        patch_suffix = args.patch_suffix
+        suffix_provided = True
+    elif configured_patch_suffix and configured_patch_suffix.lower() != "off":
+        patch_suffix = configured_patch_suffix
+        suffix_provided = configured_patch_suffix != DEFAULT_CONFIG["patch_suffix"]
+    else:
+        patch_suffix = DEFAULT_CONFIG["patch_suffix"]
+        suffix_provided = False
+
+    if patch_mode and not args.task:
+        print("ERROR: --patch requires --task", file=sys.stderr)
+        return 1
+    if patch_mode and (args.ask or args.ask_file or args.task_file):
+        print("ERROR: --patch only supports --task (not --ask/--ask-file)", file=sys.stderr)
+        return 1
 
     llm_timeout = (
         args.llm_timeout
@@ -1096,7 +1213,10 @@ def main() -> int:
     openai_proxy = str(args.openai_proxy or config.get("openai_proxy", "")).strip()
     openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
     openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
-    safety_identifier = config.get("safety_identifier")
+    safety_identifier = config.get("safety_identifier", None)
+    api_log = args.no_api_log or str(
+        config.get("api_log", True)
+    ).lower() in ("on", "true", "yes", "1")
 
     if args.list_models:
         api_key = resolve_api_key(config)
@@ -1197,6 +1317,16 @@ def main() -> int:
 
     openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
+    token_cost_raw = (
+        args.token_cost
+        if args.token_cost is not None
+        else config.get("token_cost", "off")
+    )
+    try:
+        token_cost = parse_token_cost(token_cost_raw)
+    except ValueError as exc:
+        print(f"ERROR: Invalid token cost: {exc}", file=sys.stderr)
+        return 1
 
     response_verbosity: str = (
         args.response_verbosity
@@ -1207,9 +1337,8 @@ def main() -> int:
     if patch_mode:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
-        system_prompt = system_prompt + "\n" + patch_system_prompt + "\n"
+        system_prompt = system_prompt + "\n" + patch_system_prompt
         add_line_numbers = True
-
 
     json_schema: dict[str, Any] | None = json_schema
     if response_format == "schema" and json_schema is None:
@@ -1230,12 +1359,11 @@ def main() -> int:
     api_key = resolve_api_key(config)
     if not api_key:
         print(f"ERROR: api_key missing in {CONFIG_FILE} or OPENAI_API_KEY", file=sys.stderr)
-        print()
-        print("Run:")
+        print("\nRun:")
         print("  mince --init")
         return 1
 
-    log_enabled = args.log or str(config.get("log", "off")).lower() in ("on", "true", "yes", "1") or 0
+    log_enabled = args.log or str(config.get("log", "on")).lower() in ("on", "true", "yes", "1") or 0
     log_path = None
     if log_enabled:
         LOG_DIR = APP_DIR / "logs"
@@ -1255,7 +1383,7 @@ def main() -> int:
         full_system_prompt = system_prompt
     else:
         max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
-        file_paths = [Path(f).resolve() for f in args.files]
+        file_paths = [Path(f).resolve() for f in file_names]
         context = build_context(
             file_paths=file_paths,
             max_file_size_kb=max_file_size_kb,
@@ -1273,7 +1401,7 @@ def main() -> int:
         )
         if patch_mode:
             original_texts: dict[str, str] = {}
-            for f in args.files:
+            for f in file_names:
                 try:
                     abs_path = Path(f).resolve()
                     original_texts[str(abs_path)] = abs_path.read_text(encoding="utf-8")
@@ -1283,7 +1411,7 @@ def main() -> int:
             if not original_texts:
                 print("ERROR: No readable input files.", file=sys.stderr)
                 return 1
-            user_prompt = user_prompt + "\n" + patch_system_prompt + "\n"
+            user_prompt = user_prompt + "\n" + patch_system_prompt
 
     request_tokens = estimate_request_tokens(
         model=model,
@@ -1293,8 +1421,16 @@ def main() -> int:
 
     request_tokens += tokenizer_padding
 
+    request_cost_estimate: str | None = None
+    if token_cost is not None:
+        request_cost_estimate = request_tokens * token_cost[0] / 1_000_000
+    request_cost_log = (
+        f" request_cost_estimate={request_cost_estimate:.4f}"
+        if request_cost_estimate is not None
+        else ""
+    )
     if args.estimate_only:
-        print(f"request_tokens_estimate={request_tokens}")
+        print(request_tokens)
         return 0
 
     if request_tokens > token_limit:
@@ -1305,7 +1441,12 @@ def main() -> int:
 
     if log_enabled:
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"request_characters={request_characters} request_tokens_estimate={request_tokens} model={model}\n")
+            f.write(
+                f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+                f"max_output_tokens={max_output_tokens} api_log={api_log} temperature={temperature} top_p={top_p} "
+                f"safety_identifier='{safety_identifier}' service_tier={openai_service_tier} base_url='{openai_base_url}' "
+                f"timeout={llm_timeout}\n"
+            )
             f.write("<request>\n")
             f.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
             f.write(f"<user_prompt>\n{user_prompt}\n</user_prompt>\n")
@@ -1314,7 +1455,7 @@ def main() -> int:
     if VERBOSE:
         if log_enabled:
             print(f"log_file={log_path}", file=sys.stderr)
-        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens} model={model}", file=sys.stderr)
+        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model}", file=sys.stderr)
 
     start_time = time.perf_counter()
 
@@ -1339,6 +1480,7 @@ def main() -> int:
             extra_body=extra_body,
             llm_timeout=llm_timeout,
             safety_identifier=safety_identifier,
+            store=api_log,
         )
     except Exception as exc:
         print(f"OpenAI API error: {exc}", file=sys.stderr)
@@ -1346,6 +1488,7 @@ def main() -> int:
 
     elapsed = time.perf_counter() - start_time
     result = getattr(response_obj, "output_text", "")
+    response_cost = response_cost_line(token_cost, usage)
 
     try:
         for item in getattr(response_obj, "output", []):
@@ -1362,6 +1505,7 @@ def main() -> int:
         processing_time=elapsed,
         response_text=result,
         usage=usage,
+        response_cost=response_cost,
     )
 
     if log_enabled:
@@ -1399,10 +1543,10 @@ def main() -> int:
                 print("No changes.", file=sys.stderr)
                 print(statsline, file=sys.stderr)
             return 0
-        if VERBOSE or args.patch_review:
+        if VERBOSE or patch_review:
             print()
             print("\n".join(diffs))
-        if args.patch_review:
+        if patch_review:
             if input("\nApply these changes? [y/N]: ").strip().lower() not in ("y", "yes"):
                 if VERBOSE:
                     print("Aborted.", file=sys.stderr)
