@@ -815,6 +815,7 @@ def parse_args() -> argparse.Namespace:
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
+        "-a",
         "--ask",
         type=str,
         help="Prompt without file context or the configured system prompt (use - to read from STDIN)",
@@ -825,6 +826,7 @@ def parse_args() -> argparse.Namespace:
         help="Read the ask prompt from the given file",
     )
     mode_group.add_argument(
+        "-t",
         "--task",
         help="Task/prompt for the model with file context (use - to read from STDIN)",
     )
@@ -835,6 +837,7 @@ def parse_args() -> argparse.Namespace:
     )
     files_group = parser.add_mutually_exclusive_group()
     files_group.add_argument(
+        "-f",
         "--files",
         nargs="+",
         help="Files to include as context",
@@ -981,7 +984,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--print-reasoning",
         action="store_true",
-        help="Output the reasoning monolog in <reasoning> tags with the content in <response> tags"
+        help="Include the reasoning output in <think> tags"
     )
     config_print_group = parser.add_mutually_exclusive_group()
     config_print_group.add_argument(
@@ -1010,6 +1013,7 @@ def parse_args() -> argparse.Namespace:
         help="Suppress printing of extra output (stats, information)",
     )
     parser.add_argument(
+        "-p",
         "--profile",
         metavar="NAME",
         help="Select configuration profile",
@@ -1302,7 +1306,7 @@ def main() -> int:
     openai_reasoning = (
         args.openai_reasoning
         if args.openai_reasoning is not None
-        else config.get("openai_reasoning", "low")
+        else config.get("openai_reasoning", "medium")
     )
 
     extra_body_raw = (
@@ -1588,8 +1592,8 @@ def main() -> int:
 
     if args.print_reasoning:
         output_str = (
-            f"<reasoning>\n{reasoning}\n</reasoning>\n"
-            f"<response>\n{result}\n</response>"
+            f"<think>\n{reasoning}\n</think>\n\n"
+            f"{result}\n"
         )
     else:
         output_str = result
