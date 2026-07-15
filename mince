@@ -38,6 +38,7 @@ from openai import (
 import httpx
 
 VERBOSE = 1
+DEBUG = 0
 
 APP_DIR = Path.home() / ".local/state/mince"
 DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
@@ -66,11 +67,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "temperature": "off",
     "top_p": "off",
     "openai_reasoning": "medium",
+    "reasoning_mode": "standard",
     "token_limit": 65534,
     "max_output_tokens": 65534,
     "token_cost": "1.00:6.00",
     "max_file_size_kb": 512,
     "response_format": "text",
+    "stream": "off",
     "response_verbosity": "off",
     "llm_timeout": 300,
     "openai_extra_body": "",
@@ -242,7 +245,9 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
+    prompt_config_value(config, "stream", "Streaming text responses (off, on)")
     prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh, max)")
+    prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
     prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
@@ -740,10 +745,12 @@ def call_openai(
     max_output_tokens: int | None = None,
     openai_service_tier: str | None = None,
     openai_reasoning: str | None = None,
+    reasoning_mode: str | None = None,
     extra_body: dict[str, Any] | None = None,
     llm_timeout: int | None = None,
     safety_identifier: str | None = None,
     store: bool = True,
+    stream: bool = False,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
     if openai_proxy:
@@ -777,7 +784,13 @@ def call_openai(
         kwargs["top_p"] = top_p
 
     if openai_reasoning is not None:
-        kwargs["reasoning"] = {"effort": openai_reasoning, "summary": "detailed"}
+        reasoning_payload: dict[str, Any] = {
+            "effort": openai_reasoning,
+            "summary": "detailed",
+        }
+        if reasoning_mode is not None:
+            reasoning_payload["mode"] = reasoning_mode
+        kwargs["reasoning"] = reasoning_payload
 
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
@@ -797,12 +810,46 @@ def call_openai(
             text_payload["verbosity"] = response_verbosity
         kwargs["text"] = text_payload
 
+    if stream and response_format != "text":
+        raise ValueError("Streaming is only supported for text responses")
+    if stream:
+        kwargs["stream"] = True
+
+    if DEBUG:
+        print("<debug_request>", file=sys.stderr)
+        print(json.dumps(kwargs, indent=2), file=sys.stderr)
+        print("</debug_request>", file=sys.stderr)
+
     try:
         response = client.responses.create(**kwargs)
     except Exception as exc:
         _handle_openai_error(exc)
 
     return response, usage_to_dict(getattr(response, "usage", None))
+
+def consume_response_stream(
+    stream: Any,
+    emit: Any = None,
+) -> tuple[str, dict[str, Any] | None, Any]:
+    chunks: list[str] = []
+    usage: dict[str, Any] | None = None
+    completed_response = None
+
+    for event in stream:
+        event_type = getattr(event, "type", "")
+        if event_type == "response.output_text.delta":
+            delta = getattr(event, "delta", "")
+            if delta:
+                chunks.append(delta)
+                if emit is not None:
+                    emit(delta)
+        elif event_type == "response.completed":
+            completed_response = getattr(event, "response", None)
+            usage = usage_to_dict(
+                getattr(completed_response, "usage", None)
+            )
+
+    return "".join(chunks), usage, completed_response
 
 
 # -------------------------------------------------------------------
@@ -932,6 +979,11 @@ def parse_args() -> argparse.Namespace:
         help="LLM response format in text, JSON or JSON-Schema",
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream text responses as they are generated",
+    )
+    parser.add_argument(
         "--schema-file",
         metavar="FILE",
         type=Path,
@@ -959,6 +1011,11 @@ def parse_args() -> argparse.Namespace:
         "--openai-reasoning",
         choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
         help="Reasoning effort level (low)",
+    )
+    parser.add_argument(
+        "--reasoning-mode",
+        choices=("standard", "pro"),
+        help="Reasoning mode (standard or pro)",
     )
     parser.add_argument(
         "--openai-extra-body",
@@ -1036,6 +1093,11 @@ def parse_args() -> argparse.Namespace:
         help="Suppress printing of extra output (stats, information)",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Output the request and response objects within tags",
+    )
+    parser.add_argument(
         "-p",
         "--profile",
         metavar="NAME",
@@ -1082,11 +1144,15 @@ def main() -> int:
 
     global CONFIG_FILE
     global VERBOSE
+    global DEBUG
 
     args = parse_args()
 
     if args.quiet:
         VERBOSE = 0
+
+    if args.debug:
+        DEBUG = 1
 
     if args.init:
         init_config_interactive()
@@ -1329,6 +1395,15 @@ def main() -> int:
         if args.openai_reasoning is not None
         else config.get("openai_reasoning", "medium")
     )
+    reasoning_mode = (
+        args.reasoning_mode
+        if args.reasoning_mode is not None
+        else config.get("reasoning_mode", "standard")
+    )
+    reasoning_mode = str(reasoning_mode).strip().lower()
+    if reasoning_mode not in ("standard", "pro"):
+        print("ERROR: Invalid reasoning mode; choose 'standard' or 'pro'.", file=sys.stderr)
+        return 1
 
     extra_body_raw = (
         args.openai_extra_body
@@ -1364,6 +1439,11 @@ def main() -> int:
         json_schema = PATCH_MANIFEST_SCHEMA
         system_prompt = system_prompt + "\n" + patch_system_prompt
         add_line_numbers = True
+
+    stream_enabled = args.stream or coerce_bool(config.get("stream", "off"))
+    if stream_enabled and response_format != "text":
+        print("ERROR: --stream is only supported for text responses", file=sys.stderr)
+        return 1
 
     json_schema: dict[str, Any] | None = json_schema
     if response_format == "schema" and json_schema is None:
@@ -1483,8 +1563,26 @@ def main() -> int:
         print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model}", file=sys.stderr)
 
     start_time = time.perf_counter()
+    stream_file = None
+    stream_output_emitted = False
+    stream_sink = None
 
     try:
+        if stream_enabled and not args.print_reasoning:
+            if args.output_file:
+                args.output_file.parent.mkdir(parents=True, exist_ok=True)
+                stream_file = args.output_file.open("w", encoding="utf-8")
+
+            def emit_stream_text(delta: str) -> None:
+                if stream_file is not None:
+                    stream_file.write(delta)
+                    stream_file.flush()
+                else:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+
+            stream_sink = emit_stream_text
+
         response_obj, usage = call_openai(
             api_key=api_key,
             openai_base_url=openai_base_url,
@@ -1502,17 +1600,30 @@ def main() -> int:
             max_output_tokens=max_output_tokens,
             openai_service_tier=openai_service_tier,
             openai_reasoning=openai_reasoning,
+            reasoning_mode=reasoning_mode,
             extra_body=extra_body,
             llm_timeout=llm_timeout,
             safety_identifier=safety_identifier,
             store=api_log,
+            stream=stream_enabled,
         )
+        if stream_enabled:
+            result, usage, completed_response = consume_response_stream(
+                response_obj, stream_sink
+            )
+            if completed_response is not None:
+                response_obj = completed_response
+            stream_output_emitted = stream_sink is not None
+        else:
+            result = getattr(response_obj, "output_text", "")
     except Exception as exc:
         print(f"OpenAI API error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if stream_file is not None:
+            stream_file.close()
 
     elapsed = time.perf_counter() - start_time
-    result = getattr(response_obj, "output_text", "")
     response_cost = response_cost_line(token_cost, usage)
 
     try:
@@ -1521,6 +1632,12 @@ def main() -> int:
                 for content in getattr(item, "content", []):
                     if getattr(content, "type", None) == "reasoning_text":
                         reasoning = getattr(content, "text", "")
+        if not reasoning:
+            for item in getattr(response_obj, "output", []):
+                if getattr(item, "type", None) == "reasoning":
+                    for content in getattr(item, "summary", []):
+                        if getattr(content, "type", None) == "summary_text":
+                            reasoning = getattr(content, "text", "")
     except:
         reasoning = ""
 
@@ -1620,22 +1737,29 @@ def main() -> int:
         output_str = result
 
     if args.output_file:
-        try:
-            args.output_file.parent.mkdir(parents=True, exist_ok=True)
-            args.output_file.write_text(output_str, encoding="utf-8")
-        except Exception as exc:
-            print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
-            print(output_str)
-            if VERBOSE:
-                print(statsline, file=sys.stderr)
-            return 1
+        if not stream_output_emitted:
+            try:
+                args.output_file.parent.mkdir(parents=True, exist_ok=True)
+                args.output_file.write_text(output_str, encoding="utf-8")
+            except Exception as exc:
+                print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
+                print(output_str)
+                if VERBOSE:
+                    print(statsline, file=sys.stderr)
+                return 1
+    elif stream_output_emitted:
+        if not result or not result.endswith("\n"):
+            print()
     else:
         print(output_str)
 
     if VERBOSE:
         print(statsline, file=sys.stderr)
 
-#    json.dumps(response_obj.model_dump(), indent=2)
+    if DEBUG:
+        print("<debug_response>", file=sys.stderr)
+        print(json.dumps(response_obj.model_dump(), indent=2), file=sys.stderr)
+        print("</debug_response>", file=sys.stderr)
 
     return 0
 
