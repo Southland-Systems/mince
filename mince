@@ -59,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "safety_identifier": "",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
+    "line_numbers": "on",
     "patch_system_prompt": DEFAULT_PATCH_SYSTEM_PROMPT,
     "patch": "off",
     "patch_review": "off",
@@ -253,6 +254,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "token_cost", "Token cost per million tokens (input:output, off)")
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
+    prompt_config_value(config, "line_numbers", "Context file line numbers [recommended on] (off, on)")
     prompt_config_value(config, "llm_timeout", "API timeout in seconds", int)
     prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs (off, on)")
     prompt_config_value(config, "api_log", "Store logs within the OpenAI-compatible API (off, on)")
@@ -531,6 +533,14 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
         if normalized in ("off", "false", "no", "0"):
             return False
     return default
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in ("on", "true", "yes", "1"):
+        return True
+    if normalized in ("off", "false", "no", "0"):
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value (true/false)")
 
 def coerce_int(value: Any, default: int) -> int:
     try:
@@ -900,6 +910,12 @@ def parse_args() -> argparse.Namespace:
         help="Read context file paths from a file (one file per line)",
     )
     parser.add_argument(
+        "-p",
+        "--profile",
+        metavar="NAME",
+        help="Select configuration profile",
+    )
+    parser.add_argument(
         "--output-file",
         metavar="FILE",
         type=Path,
@@ -980,7 +996,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stream",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Stream text responses as they are generated",
     )
     parser.add_argument(
@@ -1058,7 +1078,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-line-numbers",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Do not prefix line numbers to context files",
     )
     parser.add_argument(
@@ -1079,29 +1103,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log",
-        action="store_true",
-        help="Log session to HOME/.local/state/mince/logs"
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Log session to HOME/.local/state/mince/logs",
     )
     parser.add_argument(
         "--no-api-log",
-        action="store_false",
+        nargs="?",
+        const=False,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Do not store requests and responses in the OpenAI API",
     )
     parser.add_argument(
         "--quiet",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Suppress printing of extra output (stats, information)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Output the request and response objects within tags",
-    )
-    parser.add_argument(
-        "-p",
-        "--profile",
-        metavar="NAME",
-        help="Select configuration profile",
     )
     profile_action_group = parser.add_mutually_exclusive_group()
     profile_action_group.add_argument(
@@ -1239,7 +1269,6 @@ def main() -> int:
             return 1
         return 0
 
-    add_line_numbers = not args.no_line_numbers
 
     ask_mode: bool = args.ask is not None or args.ask_file is not None
     file_names: list[str] = []
@@ -1270,7 +1299,18 @@ def main() -> int:
 
     config = load_config()
 
-    if args.quiet or coerce_bool(config.get("quiet", "off")):
+    add_line_numbers = (
+        args.no_line_numbers
+        if args.no_line_numbers is not None
+        else coerce_bool(config.get("line_numbers", "on"), True)
+    )
+
+    quiet_enabled = (
+        args.quiet
+        if args.quiet is not None
+        else coerce_bool(config.get("quiet", "off"))
+    )
+    if quiet_enabled:
         VERBOSE = 0
 
     patch_mode = args.patch or coerce_bool(config.get("patch", "off"))
@@ -1306,9 +1346,11 @@ def main() -> int:
     openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
     openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
     safety_identifier = config.get("safety_identifier", None)
-    api_log = args.no_api_log or str(
-        config.get("api_log", True)
-    ).lower() in ("on", "true", "yes", "1")
+    api_log = (
+        args.no_api_log
+        if args.no_api_log is not None
+        else coerce_bool(config.get("api_log", True), True)
+    )
 
     if args.list_models:
         api_key = resolve_api_key(config)
@@ -1440,7 +1482,11 @@ def main() -> int:
         system_prompt = system_prompt + "\n" + patch_system_prompt
         add_line_numbers = True
 
-    stream_enabled = args.stream or coerce_bool(config.get("stream", "off"))
+    stream_enabled = (
+        args.stream
+        if args.stream is not None
+        else coerce_bool(config.get("stream", "off"))
+    )
     if stream_enabled and response_format != "text":
         print("ERROR: --stream is only supported for text responses", file=sys.stderr)
         return 1
@@ -1468,7 +1514,11 @@ def main() -> int:
         print("  mince --init")
         return 1
 
-    log_enabled = args.log or str(config.get("log", "on")).lower() in ("on", "true", "yes", "1") or 0
+    log_enabled = (
+        args.log
+        if args.log is not None
+        else coerce_bool(config.get("log", "on"), True)
+    )
     log_path = None
     if log_enabled:
         LOG_DIR = APP_DIR / "logs"
