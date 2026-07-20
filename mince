@@ -918,17 +918,20 @@ def parse_args() -> argparse.Namespace:
         help="Select configuration profile",
     )
     parser.add_argument(
+        "-o",
         "--output-file",
         metavar="FILE",
         type=Path,
         help="Write the response to the given file (overwrites if it exists)",
     )
     parser.add_argument(
+        "-P",
         "--patch",
         action="store_true",
         help="Patch specified files and write changes to the filename + patch suffix",
     )
     parser.add_argument(
+        "-R",
         "--patch-review",
         action="store_true",
         help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",

@@ -53,7 +53,7 @@ This creates `~/.local/state/mince/config.json`.
 Ask a direct question without file context:
 
 ```bash
-mince -a "You are an expert programmer specializing in Python. How are two strings concatenated?"
+mince -a "How are two strings concatenated?"
 ```
 
 Run a task with local files as context:
@@ -68,20 +68,6 @@ Read the task and context-file paths from files:
 mince --task-file review-task.txt --files-list review-files.txt
 ```
 
-Override the configured system prompt:
-
-```bash
-mince --system-prompt "You are a senior engineering reviewer." \
-  --task "Review the deployment flow" \
-  --files docker-compose.yml deploy.py
-```
-
-Stream a text response as it is generated:
-
-```bash
-mince --ask "Explain Python context managers" --stream
-```
-
 Request JSON output:
 
 ```bash
@@ -93,8 +79,8 @@ mince --response-format json \
 Write a response to a file:
 
 ```bash
-mince --task "Add single-user locking to the provided script. Only output the whole script." \
-  --files taskedit.py --output-file taskedit-new.py
+mince -t "Add single-user locking to the provided script. Only output the whole script." \
+  -f taskedit.py -o taskedit-new.py
 ```
 
 Validate structured output against a JSON Schema:
@@ -105,12 +91,21 @@ mince --task "Provide the file name and line count as JSON" \
   --schema-file filemeta-schema.json
 ```
 
-Generate a patch, review the diff, and write the approved result with a custom suffix:
+Generate a patch, review the diff, and write the approved result:
 
 ```bash
-mince --files passwd --task "Remove lines 1-5 from 'passwd' \
-and create a new file called 'passwd-new' with those lines." \
-  --patch --patch-review --patch-suffix .patched
+cp /etc/passwd .
+mince -PR -f passwd -t "Remove lines 1-5 from 'passwd' \
+and create a new file called 'passwd-new' with those lines."
+```
+
+Create a dedicated 'ask' profile
+
+```bash
+mince --copy-profile a
+mince --init-profile a
+
+mince -p a -a 'How is a file read in Go lang?'
 ```
 
 Run MinCE in a restricted systemd user unit for testing:
@@ -170,9 +165,9 @@ All the `mince` CLI arguments for reference.
 | `-f FILE...`, `--files FILE...` | Files to include as context. |
 | `--files-list FILE` | Read context-file paths from a file, one per line. |
 | `-p NAME`, `--profile NAME` | Select a configuration profile. |
-| `--output-file FILE` | Write the response to the given file, overwriting it if it exists. |
-| `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
-| `--patch-review` | Confirm changes before writing to filenames without the suffix, unless a suffix is overridden. |
+| `-o FILE`, `--output-file FILE` | Write the response to the given file, overwriting it if it exists. |
+| `-P`, `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
+| `-R`, `--patch-review` | Confirm changes before writing to filenames without the suffix, unless a suffix is overridden. |
 | `--patch-suffix SUFFIX` | Set the suffix for patched files (default: `.mcepatched`). |
 | `--system-prompt TEXT` | Override the configured system prompt. |
 | `--system-prompt-file FILE` | Read the system prompt from the given file. |
@@ -219,11 +214,11 @@ Environment variable reference.
 |----------------------|-------------|
 | OPENAI_API_KEY       | OpenAI-compatible API key |
 
-### Usage Notes 🪧
+## Usage Notes 🪧
 
 *Prevent incorrect cost calculation when specifying --model*
 
-If token costs are set in the configuration and `--model` is specified, also specify `--token-cost`, otherwise the cost calculations will be absent to prevent inaccuracies.
+  If token costs are set in the configuration and `--model` is specified, also specify `--token-cost`, otherwise the cost calculations will be absent to prevent inaccuracies.
 
 ## Make targets 🚀
 
