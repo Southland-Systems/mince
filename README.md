@@ -219,6 +219,12 @@ Environment variable reference.
 |----------------------|-------------|
 | OPENAI_API_KEY       | OpenAI-compatible API key |
 
+### Usage Notes 🪧
+
+*Prevent incorrect cost calculation when specifying --model*
+
+If token costs are set in the configuration and `--model` is specified, also specify `--token-cost`, otherwise the cost calculations will be absent to prevent inaccuracies.
+
 ## Make targets 🚀
 
 The project ships with a **Makefile** that handles both *user* and *system‑wide* installations.

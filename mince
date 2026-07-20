@@ -21,6 +21,10 @@ from dataclasses import dataclass
 
 import difflib
 import pydoc
+
+TIKTOKEN_CACHE_DIR = Path.home() / ".local/state/mince/tiktoken"
+os.environ["TIKTOKEN_CACHE_DIR"] = str(TIKTOKEN_CACHE_DIR)
+
 import tiktoken
 from openai import (
     OpenAI,
@@ -460,12 +464,12 @@ def parse_token_cost(value: Any) -> tuple[float, float] | None:
         return None
     parts = raw.split(":")
     if len(parts) != 2:
-        raise ValueError("expected input_float:output_float or 'off' (ex: 0.55:1.55)")
+        raise ValueError("expected input_float:output_float or 'off' (ex: 0.27:2.27)")
     try:
         input_cost = float(parts[0].strip())
         output_cost = float(parts[1].strip())
     except ValueError as exc:
-        raise ValueError("expected input_float:output_float or 'off' (ex: 0.55:1.55)") from exc
+        raise ValueError("expected input_float:output_float or 'off' (ex: 0.27:2.27)") from exc
     if not all(math.isfinite(cost) and cost >= 0 for cost in (input_cost, output_cost)):
         raise ValueError("token costs must be finite non-negative floats")
     return input_cost, output_cost
@@ -498,7 +502,6 @@ def usage_to_dict(usage: Any) -> dict[str, Any] | None:
         return usage.dict()
     return {"raw": str(usage)}
 
-
 def print_stats(
     *,
     request_characters: int,
@@ -521,7 +524,6 @@ def print_stats(
     if response_cost is not None:
         stats.append(response_cost)
     return " ".join(stats)
-
 
 def coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -735,7 +737,7 @@ def resolve_api_key(config: dict[str, Any]) -> str:
     key = str(config.get("api_key", "")).strip()
     if key:
         return key
-    raise SystemExit("No API key found. Set it in the config file or 'export OPENAI_API_KEY=key'.")
+    raise SystemExit("No API key found. Set it up in the config file with --init or with 'export OPENAI_API_KEY=key'.")
 
 
 def call_openai(
@@ -1459,11 +1461,14 @@ def main() -> int:
 
     openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
-    token_cost_raw = (
-        args.token_cost
-        if args.token_cost is not None
-        else config.get("token_cost", "off")
-    )
+    if args.model is not None and args.token_cost is None:
+        token_cost_raw = "off"
+    else:
+        token_cost_raw = (
+            args.token_cost
+            if args.token_cost is not None
+            else config.get("token_cost", "off")
+        )
     try:
         token_cost = parse_token_cost(token_cost_raw)
     except ValueError as exc:
