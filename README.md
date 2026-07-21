@@ -24,16 +24,25 @@
 git clone https://github.com/Southland-Systems/mince.git
 cd mince
 make install
+```
 
-# Update
+Update
+
+```bash
 cd mince
 make update
+```
 
-# Uninstall
+Uninstall
+
+```bash
 cd mince
 make uninstall-user
+```
 
-# Manual install
+Manual install
+
+```bash
 (cd mince && cp -a mince ~/.local/bin/ && chmod +x ~/.local/bin/mince \
   && pip install -U -r requirements.txt)
 ```
@@ -97,7 +106,15 @@ mince -PR -f passwd -t "Remove lines 1-5 from 'passwd' \
 and create a new file called 'passwd-new' with those lines."
 ```
 
-Create a dedicated 'ask' profile from the default profile.
+Plan mode asks the model to create prompt for the next step using the supplied context:
+
+```bash
+mince --plan \
+  --task "Review the error handling and propose the next implementation step" \
+  --files src/main.py README.md
+```
+
+Create a dedicated 'ask' profile from the default profile:
 
 ```bash
 mince --copy-profile a
@@ -167,9 +184,12 @@ All the `mince` CLI arguments for reference.
 | `-P`, `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
 | `-R`, `--patch-review` | Confirm changes before writing to filenames without the suffix, unless a suffix is overridden. |
 | `--patch-suffix SUFFIX` | Set the suffix for patched files (default: `.mcepatched`). |
+| `--patch-save [BOOL]` | Save the patch file under `~/.local/state/mince/patches`. |
+| `--plan` | Generate and review a prompt before using it as the task. |
 | `--system-prompt TEXT` | Override the configured system prompt. |
 | `--system-prompt-file FILE` | Read the system prompt from the given file. |
 | `--patch-system-prompt TEXT` | Set the system prompt for patch mode. |
+| `--plan-system-prompt TEXT` | Set the system prompt for plan mode. |
 | `--model MODEL` | Override the configured model. |
 | `--list-models` | List available models. |
 | `--openai-base-url URL` | Set the OpenAI-compatible API base URL. |
