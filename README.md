@@ -4,13 +4,11 @@
 
 - Answers direct prompts or performs tasks using one or more local files as context
 - Sends a single request to an OpenAI-compatible model endpoint
-- Supports text, JSON, JSON Schema Structured Outputs, and streamed text responses
-- Can write responses to a file and estimate input-token usage before sending
 - Generates structured multi-file patches with diffs, optional review, and configurable output suffixes
+- Supports text, JSON, JSON Schema Structured Outputs, and streamed text responses
 - Supports configuration profiles, custom system prompts, reasoning controls, and model parameters
-- Works with hosted APIs and local OpenAI-compatible servers
 - Provides optional local session logging, API storage controls, usage statistics, and cost estimates
-- Creates a context-controlled, continuously verified workflow
+- Creates a context-controlled, continuously verified workflow and maximizes cost effectiveness
 
 ## Requirements 📦
 
@@ -99,7 +97,7 @@ mince -PR -f passwd -t "Remove lines 1-5 from 'passwd' \
 and create a new file called 'passwd-new' with those lines."
 ```
 
-Create a dedicated 'ask' profile
+Create a dedicated 'ask' profile from the default profile.
 
 ```bash
 mince --copy-profile a
@@ -198,6 +196,8 @@ All the `mince` CLI arguments for reference.
 | `--print-reasoning` | Include reasoning output in `<think>` tags. |
 | `--print-default-config` | Print the built-in default configuration as JSON. |
 | `--print-current-config` | Print the stored configuration file, creating it if missing. |
+| `--set-config NAME=VALUE` | Set a configuration value (may be repeated). |
+| `--get-config [NAME]` | Get a configuration value, or all values if NAME is omitted. |
 | `--log [BOOL]` | Enable or disable local session logging under `~/.local/state/mince/logs`. |
 | `--no-api-log [BOOL]` | Do not store requests and responses in the OpenAI-compatible API. |
 | `--quiet [BOOL]` | Suppress extra output such as statistics and information messages. |
