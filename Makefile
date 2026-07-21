@@ -18,7 +18,7 @@ ifeq ($(shell id -u),0)
 SUDO :=
 endif
 
-.PHONY: install-user uninstall-user update-user install-global uninstall-global update-global update help shell
+.PHONY: install-user uninstall-user update-user install-global uninstall-global update-global update help shell changelog
 
 help:
 	@printf '%s\n' \
@@ -31,7 +31,8 @@ help:
 	  '  update-global     Refresh the global install' \
 	  '  install           Alias for install-user' \
 	  '  update            Auto-detect and update whichever install exists' \
-	  '  shell             Start a shell in the installed environment'
+	  '  shell             Start a shell in the installed environment' \
+	  '  changelog         Show the recent changelog'
 
 install-user:
 	@set -eu; \
@@ -133,3 +134,6 @@ shell:
 		exit 1; \
 	fi
 
+changelog:
+	@set -eu; \
+	git log --oneline -n 24 --since "2 weeks ago"

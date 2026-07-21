@@ -3,7 +3,8 @@
 ## What it does ✨
 
 - Answers direct prompts or performs tasks using one or more local files as context
-- Sends a single request to an OpenAI-compatible model endpoint
+- Sends requests to an OpenAI-compatible model endpoint
+- Processes files recursively in tree mode, making one request per matched file
 - Generates structured multi-file patches with diffs, optional review, and configurable output suffixes
 - Supports text, JSON, JSON Schema Structured Outputs, and streamed text responses
 - Supports configuration profiles, custom system prompts, reasoning controls, and model parameters
@@ -73,6 +74,21 @@ Read the task and context-file paths from files:
 
 ```bash
 mince --task-file review-task.txt --files-list review-files.txt
+```
+
+Run tree mode over files and directories:
+
+```bash
+mince --tree-files src tests --tree-task-file tree-task.txt \
+  --tree-include '*.py' --tree-exclude '*/.venv/*' --tree-parallel 128
+```
+
+Use `--tree-system-prompt-file` to set a system prompt by extension. Lines may be `.ext:prompt`, `.*:prompt` and/or an overall `prompt`.
+
+```text
+.py:Create python specific documentation for the provided script.
+.*:Create best effort documentation for the provided file.
+Ensure documentation is concise, complete and relevant to the content.
 ```
 
 Request JSON output:
@@ -179,6 +195,14 @@ All the `mince` CLI arguments for reference.
 | `--task-file FILE` | Read the task/prompt from the given file. |
 | `-f FILE...`, `--files FILE...` | Files to include as context. |
 | `--files-list FILE` | Read context-file paths from a file, one per line. |
+| `--tree-files PATH...` | Recursively process files or directories in tree mode. |
+| `--tree-files-list FILE` | Read tree-mode file or directory roots from a file, one per line. |
+| `--tree-task-file FILE` | Read the required tree-mode task from a file. |
+| `--tree-system-prompt-file FILE` | Select tree-mode system prompts by extension (`.ext:prompt`, `*:prompt`, and an overall `prompt`). |
+| `--tree-include PATTERN...` | Include only tree files matching at least one pattern. |
+| `--tree-exclude PATTERN...` | Exclude tree files matching any pattern. |
+| `--tree-exclude-git [BOOL]` | Exclude `.git` directories (default: `on`). |
+| `--tree-parallel [N]` | Set the maximum number of parallel tree-mode requests (default: `64`). |
 | `-p NAME`, `--profile NAME` | Select a configuration profile. |
 | `-o FILE`, `--output-file FILE` | Write the response to the given file, overwriting it if it exists. |
 | `-P`, `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
@@ -258,6 +282,7 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make update` | Auto‑detects whether a **user** or **global** install exists and runs the appropriate update target. |
 | `make install` | Alias for `install-user` |
 | `make shell` | Drops you into a Bash shell with the correct virtual‑env activated (`source …/bin/activate`). Handy for debugging or ad‑hoc runs. |
+| `make changelog` | Displays the changelog for the last two weeks or last 20 entries. |
 | `make help` | Prints this table and a short description of each target. |
 
 ## License and Copyright 📄

@@ -16,6 +16,9 @@ import time
 import re
 from pathlib import Path
 from typing import Any
+import fnmatch
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import random, string
 from dataclasses import dataclass
 
@@ -941,6 +944,410 @@ def consume_response_stream(
     return "".join(chunks), usage, completed_response
 
 
+
+def read_tree_system_prompts(path: Path) -> tuple[dict[str, str], str | None, str | None]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        raise ValueError(f"cannot read tree system prompt file {path} ({exc})") from exc
+
+    exact_prompts: dict[str, str] = {}
+    wildcard_prompt: str | None = None
+    default_prompt: str | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        key, separator, value = line.partition(":")
+        extension = key.strip().lower()
+        if separator and (extension == "*" or extension.startswith(".")):
+            prompt = value.strip()
+            if extension == "*":
+                wildcard_prompt = prompt
+            else:
+                exact_prompts[extension] = prompt
+        else:
+            # An unqualified line is the default system prompt.
+            default_prompt = line
+
+    return exact_prompts, wildcard_prompt, default_prompt
+
+
+
+def tree_system_prompt_for_path(
+    path: Path,
+    prompts: tuple[dict[str, str], str | None, str | None],
+    fallback: str,
+ ) -> str:
+    exact_prompts, wildcard_prompt, default_prompt = prompts
+    suffixes = path.suffixes
+    extension_candidates: list[str] = []
+    if suffixes:
+        extension_candidates.append("".join(suffixes).lower())
+        extension_candidates.extend(suffix.lower() for suffix in reversed(suffixes))
+    for extension in extension_candidates:
+        if extension in exact_prompts:
+            return exact_prompts[extension]
+    if wildcard_prompt is not None:
+        return wildcard_prompt
+    if default_prompt is not None:
+        return default_prompt
+    return fallback
+
+
+
+def _tree_path_candidates(path: Path, roots: list[Path]) -> set[str]:
+    candidates = {path.as_posix(), path.name}
+    cwd = Path.cwd().resolve()
+    try:
+        candidates.add(path.relative_to(cwd).as_posix())
+    except ValueError:
+        pass
+
+    for root in roots:
+        base = root if root.is_dir() else root.parent
+        try:
+            relative = path.relative_to(base)
+        except ValueError:
+            continue
+        candidates.add(relative.as_posix())
+        candidates.add((Path(base.name) / relative).as_posix())
+    return candidates
+
+
+
+def _tree_pattern_matches(path: Path, patterns: list[str], roots: list[Path]) -> bool:
+    candidates = _tree_path_candidates(path, roots)
+    for raw_pattern in patterns:
+        pattern = raw_pattern.replace("\\", "/")
+        for candidate in candidates:
+            if fnmatch.fnmatchcase(candidate, pattern):
+                return True
+            try:
+                if Path(candidate).match(pattern):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+
+def expand_tree_file_paths(
+    input_names: list[str],
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    exclude_git: bool = True,
+ ) -> tuple[list[Path], list[Path]]:
+    roots: list[Path] = []
+    candidates: list[Path] = []
+
+    for raw_name in input_names:
+        root = Path(raw_name).expanduser().resolve()
+        if not root.exists():
+            raise ValueError(f"tree input does not exist: {raw_name}")
+        roots.append(root)
+        if root.is_dir():
+            if exclude_git and ".git" in root.parts:
+                continue
+            for current_root, dir_names, file_names in os.walk(root):
+                if exclude_git:
+                    dir_names[:] = [
+                        name for name in dir_names if name != ".git"
+                    ]
+                for name in file_names:
+                    path = Path(current_root) / name
+                    if path.is_file():
+                        candidates.append(path)
+        elif root.is_file():
+            candidates.append(root)
+        else:
+            raise ValueError(f"tree input is not a file or directory: {raw_name}")
+
+    unique_candidates: dict[Path, None] = {}
+    for path in candidates:
+        if exclude_git and ".git" in path.parts[:-1]:
+            continue
+        resolved = path.resolve()
+        if resolved in unique_candidates:
+            continue
+        if exclude_git and ".git" in resolved.parts[:-1]:
+            continue
+        if exclude_patterns and _tree_pattern_matches(resolved, exclude_patterns, roots):
+            continue
+        if include_patterns and not _tree_pattern_matches(resolved, include_patterns, roots):
+            continue
+        unique_candidates[resolved] = None
+
+    return sorted(unique_candidates, key=lambda path: path.as_posix()), roots
+
+
+
+def tree_result_relative_path(path: Path, roots: list[Path]) -> Path:
+    cwd = Path.cwd().resolve()
+    try:
+        relative = path.relative_to(cwd)
+    except ValueError:
+        relative = None
+        for root in roots:
+            base = root if root.is_dir() else root.parent
+            try:
+                under_root = path.relative_to(base)
+            except ValueError:
+                continue
+            relative = Path(base.name) / under_root
+            break
+        if relative is None:
+            relative = Path(*path.parts[1:])
+    safe_parts = [part for part in relative.parts if part not in ("", ".", "..")]
+    if not safe_parts:
+        safe_parts = [path.name or "file"]
+    return Path(*safe_parts)
+
+
+
+def _tree_reasoning(response_obj: Any) -> str:
+    reasoning = ""
+    try:
+        for item in getattr(response_obj, "output", []):
+            if getattr(item, "type", None) == "reasoning":
+                for content in getattr(item, "content", []):
+                    if getattr(content, "type", None) == "reasoning_text":
+                        reasoning = getattr(content, "text", "")
+        if not reasoning:
+            for item in getattr(response_obj, "output", []):
+                if getattr(item, "type", None) == "reasoning":
+                    for content in getattr(item, "summary", []):
+                        if getattr(content, "type", None) == "summary_text":
+                            reasoning = getattr(content, "text", "")
+    except Exception:
+        return ""
+    return str(reasoning or "")
+
+
+
+def _tree_exception_message(exc: BaseException) -> str:
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    return type(exc).__name__
+
+
+
+def run_tree_mode(
+    *,
+    file_paths: list[Path],
+    relative_paths: dict[Path, Path],
+    task: str,
+    tree_system_prompts: tuple[dict[str, str], str | None, str | None],
+    system_prompt: str,
+    linenum_system_prompt: str,
+    add_line_numbers: bool,
+    max_file_size_kb: int,
+    tree_parallel: int,
+    token_limit: int,
+    model: str,
+    api_key: str,
+    openai_base_url: str,
+    openai_proxy: str,
+    openai_organization: str,
+    openai_project: str,
+    response_format: str,
+    json_schema: dict[str, Any] | None,
+    response_verbosity: str,
+    temperature: float | None,
+    top_p: float | None,
+    max_output_tokens: int,
+    openai_service_tier: str,
+    openai_reasoning: str | None,
+    reasoning_mode: str,
+    extra_body: dict[str, Any],
+    llm_timeout: int,
+    safety_identifier: Any,
+    api_log: bool,
+    token_cost: tuple[float, float] | None,
+    print_reasoning: bool,
+    tree_session_dir: Path,
+    combined_tree_path: Path,
+    log_enabled: bool,
+    log_path: Path | None,
+ ) -> int:
+    log_lock = threading.Lock()
+    records: list[dict[str, Any]] = []
+
+    def process_file(file_path: Path) -> dict[str, Any]:
+        relative_path = relative_paths[file_path]
+        output_path = tree_session_dir / relative_path
+        request_characters = 0
+        request_tokens = 0
+        request_cost_log = ""
+        full_system_prompt = ""
+        user_prompt = ""
+        result = ""
+        usage: dict[str, Any] | None = None
+        response_obj: Any = None
+        error_text: str | None = None
+        start_time = time.perf_counter()
+
+        try:
+            context = build_context(
+                file_paths=[file_path],
+                max_file_size_kb=max_file_size_kb,
+                add_line_numbers=add_line_numbers,
+            )
+            selected_system_prompt = tree_system_prompt_for_path(
+                file_path, tree_system_prompts, system_prompt
+            )
+            if add_line_numbers:
+                full_system_prompt = linenum_system_prompt + "\n" + selected_system_prompt
+            else:
+                full_system_prompt = selected_system_prompt
+            user_prompt = build_user_prompt(
+                task=task,
+                context=context,
+                response_format=response_format,
+                json_schema=json_schema,
+            )
+            request_tokens = estimate_request_tokens(
+                model=model,
+                system_prompt=full_system_prompt,
+                user_prompt=user_prompt,
+            )
+            request_characters = len(full_system_prompt + user_prompt)
+            if token_cost is not None:
+                request_cost_log = f" request_cost_estimate={request_tokens * token_cost[0] / 1_000_000:.4f}"
+            if request_tokens > token_limit:
+                raise ValueError(
+                    f"Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})"
+                )
+            response_obj, usage = call_openai(
+                api_key=api_key,
+                openai_base_url=openai_base_url,
+                openai_proxy=openai_proxy,
+                openai_organization=openai_organization,
+                openai_project=openai_project,
+                model=model,
+                system_prompt=full_system_prompt,
+                user_prompt=user_prompt,
+                response_format=response_format,
+                json_schema=json_schema,
+                response_verbosity=response_verbosity,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_output_tokens,
+                openai_service_tier=openai_service_tier,
+                openai_reasoning=openai_reasoning,
+                reasoning_mode=reasoning_mode,
+                extra_body=extra_body,
+                llm_timeout=llm_timeout,
+                safety_identifier=safety_identifier,
+                store=api_log,
+                stream=False,
+            )
+            result = str(getattr(response_obj, "output_text", "") or "")
+            if not result.strip():
+                error_text = "LLM returned an empty response"
+            if response_format in ("json", "schema") and result.strip():
+                cleaned_result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
+                try:
+                    result = json.dumps(json.loads(cleaned_result), indent=2, ensure_ascii=False)
+                except json.JSONDecodeError as exc:
+                    error_text = f"Failed to parse JSON response: {exc}"
+        except BaseException as exc:
+            error_text = _tree_exception_message(exc)
+        elapsed = time.perf_counter() - start_time
+        reasoning = _tree_reasoning(response_obj) if response_obj is not None else ""
+        stored_result = result
+        if not stored_result:
+            stored_result = f"ERROR: {error_text}" if error_text else ""
+        if print_reasoning:
+            stored_result = f"<think>\n{reasoning}\n</think>\n\n{stored_result}"
+        output_error: str | None = None
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(stored_result, encoding="utf-8")
+        except Exception as exc:
+            output_error = _tree_exception_message(exc)
+            if error_text is None:
+                error_text = output_error
+        response_cost = response_cost_line(token_cost, usage)
+        statsline = print_stats(
+            request_characters=request_characters,
+            request_tokens=request_tokens,
+            processing_time=elapsed,
+            response_text=stored_result,
+            usage=usage,
+            response_cost=response_cost,
+        )
+        if log_enabled:
+            with log_lock:
+                with open(log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(f"<tree_file path='{file_path}'>\n")
+                    log_file.write("<tree_request_stats>\n")
+                    log_file.write(
+                        f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+                        f"max_output_tokens={max_output_tokens} api_log={api_log} timeout={llm_timeout}\n"
+                    )
+                    log_file.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
+                    log_file.write(f"<user_prompt>\n{user_prompt}\n</user_prompt>\n")
+                    if reasoning:
+                        log_file.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
+                    if error_text:
+                        log_file.write(f"<error>{error_text}</error>\n")
+                    log_file.write(f"<response>\n{stored_result}\n</response>\n")
+                    log_file.write(f"<response_stats>\n{statsline}\n</response_stats>\n")
+                    log_file.write(f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n")
+                    log_file.write("</tree_file>\n")
+                    log_file.flush()
+        success = error_text is None and output_error is None
+        record = {
+            "path": file_path,
+            "relative_path": relative_path,
+            "output_path": output_path,
+            "result": stored_result,
+            "statsline": statsline,
+            "success": success,
+        }
+        with log_lock:
+            records.append(record)
+            if VERBOSE:
+                status = "ok" if success else "error"
+                print(
+                    f"tree_file={file_path} output_file={relative_path} status={status} {statsline}",
+                    file=sys.stderr,
+                )
+        return record
+
+    try:
+        with ThreadPoolExecutor(max_workers=tree_parallel) as executor:
+            futures = [executor.submit(process_file, file_path) for file_path in file_paths]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except BaseException as exc:
+                    print(f"ERROR: Tree worker failed: {_tree_exception_message(exc)}", file=sys.stderr)
+    except Exception as exc:
+        print(f"ERROR: Failed to run tree workers: {exc}", file=sys.stderr)
+        return 1
+
+    ordered_records = sorted(records, key=lambda record: record["relative_path"].as_posix())
+    combined_parts: list[str] = []
+    for record in ordered_records:
+        combined_parts.append(
+            f"---\n## **{record['relative_path'].as_posix()}**\n\n{record['result'].rstrip()}\n"
+        )
+    try:
+        combined_tree_path.parent.mkdir(parents=True, exist_ok=True)
+        combined_tree_path.write_text("\n".join(combined_parts), encoding="utf-8")
+    except Exception as exc:
+        print(f"ERROR: Failed to write combined tree result {combined_tree_path}: {exc}", file=sys.stderr)
+        return 1
+
+    if VERBOSE:
+        print(f"tree_output={combined_tree_path}", file=sys.stderr)
+    return 0 if len(records) == len(file_paths) and all(record["success"] for record in records) else 1
+
+
 # -------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------
@@ -993,6 +1400,61 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Read context file paths from a file (one file per line)",
     )
+    tree_files_group = parser.add_mutually_exclusive_group()
+    tree_files_group.add_argument(
+        "--tree-files",
+        nargs="+",
+        metavar="PATH",
+        help="Files or directories to process recursively in tree mode",
+    )
+    tree_files_group.add_argument(
+        "--tree-files-list",
+        metavar="FILE",
+        type=Path,
+        help="Read tree-mode files or directories from a file",
+    )
+    parser.add_argument(
+        "--tree-task-file",
+        metavar="FILE",
+        type=Path,
+        help="Read the tree-mode task from this file",
+    )
+    parser.add_argument(
+        "--tree-system-prompt-file",
+        metavar="FILE",
+        type=Path,
+        help="Per-extension system prompts (.ext:prompt, *:prompt, or an overall prompt)",
+    )
+    parser.add_argument(
+        "--tree-exclude",
+        nargs="+",
+        metavar="PATTERN",
+        help="Exclude tree files matching any of these patterns",
+    )
+    parser.add_argument(
+        "--tree-exclude-git",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Exclude .git directories from tree search (default: on)",
+    )
+    parser.add_argument(
+        "--tree-include",
+        nargs="+",
+        metavar="PATTERN",
+        help="Include only tree files matching any of these patterns",
+    )
+    parser.add_argument(
+        "--tree-parallel",
+        nargs="?",
+        const=64,
+        default=None,
+        type=int,
+        metavar="N",
+        help="Maximum parallel tree calls (default: 64)",
+    )
     parser.add_argument(
         "-p",
         "--profile",
@@ -1007,18 +1469,17 @@ def parse_args() -> argparse.Namespace:
         help="Write the response to the given file (overwrites if it exists)",
     )
     parser.add_argument(
-        "-P",
         "--patch",
         action="store_true",
         help="Patch specified files and write changes to the filename + patch suffix",
     )
     parser.add_argument(
-        "-R",
         "--patch-review",
         action="store_true",
         help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",
     )
     parser.add_argument(
+        "-S",
         "--patch-suffix",
         type=str,
         help="Suffix for patched files (default: .mcepatched)",
@@ -1426,9 +1887,47 @@ def main() -> int:
 
 
     ask_mode: bool = args.ask is not None or args.ask_file is not None
+    tree_mode = args.tree_files is not None or args.tree_files_list is not None
+    tree_exclude_git = (
+        args.tree_exclude_git
+        if args.tree_exclude_git is not None
+        else True
+    )
+    tree_option_used = any(
+        value is not None
+        for value in (
+            args.tree_task_file,
+            args.tree_system_prompt_file,
+            args.tree_exclude,
+            args.tree_include,
+            args.tree_exclude_git,
+            args.tree_parallel,
+        )
+    )
     file_names: list[str] = []
 
-    if not ask_mode and not args.list_models:
+    if tree_mode:
+        if ask_mode or args.task is not None or args.task_file is not None or args.files is not None or args.files_list is not None:
+            print("ERROR: tree mode cannot be combined with regular task, ask, or file options", file=sys.stderr)
+            return 1
+        if not args.tree_task_file:
+            print("ERROR: tree mode requires --tree-task-file", file=sys.stderr)
+            return 1
+        try:
+            task = args.tree_task_file.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            try:
+                task = args.tree_task_file.read_bytes().decode("utf-8", errors="replace").strip()
+            except Exception as exc:
+                print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
+                return 1
+        except Exception as exc:
+            print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
+            return 1
+    elif tree_option_used:
+        print("ERROR: tree options require --tree-files or --tree-files-list", file=sys.stderr)
+        return 1
+    elif not ask_mode and not args.list_models:
         if args.task:
             task = read_prompt_argument(args.task)
         elif args.task_file:
@@ -1487,14 +1986,17 @@ def main() -> int:
         patch_suffix = DEFAULT_CONFIG["patch_suffix"]
         suffix_provided = False
 
+    if tree_mode and (plan_mode or patch_mode):
+        print("ERROR: tree mode cannot be combined with --plan or --patch", file=sys.stderr)
+        return 1
     if plan_mode and ask_mode:
-        print("ERROR: --plan only supports --task or --task-file (not --ask/--ask-file)", file=sys.stderr)
+        print("ERROR: --plan only supports --task or --task-file", file=sys.stderr)
         return 1
-    if patch_mode and not args.task:
-        print("ERROR: --patch requires --task", file=sys.stderr)
+    if patch_mode and not (args.task or args.task_file):
+        print("ERROR: --patch requires --task or --task-file", file=sys.stderr)
         return 1
-    if patch_mode and (args.ask or args.ask_file or args.task_file):
-        print("ERROR: --patch only supports --task (not --ask/--ask-file)", file=sys.stderr)
+    if patch_mode and (args.ask or args.ask_file):
+        print("ERROR: --patch only supports --task or --task-file ", file=sys.stderr)
         return 1
 
     llm_timeout = (
@@ -1704,7 +2206,7 @@ def main() -> int:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = LOG_DIR / f"{session_stem}.txt"
         with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"start_time={time.ctime(session_timestamp)}\n")
+            f.write(f"<start_time>{time.ctime(session_timestamp)} [{session_timestamp}]</start_time>\n")
         if VERBOSE:
             print(f"log_file={log_path}", file=sys.stderr)
 
@@ -1712,6 +2214,97 @@ def main() -> int:
     if patch_save_enabled and patch_mode:
         patch_stem = log_path.stem if log_path is not None else session_stem
         patch_save_path = APP_DIR / "patches" / f"{patch_stem}.patch"
+
+    if tree_mode:
+        try:
+            if args.tree_files_list:
+                tree_input_names = read_files_list(args.tree_files_list)
+            else:
+                tree_input_names = list(args.tree_files or [])
+            tree_file_paths, tree_roots = expand_tree_file_paths(
+                tree_input_names,
+                include_patterns=args.tree_include or [],
+                exclude_patterns=args.tree_exclude or [],
+                exclude_git=tree_exclude_git,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        if not tree_file_paths:
+            print("ERROR: No files matched the tree inputs and filters.", file=sys.stderr)
+            return 1
+
+        tree_parallel = args.tree_parallel if args.tree_parallel is not None else 64
+        if tree_parallel < 1:
+            print("ERROR: --tree-parallel must be at least 1.", file=sys.stderr)
+            return 1
+
+        try:
+            if args.tree_system_prompt_file:
+                tree_system_prompts = read_tree_system_prompts(args.tree_system_prompt_file)
+            else:
+                tree_system_prompts = ({}, None, None)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        tree_relative_paths: dict[Path, Path] = {}
+        used_relative_paths: set[Path] = set()
+        for tree_file_path in tree_file_paths:
+            relative_path = tree_result_relative_path(tree_file_path, tree_roots)
+            if relative_path in used_relative_paths:
+                print(f"ERROR: Multiple tree inputs map to the same result path: {relative_path}", file=sys.stderr)
+                return 1
+            used_relative_paths.add(relative_path)
+            tree_relative_paths[tree_file_path] = relative_path
+
+        tree_session_dir = APP_DIR / "trees" / session_stem
+        combined_tree_path = APP_DIR / "trees" / f"{session_stem}.md"
+        try:
+            tree_session_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print(f"ERROR: Failed to create tree output directory {tree_session_dir}: {exc}", file=sys.stderr)
+            return 1
+
+        max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
+        return run_tree_mode(
+            file_paths=tree_file_paths,
+            relative_paths=tree_relative_paths,
+            task=task,
+            tree_system_prompts=tree_system_prompts,
+            system_prompt=system_prompt,
+            linenum_system_prompt=linenum_system_prompt,
+            add_line_numbers=add_line_numbers,
+            max_file_size_kb=max_file_size_kb,
+            tree_parallel=tree_parallel,
+            token_limit=token_limit,
+            model=model,
+            api_key=api_key,
+            openai_base_url=openai_base_url,
+            openai_proxy=openai_proxy,
+            openai_organization=openai_organization,
+            openai_project=openai_project,
+            response_format=response_format,
+            json_schema=json_schema,
+            response_verbosity=response_verbosity,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            openai_service_tier=openai_service_tier,
+            openai_reasoning=openai_reasoning,
+            reasoning_mode=reasoning_mode,
+            extra_body=extra_body,
+            llm_timeout=llm_timeout,
+            safety_identifier=safety_identifier,
+            api_log=api_log,
+            token_cost=token_cost,
+            print_reasoning=args.print_reasoning,
+            tree_session_dir=tree_session_dir,
+            combined_tree_path=combined_tree_path,
+            log_enabled=log_enabled,
+            log_path=log_path,
+        )
 
     if ask_mode:
         context = ""
@@ -1788,7 +2381,7 @@ def main() -> int:
         if log_enabled:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_request>\n")
-                f.write(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} plan_mode\n")
+                f.write(f"<plan_request_stats>\nrequest_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model}\n</plan_request_stats>\n")
                 f.write(f"<system_prompt>\n{plan_full_system_prompt}\n</system_prompt>\n")
                 f.write(f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n")
                 f.write("</plan_request>\n")
@@ -1840,7 +2433,7 @@ def main() -> int:
         if log_enabled:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_response>\n{plan_result}\n</plan_response>\n")
-                f.write(f"{plan_statsline}\n")
+                f.write(f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n")
         if VERBOSE:
             print(plan_statsline, file=sys.stderr)
         print()
@@ -1893,10 +2486,11 @@ def main() -> int:
     if log_enabled:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
+                f"<request_stats>\n"
                 f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
                 f"max_output_tokens={max_output_tokens} api_log={api_log} temperature={temperature} top_p={top_p} "
                 f"safety_identifier='{safety_identifier}' service_tier={openai_service_tier} base_url='{openai_base_url}' "
-                f"timeout={llm_timeout}\n"
+                f"timeout={llm_timeout}\n</request_stats>\n"
             )
             f.write("<request>\n")
             f.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
@@ -1999,8 +2593,8 @@ def main() -> int:
             if reasoning:
                 f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
             f.write(f"<response>\n{result}\n</response>\n")
-            f.write(f"{statsline}\n")
-            f.write(f"end_time={time.ctime(int(time.time()))}\n")
+            f.write(f"<response_stats>\n{statsline}\n</response_stats>\n")
+            f.write(f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n")
 
     if patch_mode:
         try:
