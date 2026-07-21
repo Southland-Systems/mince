@@ -1453,6 +1453,11 @@ def parse_args() -> argparse.Namespace:
         help="Include only tree files matching any of these patterns",
     )
     parser.add_argument(
+        "--tree-show-only",
+        action="store_true",
+        help="Only output the filtered tree file list without processing files",
+    )
+    parser.add_argument(
         "--tree-parallel",
         nargs="?",
         const=64,
@@ -1909,27 +1914,30 @@ def main() -> int:
             args.tree_exclude_git,
             args.tree_parallel,
         )
-    )
+    ) or args.tree_show_only
     file_names: list[str] = []
 
     if tree_mode:
         if ask_mode or args.task is not None or args.task_file is not None or args.files is not None or args.files_list is not None:
             print("ERROR: tree mode cannot be combined with regular task, ask, or file options", file=sys.stderr)
             return 1
-        if not args.tree_task_file:
+        if not args.tree_show_only and not args.tree_task_file:
             print("ERROR: tree mode requires --tree-task-file", file=sys.stderr)
             return 1
-        try:
-            task = args.tree_task_file.read_text(encoding="utf-8").strip()
-        except UnicodeDecodeError:
+        if args.tree_show_only:
+            task = ""
+        else:
             try:
-                task = args.tree_task_file.read_bytes().decode("utf-8", errors="replace").strip()
+                task = args.tree_task_file.read_text(encoding="utf-8").strip()
+            except UnicodeDecodeError:
+                try:
+                    task = args.tree_task_file.read_bytes().decode("utf-8", errors="replace").strip()
+                except Exception as exc:
+                    print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
+                    return 1
             except Exception as exc:
                 print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
                 return 1
-        except Exception as exc:
-            print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
-            return 1
     elif tree_option_used:
         print("ERROR: tree options require --tree-files or --tree-files-list", file=sys.stderr)
         return 1
@@ -1956,6 +1964,30 @@ def main() -> int:
             return 1
     else:
         task = ""
+
+    if tree_mode and args.tree_show_only:
+        try:
+            if args.tree_files_list:
+                tree_input_names = read_files_list(args.tree_files_list)
+            else:
+                tree_input_names = list(args.tree_files or [])
+            tree_file_paths, _ = expand_tree_file_paths(
+                tree_input_names,
+                include_patterns=args.tree_include or [],
+                exclude_patterns=args.tree_exclude or [],
+                exclude_git=tree_exclude_git,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        if not tree_file_paths:
+            print("ERROR: No files matched the tree inputs and filters.", file=sys.stderr)
+            return 1
+
+        for tree_file_path in tree_file_paths:
+            print(tree_file_path)
+        return 0
 
     config = load_config()
 
