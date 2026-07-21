@@ -83,12 +83,14 @@ mince --tree-files src tests --tree-task-file tree-task.txt \
   --tree-include '*.py' --tree-exclude '*/.venv/*' --tree-parallel 128
 ```
 
-Use `--tree-system-prompt-file` to set a system prompt by extension. Lines may be `.ext:prompt`, `*:prompt` and/or an overall `prompt`.
+The `--tree-task-file` file contains a list of extensions and tasks. Lines may be `.ext:task`, `*:task` or an overall `task`, and they can be repeated.
 
 ```text
 .py:Create python specific documentation for the provided script.
+.py:Use Markdown to format the documentation.
 *:Create best effort documentation for the provided file.
 Ensure documentation is concise, complete and relevant to the content.
+Keep the documentation technical and without conversation.
 ```
 
 Request JSON output:

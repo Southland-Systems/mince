@@ -619,7 +619,9 @@ def read_file(path: Path) -> str:
         return f"ERROR: cannot read file {path} ({exc})"
 
 
-def read_prompt_argument(value: str) -> str:
+def read_prompt_argument(value: str | list[str]) -> str:
+    if isinstance(value, list):
+        value = " ".join(value)
     if value == "-":
         return sys.stdin.read().strip()
     return value.strip()
@@ -937,37 +939,52 @@ def consume_response_stream(
 
 
 
-def read_tree_system_prompts(path: Path) -> tuple[dict[str, str], str | None, str | None]:
+def read_tree_prompt_file(path: Path) -> tuple[dict[str, str], str | None, str | None]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except Exception as exc:
-        raise ValueError(f"cannot read tree system prompt file {path} ({exc})") from exc
+        raise ValueError(f"cannot read tree prompt file {path} ({exc})") from exc
 
-    exact_prompts: dict[str, str] = {}
-    wildcard_prompt: str | None = None
-    default_prompt: str | None = None
+    default_key = "__default__"
+    prompt_lines: dict[str, list[str]] = {}
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
-        key, separator, value = line.partition(":")
+        key, separator, value = raw_line.partition(":")
         extension = key.strip().lower()
         if separator and (extension == "*" or extension.startswith(".")):
-            prompt = value.strip()
-            if extension == "*":
-                wildcard_prompt = prompt
-            else:
-                exact_prompts[extension] = prompt
+            prompt_lines.setdefault(extension, []).append(value.strip())
         else:
-            # An unqualified line is the default system prompt.
-            default_prompt = line
+            prompt_lines.setdefault(default_key, []).append(line)
 
+    def combine(lines_for_prompt: list[str]) -> str:
+        return "\n".join(lines_for_prompt).strip()
+
+    exact_prompts = {
+        extension: combine(lines_for_prompt)
+        for extension, lines_for_prompt in prompt_lines.items()
+        if extension not in (default_key, "*")
+    }
+    wildcard_prompt = (
+        combine(prompt_lines["*"])
+        if "*" in prompt_lines
+        else None
+    )
+    default_prompt = (
+        combine(prompt_lines[default_key])
+        if default_key in prompt_lines
+        else None
+    )
     return exact_prompts, wildcard_prompt, default_prompt
 
 
+def read_tree_system_prompts(path: Path) -> tuple[dict[str, str], str | None, str | None]:
+    return read_tree_prompt_file(path)
 
-def tree_system_prompt_for_path(
+
+def tree_prompt_for_path(
     path: Path,
     prompts: tuple[dict[str, str], str | None, str | None],
     fallback: str,
@@ -978,14 +995,30 @@ def tree_system_prompt_for_path(
     if suffixes:
         extension_candidates.append("".join(suffixes).lower())
         extension_candidates.extend(suffix.lower() for suffix in reversed(suffixes))
+
+    selected_prompt: str | None = None
     for extension in extension_candidates:
         if extension in exact_prompts:
-            return exact_prompts[extension]
-    if wildcard_prompt is not None:
-        return wildcard_prompt
-    if default_prompt is not None:
-        return default_prompt
-    return fallback
+            selected_prompt = exact_prompts[extension]
+            break
+
+    if selected_prompt is None:
+        selected_prompt = wildcard_prompt
+    if selected_prompt is None:
+        selected_prompt = default_prompt
+    if selected_prompt is None:
+        return fallback
+    if default_prompt is not None and selected_prompt != default_prompt:
+        return f"{default_prompt}\n{selected_prompt}"
+    return selected_prompt
+
+
+def tree_system_prompt_for_path(
+    path: Path,
+    prompts: tuple[dict[str, str], str | None, str | None],
+    fallback: str,
+ ) -> str:
+    return tree_prompt_for_path(path, prompts, fallback)
 
 
 
@@ -1131,6 +1164,7 @@ def run_tree_mode(
     file_paths: list[Path],
     relative_paths: dict[Path, Path],
     task: str,
+    tree_task_prompts: tuple[dict[str, str], str | None, str | None],
     tree_system_prompts: tuple[dict[str, str], str | None, str | None],
     system_prompt: str,
     linenum_system_prompt: str,
@@ -1187,7 +1221,10 @@ def run_tree_mode(
                 max_file_size_kb=max_file_size_kb,
                 add_line_numbers=add_line_numbers,
             )
-            selected_system_prompt = tree_system_prompt_for_path(
+            selected_task = tree_prompt_for_path(
+                file_path, tree_task_prompts, task
+            )
+            selected_system_prompt = tree_prompt_for_path(
                 file_path, tree_system_prompts, system_prompt
             )
             if add_line_numbers:
@@ -1195,7 +1232,7 @@ def run_tree_mode(
             else:
                 full_system_prompt = selected_system_prompt
             user_prompt = build_user_prompt(
-                task=task,
+                task=selected_task,
                 context=context,
                 response_format=response_format,
                 json_schema=json_schema,
@@ -1299,6 +1336,7 @@ def run_tree_mode(
             "output_path": output_path,
             "result": stored_result,
             "statsline": statsline,
+            "usage": usage,
             "response_cost_components": response_cost_components,
             "success": success,
         }
@@ -1322,14 +1360,27 @@ def run_tree_mode(
         return 1
 
     ordered_records = sorted(records, key=lambda record: record["relative_path"].as_posix())
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_response_cost = 0.0
+    for record in ordered_records:
+        usage = record["usage"]
+        if usage is not None:
+            try:
+                total_input_tokens += int(usage["input_tokens"])
+                total_output_tokens += int(usage["output_tokens"])
+            except (KeyError, TypeError, ValueError):
+                pass
+        response_cost_components = record["response_cost_components"]
+        if response_cost_components is not None:
+            total_response_cost += response_cost_components[2]
+    tree_token_total_line = (
+        f" tree_input_tokens={total_input_tokens}"
+        f" tree_output_tokens={total_output_tokens}"
+    )
     response_cost_total_line = ""
     if token_cost is not None:
-        total_response_cost = 0.0
-        for record in ordered_records:
-            response_cost_components = record["response_cost_components"]
-            if response_cost_components is not None:
-                total_response_cost += response_cost_components[2]
-        response_cost_total_line = f" tree_cost_total={total_response_cost:.4f}"
+        response_cost_total_line = f" tree_token_cost={total_response_cost:.4f}"
     combined_parts: list[str] = []
     for record in ordered_records:
         combined_parts.append(
@@ -1344,11 +1395,10 @@ def run_tree_mode(
     except Exception as exc:
         print(f"ERROR: Failed to write combined tree result {combined_tree_path}: {exc}", file=sys.stderr)
         return 1
-
     if VERBOSE:
         print(
             f"tree_output_file={combined_tree_path} "
-            f"tree_output_directory={tree_session_dir}{response_cost_total_line}",
+            f"tree_output_directory={tree_session_dir}{tree_token_total_line}{response_cost_total_line}",
             file=sys.stderr,
         )
     return 0 if len(records) == len(file_paths) and all(record["success"] for record in records) else 1
@@ -1419,23 +1469,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Read tree-mode files or directories from a file",
     )
-    parser.add_argument(
+    tree_task_group = parser.add_mutually_exclusive_group()
+    tree_task_group.add_argument(
+        "--tree-task",
+        nargs="+",
+        metavar="TEXT",
+        help="Task/prompt for tree mode (use - to read from STDIN)",
+    )
+    tree_task_group.add_argument(
         "--tree-task-file",
         metavar="FILE",
         type=Path,
-        help="Read the tree-mode task from this file",
+        help="Read tree-mode tasks from this file (.ext:task, *:task, or an overall task; can be repeated)",
     )
     parser.add_argument(
         "--tree-system-prompt-file",
         metavar="FILE",
         type=Path,
-        help="Per-extension system prompts (.ext:prompt, *:prompt, or an overall prompt)",
+        help="Per-extension system prompts (.ext:prompt, *:prompt, or an overall prompt; can be repeated)",
     )
     parser.add_argument(
         "--tree-exclude",
         nargs="+",
         metavar="PATTERN",
-        help="Exclude tree files matching any of these patterns",
+        help="Exclude tree files matching any of the supplied patterns",
     )
     parser.add_argument(
         "--tree-exclude-git",
@@ -1450,21 +1507,21 @@ def parse_args() -> argparse.Namespace:
         "--tree-include",
         nargs="+",
         metavar="PATTERN",
-        help="Include only tree files matching any of these patterns",
+        help="Include only tree files matching any the supplied patterns",
     )
     parser.add_argument(
         "--tree-show-only",
         action="store_true",
-        help="Only output the filtered tree file list without processing files",
+        help="Only output the filtered tree file list and exit",
     )
     parser.add_argument(
         "--tree-parallel",
         nargs="?",
-        const=64,
+        const=16,
         default=None,
         type=int,
         metavar="N",
-        help="Maximum parallel tree calls (default: 64)",
+        help="Maximum parallel tree calls (default: 16)",
     )
     parser.add_argument(
         "-p",
@@ -1907,6 +1964,7 @@ def main() -> int:
     tree_option_used = any(
         value is not None
         for value in (
+            args.tree_task,
             args.tree_task_file,
             args.tree_system_prompt_file,
             args.tree_exclude,
@@ -1916,28 +1974,26 @@ def main() -> int:
         )
     ) or args.tree_show_only
     file_names: list[str] = []
+    tree_task_prompts: tuple[dict[str, str], str | None, str | None] = ({}, None, None)
 
     if tree_mode:
         if ask_mode or args.task is not None or args.task_file is not None or args.files is not None or args.files_list is not None:
             print("ERROR: tree mode cannot be combined with regular task, ask, or file options", file=sys.stderr)
             return 1
-        if not args.tree_show_only and not args.tree_task_file:
-            print("ERROR: tree mode requires --tree-task-file", file=sys.stderr)
+        if not args.tree_show_only and args.tree_task is None and args.tree_task_file is None:
+            print("ERROR: tree mode requires --tree-task or --tree-task-file", file=sys.stderr)
             return 1
         if args.tree_show_only:
             task = ""
+        elif args.tree_task is not None:
+            task = read_prompt_argument(args.tree_task)
         else:
             try:
-                task = args.tree_task_file.read_text(encoding="utf-8").strip()
-            except UnicodeDecodeError:
-                try:
-                    task = args.tree_task_file.read_bytes().decode("utf-8", errors="replace").strip()
-                except Exception as exc:
-                    print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
-                    return 1
-            except Exception as exc:
-                print(f"ERROR: Failed to read tree task file {args.tree_task_file}: {exc}", file=sys.stderr)
+                tree_task_prompts = read_tree_prompt_file(args.tree_task_file)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
+            task = ""
     elif tree_option_used:
         print("ERROR: tree options require --tree-files or --tree-files-list", file=sys.stderr)
         return 1
@@ -2273,7 +2329,7 @@ def main() -> int:
             print("ERROR: No files matched the tree inputs and filters.", file=sys.stderr)
             return 1
 
-        tree_parallel = args.tree_parallel if args.tree_parallel is not None else 64
+        tree_parallel = args.tree_parallel if args.tree_parallel is not None else 16
         if tree_parallel < 1:
             print("ERROR: --tree-parallel must be at least 1.", file=sys.stderr)
             return 1
@@ -2310,6 +2366,7 @@ def main() -> int:
             file_paths=tree_file_paths,
             relative_paths=tree_relative_paths,
             task=task,
+            tree_task_prompts=tree_task_prompts,
             tree_system_prompts=tree_system_prompts,
             system_prompt=system_prompt,
             linenum_system_prompt=linenum_system_prompt,
