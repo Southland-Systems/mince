@@ -1312,10 +1312,7 @@ def run_tree_mode(
             records.append(record)
             if VERBOSE:
                 status = "ok" if success else "error"
-                print(
-                    f"tree_file={file_path} output_file={relative_path} status={status} {statsline}",
-                    file=sys.stderr,
-                )
+                print(f"tree_file={file_path} status={status} {statsline}", file=sys.stderr)
         return record
 
     try:
@@ -1334,7 +1331,10 @@ def run_tree_mode(
     combined_parts: list[str] = []
     for record in ordered_records:
         combined_parts.append(
-            f"---\n## **{record['relative_path'].as_posix()}**\n\n{record['result'].rstrip()}\n"
+            f"------------------------------------------------------------------------\n"
+            f"## **{record['relative_path'].as_posix()}**\n"
+            f"------------------------------------------------------------------------\n"
+            f"\n{record['result'].rstrip()}\n\n"
         )
     try:
         combined_tree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1344,7 +1344,7 @@ def run_tree_mode(
         return 1
 
     if VERBOSE:
-        print(f"tree_output={combined_tree_path}", file=sys.stderr)
+        print(f"tree_output_file={combined_tree_path} tree_output_directory={tree_session_dir}", file=sys.stderr)
     return 0 if len(records) == len(file_paths) and all(record["success"] for record in records) else 1
 
 
@@ -2192,7 +2192,7 @@ def main() -> int:
         print("  mince --init")
         return 1
 
-    log_enabled = (
+    log_enabled = tree_mode or (
         args.log
         if args.log is not None
         else coerce_bool(config.get("log", "on"), True)
