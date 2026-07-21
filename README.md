@@ -83,11 +83,11 @@ mince --tree-files src tests --tree-task-file tree-task.txt \
   --tree-include '*.py' --tree-exclude '*/.venv/*' --tree-parallel 128
 ```
 
-Use `--tree-system-prompt-file` to set a system prompt by extension. Lines may be `.ext:prompt`, `.*:prompt` and/or an overall `prompt`.
+Use `--tree-system-prompt-file` to set a system prompt by extension. Lines may be `.ext:prompt`, `*:prompt` and/or an overall `prompt`.
 
 ```text
 .py:Create python specific documentation for the provided script.
-.*:Create best effort documentation for the provided file.
+*:Create best effort documentation for the provided file.
 Ensure documentation is concise, complete and relevant to the content.
 ```
 
@@ -114,11 +114,11 @@ mince --task "Provide the file name and line count as JSON" \
   --schema-file filemeta-schema.json
 ```
 
-Generate a patch, review the diff, and write the approved result:
+Generate a patch, review the diff, and write the approved result to the original and new file:
 
 ```bash
 cp /etc/passwd .
-mince -PR -f passwd -t "Remove lines 1-5 from 'passwd' \
+mince --patch --patch-review -f passwd -t "Remove lines 1-5 from 'passwd' \
 and create a new file called 'passwd-new' with those lines."
 ```
 
@@ -205,9 +205,9 @@ All the `mince` CLI arguments for reference.
 | `--tree-parallel [N]` | Set the maximum number of parallel tree-mode requests (default: `64`). |
 | `-p NAME`, `--profile NAME` | Select a configuration profile. |
 | `-o FILE`, `--output-file FILE` | Write the response to the given file, overwriting it if it exists. |
-| `-P`, `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
-| `-R`, `--patch-review` | Confirm changes before writing to filenames without the suffix, unless a suffix is overridden. |
-| `--patch-suffix SUFFIX` | Set the suffix for patched files (default: `.mcepatched`). |
+| `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
+| `--patch-review` | Confirm changes before writing to filenames without the suffix, unless a suffix is overridden. |
+| `-S`, `--patch-suffix SUFFIX` | Set the suffix for patched files (default: `.mcepatched`). |
 | `--patch-save [BOOL]` | Save the patch file under `~/.local/state/mince/patches` (default: `on`). |
 | `--plan` | Generate and review a prompt before using it as the task. |
 | `--system-prompt TEXT` | Override the configured system prompt. |
