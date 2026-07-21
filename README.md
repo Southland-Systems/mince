@@ -184,7 +184,7 @@ All the `mince` CLI arguments for reference.
 | `-P`, `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
 | `-R`, `--patch-review` | Confirm changes before writing to filenames without the suffix, unless a suffix is overridden. |
 | `--patch-suffix SUFFIX` | Set the suffix for patched files (default: `.mcepatched`). |
-| `--patch-save [BOOL]` | Save the patch file under `~/.local/state/mince/patches`. |
+| `--patch-save [BOOL]` | Save the patch file under `~/.local/state/mince/patches` (default: `on`). |
 | `--plan` | Generate and review a prompt before using it as the task. |
 | `--system-prompt TEXT` | Override the configured system prompt. |
 | `--system-prompt-file FILE` | Read the system prompt from the given file. |
@@ -234,11 +234,13 @@ Environment variable reference.
 |----------------------|-------------|
 | OPENAI_API_KEY       | OpenAI-compatible API key |
 
+
 ## Usage Notes 🪧
 
-*Prevent incorrect cost calculation when specifying --model*
+**Prevent incorrect cost calculation when specifying --model:**
 
-  If token costs are set in the configuration and `--model` is specified, also specify `--token-cost`, otherwise the cost calculations will be absent to prevent inaccuracies.
+If token costs are set in the configuration and `--model` is specified, `--token-cost` must also be specified, otherwise the cost calculation will be absent to prevent inaccuracies.
+
 
 ## Make targets 🚀
 

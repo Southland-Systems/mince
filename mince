@@ -201,6 +201,12 @@ def save_config(config: dict[str, Any]) -> None:
         encoding="utf-8",
     )
 
+def get_default_config_value(name: str) -> Any:
+    if name not in DEFAULT_CONFIG:
+        raise ValueError(f"{name} has no built-in default value")
+    return DEFAULT_CONFIG[name]
+
+
 def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, Any]:
     if "=" not in value:
         raise ValueError("expected NAME=VALUE")
@@ -210,6 +216,9 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
     if not name:
         raise ValueError("configuration name cannot be empty")
     raw_value = raw_value.strip()
+
+    if raw_value == "DEFAULT":
+        return name, get_default_config_value(name)
 
     expected = DEFAULT_CONFIG[name] if name in DEFAULT_CONFIG else config.get(name)
     if isinstance(expected, int) and not isinstance(expected, bool):
@@ -230,6 +239,7 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
             return name, False
         raise ValueError(f"{name} must be a boolean")
     return name, raw_value
+
 
 
 def format_config_value(value: Any) -> str:
@@ -272,7 +282,10 @@ def prompt_config_value(
         return
 
     try:
-        config[key] = cast(value) if cast else value
+        if value == "DEFAULT":
+            config[key] = get_default_config_value(key)
+        else:
+            config[key] = cast(value) if cast else value
     except Exception:
         print(f"WARNING: Invalid value for {key}; keeping existing value.")
 
@@ -281,7 +294,7 @@ def init_config_interactive() -> None:
     ensure_config_exists()
     config = load_config()
 
-    print(f"Config file: {CONFIG_FILE}\n")
+    print(f"Config file: {CONFIG_FILE}\nUse the word DEFAULT to reset any value\n")
 
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
@@ -1017,7 +1030,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         type=parse_bool,
         metavar="BOOL",
-        help="Save patch file to HOME/.local/state/mince/patches",
+        help="Save patch file to HOME/.local/state/mince/patches (default: on)",
     )
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
@@ -1193,7 +1206,7 @@ def parse_args() -> argparse.Namespace:
         "--set-config",
         metavar="NAME=VALUE",
         action="append",
-        help="Set a configuration value (may be repeated)",
+        help="Set a configuration value (use DEFAULT to reset it; may be repeated)",
     )
     config_print_group.add_argument(
         "--get-config",
