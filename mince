@@ -477,24 +477,6 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
             for line in patch["content_line_array"]
         ]
 
-# TODO debugging
-#        patch_id = patch.get("patch_id", "<unknown>")
-#        print(
-#            f"Applying patch {patch_id}: remove lines {start_line}-{end_line}",
-#            file=sys.stderr,
-#        )
-#        for line in removed:
-#            print(f"- {line}", file=sys.stderr)
-#        if replacement:
-#            print(
-#                f"Add {len(replacement)} line(s) at {start_line}:",
-#                file=sys.stderr,
-#            )
-#            for line in replacement:
-#                print(f"+ {line}", file=sys.stderr)
-#        else:
-#            print("No lines added (pure deletion).", file=sys.stderr)
-
         # Perform the slice replacement
         lines[start_line - 1 : end_line] = replacement
 
@@ -542,10 +524,10 @@ def parse_token_cost(value: Any) -> tuple[float, float] | None:
         raise ValueError("token costs must be finite non-negative floats")
     return input_cost, output_cost
 
-def response_cost_line(
+def response_cost_amounts(
     token_cost: tuple[float, float] | None,
     usage: dict[str, Any] | None,
- ) -> str | None:
+ ) -> tuple[float, float, float] | None:
     if token_cost is None or not usage:
         return None
     try:
@@ -557,6 +539,16 @@ def response_cost_line(
     input_cost = input_tokens * token_cost[0] / 1_000_000
     output_cost = output_tokens * token_cost[1] / 1_000_000
     total_cost = input_cost + output_cost
+    return input_cost, output_cost, total_cost
+
+def response_cost_line(
+    token_cost: tuple[float, float] | None,
+    usage: dict[str, Any] | None,
+ ) -> str | None:
+    costs = response_cost_amounts(token_cost, usage)
+    if costs is None:
+        return None
+    input_cost, output_cost, total_cost = costs
     return f"response_cost={input_cost:.4f}:{output_cost:.4f}:{total_cost:.4f}"
 
 def usage_to_dict(usage: Any) -> dict[str, Any] | None:
@@ -1270,6 +1262,7 @@ def run_tree_mode(
             output_error = _tree_exception_message(exc)
             if error_text is None:
                 error_text = output_error
+        response_cost_components = response_cost_amounts(token_cost, usage)
         response_cost = response_cost_line(token_cost, usage)
         statsline = print_stats(
             request_characters=request_characters,
@@ -1306,6 +1299,7 @@ def run_tree_mode(
             "output_path": output_path,
             "result": stored_result,
             "statsline": statsline,
+            "response_cost_components": response_cost_components,
             "success": success,
         }
         with log_lock:
@@ -1328,11 +1322,19 @@ def run_tree_mode(
         return 1
 
     ordered_records = sorted(records, key=lambda record: record["relative_path"].as_posix())
+    response_cost_total_line = ""
+    if token_cost is not None:
+        total_response_cost = 0.0
+        for record in ordered_records:
+            response_cost_components = record["response_cost_components"]
+            if response_cost_components is not None:
+                total_response_cost += response_cost_components[2]
+        response_cost_total_line = f" tree_cost_total={total_response_cost:.4f}"
     combined_parts: list[str] = []
     for record in ordered_records:
         combined_parts.append(
             f"------------------------------------------------------------------------\n"
-            f"## **{record['relative_path'].as_posix()}**\n"
+            f"# **{record['relative_path'].as_posix()}**\n"
             f"------------------------------------------------------------------------\n"
             f"\n{record['result'].rstrip()}\n\n"
         )
@@ -1344,7 +1346,11 @@ def run_tree_mode(
         return 1
 
     if VERBOSE:
-        print(f"tree_output_file={combined_tree_path} tree_output_directory={tree_session_dir}", file=sys.stderr)
+        print(
+            f"tree_output_file={combined_tree_path} "
+            f"tree_output_directory={tree_session_dir}{response_cost_total_line}",
+            file=sys.stderr,
+        )
     return 0 if len(records) == len(file_paths) and all(record["success"] for record in records) else 1
 
 

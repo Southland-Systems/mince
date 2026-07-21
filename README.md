@@ -180,6 +180,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 - Large files are skipped automatically
 - Binary files are not supported
 - JSON Schema mode is best when you need machine‑readable output
+- Token estimation is provided by `tiktoken` which will download an encoder on first use
 - MinCE is tested on and assisted by `GPT 5.6 Luna`
 
 ## Command line arguments 📋
