@@ -29,11 +29,11 @@ Enable `--patch-review` to introduce an approval step: review the diff, then app
 
 The `--plan` flag instructs the model to convert the provided task and file context into a self-contained prompt for the subsequent step. MinCE displays this prompt and requests confirmation; only confirmed plans proceed as the actual task. Combine it with `--patch` to perform a thoughtful planning phase before executing a controlled edit.
 
-### Tree mode — scale the same judgment across a codebase
+### Tree mode — scale the same judgement across a codebase
 
-Tree mode executes one focused request for each matched file. Begin with `--tree-files` (or `--tree-files-list`) and provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, with `.git` excluded by default. Use `--tree-include` and `--tree-exclude` to refine the scope. Requests execute concurrently, supporting up to 16 workers by default.
+Tree mode executes one focused request for each matched file. Begin with `--tree-files` (or `--tree-files-list`) and provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, with `.git` excluded by default. Use `--tree-include` and `--tree-exclude` to refine the scope. Requests execute concurrently, supporting up to 16 workers by default, adjustable with `--tree-parallel`.
 
-Assign distinct instructions to different file types using entries like `.py:task`, `*:task`, and corresponding settings in `--tree-system-prompt-file`. Outputs are saved both per file and in a consolidated Markdown report under `~/.local/state/mince/trees`. Employ `--tree-show-only` to preview the filtered files without issuing API calls, or `--tree-reuse-session NAME` to continue an interrupted session.
+Assign distinct instructions to different file types using entries like `.py:task`, `*:task`, and corresponding settings in `--tree-system-prompt-file`. Outputs are saved both per file and in a consolidated Markdown report under `~/.local/state/mince/trees/SESSION_NAME`. Use `--tree-show-only` to preview the filtered files without issuing API calls, or `--tree-reuse-session NAME` to continue an interrupted session.
 
 ### Profiles — save your best operating setup
 
@@ -113,7 +113,7 @@ Run tree mode over files and directories:
 
 ```bash
 mince --tree-files src tests --tree-task-file tree-task.txt \
-  --tree-include '*.py' --tree-exclude '*/.venv/*' --tree-parallel 128
+  --tree-include '*.py' --tree-exclude '*/.venv/*' --tree-parallel 24
 ```
 
 The `--tree-task-file` file contains a list of extensions and tasks. Lines may be `.ext:task`, `*:task` or an overall `task`, and they can be repeated.
@@ -296,7 +296,7 @@ Environment variable reference.
 | Environment Variable | Description |
 |----------------------|-------------|
 | OPENAI_API_KEY       | OpenAI-compatible API key |
-
+| EDITOR | The text editor to use in plan mode |
 
 ## Usage Notes 🪧
 
@@ -325,7 +325,7 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 
 ## Reporting Issues ⚠️
 
-Create an Issue on GitHub or fill out the contact form on southlandsys.com or email contact@southlandsys.com (no reply will be given). Include as much detail as possible to ensure the issue is resolved.
+Create an Issue on GitHub or fill out the contact form on https://southlandsys.com or email contact@southlandsys.com (no reply will be given). Include as much detail as possible to ensure the issue is resolved.
 
 Reporting an issue is much appreciated, reporting improves quality for everyone.
 

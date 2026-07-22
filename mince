@@ -14,6 +14,9 @@ import math
 import sys
 import time
 import re
+import shlex
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 import fnmatch
@@ -75,11 +78,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "patch_save": "on",
     "patch_review": "off",
     "patch_suffix": ".mcepatched",
+    "plan": "off",
     "quiet": "off",
     "temperature": "off",
     "top_p": "off",
     "openai_reasoning": "medium",
     "reasoning_mode": "standard",
+    "print_reasoning": "off",
     "token_limit": 65534,
     "max_output_tokens": 65534,
     "token_cost": "1.00:6.00",
@@ -316,12 +321,14 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "patch_save", "Save patch file to HOME/.local/state/mince/patches (off, on)")
+    prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
     prompt_config_value(config, "stream", "Streaming text responses (off, on)")
     prompt_config_value(config, "openai_reasoning", "Reasoning (off, none, minimal, low, medium, high, xhigh, max)")
     prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
+    prompt_config_value(config, "print_reasoning", "Include reasoning output in <think> tags (off, on)")
     prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
@@ -618,6 +625,35 @@ def read_file(path: Path) -> str:
         return path.read_bytes().decode("utf-8", errors="replace")
     except Exception as exc:
         return f"ERROR: cannot read file {path} ({exc})"
+
+def edit_text(text: str, suffix: str = ".txt") -> str:
+    editor = os.environ.get("EDITOR", "").strip() or "vi"
+    editor_command = shlex.split(editor)
+    if not editor_command:
+        editor_command = ["vi"]
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=suffix,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(text)
+
+        subprocess.run(
+            [*editor_command, str(temporary_path)],
+            check=True,
+        )
+        return temporary_path.read_text(encoding="utf-8")
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def read_prompt_argument(value: str | list[str]) -> str:
@@ -1560,7 +1596,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plan",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Create an AI prompt for review before using it as the task",
     )
     files_group = parser.add_mutually_exclusive_group()
@@ -1663,12 +1703,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--patch",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Patch specified files and write changes to the filename + patch suffix",
     )
     parser.add_argument(
         "--patch-review",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",
     )
     parser.add_argument(
@@ -1842,8 +1890,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--print-reasoning",
-        action="store_true",
-        help="Include the reasoning output in <think> tags"
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Include the reasoning output in <think> tags",
     )
     config_print_group = parser.add_mutually_exclusive_group()
     config_print_group.add_argument(
@@ -2186,14 +2238,31 @@ def main() -> int:
     if quiet_enabled:
         VERBOSE = 0
 
-    patch_mode = args.patch or coerce_bool(config.get("patch", "off"))
+    patch_mode = (
+        args.patch
+        if args.patch is not None
+        else coerce_bool(config.get("patch", "off"))
+    )
     patch_save_enabled = (
         args.patch_save
         if args.patch_save is not None
         else coerce_bool(config.get("patch_save", "on"), True)
     )
-    patch_review = args.patch_review or coerce_bool(config.get("patch_review", "off"))
-    plan_mode = bool(args.plan)
+    patch_review = (
+        args.patch_review
+        if args.patch_review is not None
+        else coerce_bool(config.get("patch_review", "off"))
+    )
+    plan_mode = (
+        args.plan
+        if args.plan is not None
+        else coerce_bool(config.get("plan", "off"))
+    )
+    print_reasoning = (
+        args.print_reasoning
+        if args.print_reasoning is not None
+        else coerce_bool(config.get("print_reasoning", "off"))
+    )
     configured_patch_suffix = str(config.get("patch_suffix", DEFAULT_CONFIG["patch_suffix"]) or "").strip()
     if args.patch_suffix is not None:
         patch_suffix = args.patch_suffix
@@ -2331,6 +2400,9 @@ def main() -> int:
         if args.openai_reasoning is not None
         else config.get("openai_reasoning", "medium")
     )
+    if str(openai_reasoning).strip().lower() == "off":
+        print_reasoning = False
+
     reasoning_mode = (
         args.reasoning_mode
         if args.reasoning_mode is not None
@@ -2519,7 +2591,7 @@ def main() -> int:
             safety_identifier=safety_identifier,
             api_log=api_log,
             token_cost=token_cost,
-            print_reasoning=args.print_reasoning,
+            print_reasoning=print_reasoning,
             tree_session_dir=tree_session_dir,
             combined_tree_path=combined_tree_path,
             log_enabled=log_enabled,
@@ -2657,10 +2729,19 @@ def main() -> int:
                 f.write(f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n")
         if VERBOSE:
             print(plan_statsline, file=sys.stderr)
-        print()
-        print(plan_result)
-        print()
-        accepted = input("Use this plan? [y/N]: ").strip().lower() in ("y", "yes")
+        while True:
+            print()
+            print(plan_result)
+            print()
+            plan_choice = input("Use this plan? [y/N/e]: ").strip().lower()
+            if plan_choice in ("e", "edit"):
+                try:
+                    plan_result = edit_text(plan_result).strip()
+                except Exception as exc:
+                    print(f"ERROR: Failed to edit plan: {exc}", file=sys.stderr)
+                continue
+            accepted = plan_choice in ("y", "yes")
+            break
         if log_enabled:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_review>{'accepted' if accepted else 'rejected'}</plan_review>\n")
@@ -2727,7 +2808,7 @@ def main() -> int:
     stream_sink = None
 
     try:
-        if stream_enabled and not args.print_reasoning:
+        if stream_enabled and not print_reasoning:
             if args.output_file:
                 args.output_file.parent.mkdir(parents=True, exist_ok=True)
                 stream_file = args.output_file.open("w", encoding="utf-8")
@@ -2897,7 +2978,7 @@ def main() -> int:
         finally:
             result = pretty_json(result)
 
-    if args.print_reasoning:
+    if print_reasoning:
         output_str = (
             f"<think>\n{reasoning}\n</think>\n\n"
             f"{result}"
