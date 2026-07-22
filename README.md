@@ -173,7 +173,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 | OpenAI | GPT 5.6 | ✅ |
 | Alibaba | Qwen 3.7 |  ✅ |
 | Oracle | GPT-OSS-120b | ✅ |
-| xAI | Grok 4.3 | ✅ |
+| xAI | Grok Build 0.1  | ✅ |
 | AWS | GPT-OSS-120b | ✅ |
 
 

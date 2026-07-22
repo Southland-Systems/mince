@@ -297,7 +297,7 @@ def init_config_interactive() -> None:
     ensure_config_exists()
     config = load_config()
 
-    print(f"Config file: {CONFIG_FILE}\nUse the word DEFAULT to reset any value\n")
+    print(f"Config file: {CONFIG_FILE}\nUse DEFAULT to reset any value\n")
 
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
@@ -319,7 +319,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
     prompt_config_value(config, "stream", "Streaming text responses (off, on)")
-    prompt_config_value(config, "openai_reasoning", "Reasoning (none, minimal, low, medium, high, xhigh, max)")
+    prompt_config_value(config, "openai_reasoning", "Reasoning (off, none, minimal, low, medium, high, xhigh, max)")
     prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
     prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
@@ -869,7 +869,7 @@ def call_openai(
     if top_p is not None:
         kwargs["top_p"] = top_p
 
-    if openai_reasoning is not None:
+    if openai_reasoning is not None and str(openai_reasoning).strip().lower() != "off":
         reasoning_payload: dict[str, Any] = {
             "effort": openai_reasoning,
             "summary": "detailed",
@@ -1659,8 +1659,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openai-reasoning",
-        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
-        help="Reasoning effort level (low)",
+        choices=("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        help="Reasoning effort level (off to disable)",
     )
     parser.add_argument(
         "--reasoning-mode",
