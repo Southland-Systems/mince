@@ -20,6 +20,7 @@ import fnmatch
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random, string
+import dbm
 from dataclasses import dataclass
 
 import difflib
@@ -768,40 +769,28 @@ def build_user_prompt(
 def _handle_openai_error(exc: Exception) -> None:
     if isinstance(exc, AuthenticationError):
         msg = "Authentication failed – check your API key."
-        code = 2
     elif isinstance(exc, RateLimitError):
         msg = "Rate limit exceeded – try again later."
-        code = 3
     elif isinstance(exc, BadRequestError):
         msg = f"Bad request: {exc}"
-        code = 4
     elif isinstance(exc, PermissionDeniedError):
         msg = f"Permission denied: {exc}"
-        code = 5
     elif isinstance(exc, NotFoundError):
         msg = f"Resource not found: {exc}"
-        code = 6
     elif isinstance(exc, APITimeoutError):
         msg = f"Request timed out: {exc}"
-        code = 7
     elif isinstance(exc, APIConnectionError):
         msg = f"Network error: {exc}"
-        code = 8
     elif isinstance(exc, APIError):
         msg = f"OpenAI API error: {exc}"
-        code = 9
     elif isinstance(exc, UnprocessableEntityError):
         msg = f"Cannot process request despite it being correct: {exc}"
-        code = 10
     elif isinstance(exc, InternalServerError):
         msg = f"OpenAI API internal server error: {exc}"
-        code = 11
     else:
         msg = f"Unexpected error: {exc}"
-        code = 1
-
     print(f"ERROR: {msg}", file=sys.stderr)
-    raise SystemExit(code)
+    raise exc
 
 
 def resolve_api_key(config: dict[str, Any]) -> str:
@@ -1159,6 +1148,24 @@ def _tree_exception_message(exc: BaseException) -> str:
 
 
 
+def _is_openai_temp_error(exc: BaseException) -> bool:
+    return isinstance(exc, (
+        RateLimitError,
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        APIError,
+    ))
+
+def _is_openai_perm_error(exc: BaseException) -> bool:
+    return isinstance(exc, (
+        AuthenticationError,
+        BadRequestError,
+        PermissionDeniedError,
+        NotFoundError,
+        UnprocessableEntityError,
+    ))
+
 def run_tree_mode(
     *,
     file_paths: list[Path],
@@ -1197,12 +1204,62 @@ def run_tree_mode(
     combined_tree_path: Path,
     log_enabled: bool,
     log_path: Path | None,
- ) -> int:
+    tree_session_stem: str,
+) -> int:
     log_lock = threading.Lock()
+    db_lock = threading.Lock()
     records: list[dict[str, Any]] = []
+    state_db_path = str(tree_session_dir) + ".dbm"
+    rel_to_path: dict[str, Path] = {}
+    for fp in file_paths:
+        rel = relative_paths[fp].as_posix()
+        rel_to_path[rel] = fp
+    try:
+        with db_lock:
+            state_db = dbm.open(state_db_path, "c")
+            try:
+                for rel in rel_to_path:
+                    key = rel.encode("utf-8")
+                    if key not in state_db:
+                        state_db[key] = b"pending"
+            finally:
+                state_db.close()
+    except Exception as exc:
+        print(f"ERROR: Failed to open tree state db {state_db_path}: {exc}", file=sys.stderr)
+        return 1
 
+    def get_status(rel: str) -> str:
+        key = rel.encode("utf-8")
+        with db_lock:
+            state_db = dbm.open(state_db_path, "c")
+            try:
+                if key in state_db:
+                    try:
+                        return state_db[key].decode("utf-8", errors="replace")
+                    except Exception:
+                        return "pending"
+                return "pending"
+            finally:
+                state_db.close()
+    def set_status(rel: str, status: str) -> None:
+        key = rel.encode("utf-8")
+        with db_lock:
+            state_db = dbm.open(state_db_path, "c")
+            try:
+                state_db[key] = status.encode("utf-8")
+            finally:
+                state_db.close()
+
+    def get_pending_files() -> list[tuple[str, Path]]:
+        pending: list[tuple[str, Path]] = []
+        for rel, fp in list(rel_to_path.items()):
+            status = get_status(rel)
+            if not status.startswith("complete") and not status.startswith("perm_error"):
+                pending.append((rel, fp))
+        return pending
     def process_file(file_path: Path) -> dict[str, Any]:
         relative_path = relative_paths[file_path]
+        rel_str = relative_path.as_posix()
         output_path = tree_session_dir / relative_path
         request_characters = 0
         request_tokens = 0
@@ -1213,8 +1270,8 @@ def run_tree_mode(
         usage: dict[str, Any] | None = None
         response_obj: Any = None
         error_text: str | None = None
+        error_type: str = "none"
         start_time = time.perf_counter()
-
         try:
             context = build_context(
                 file_paths=[file_path],
@@ -1276,14 +1333,22 @@ def run_tree_mode(
             result = str(getattr(response_obj, "output_text", "") or "")
             if not result.strip():
                 error_text = "LLM returned an empty response"
+                error_type = "temp"
             if response_format in ("json", "schema") and result.strip():
                 cleaned_result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
                 try:
                     result = json.dumps(json.loads(cleaned_result), indent=2, ensure_ascii=False)
                 except json.JSONDecodeError as exc:
                     error_text = f"Failed to parse JSON response: {exc}"
+                    error_type = "temp"
         except BaseException as exc:
             error_text = _tree_exception_message(exc)
+            if _is_openai_temp_error(exc):
+                error_type = "temp"
+            elif _is_openai_perm_error(exc):
+                error_type = "perm"
+            else:
+                error_type = "perm"
         elapsed = time.perf_counter() - start_time
         reasoning = _tree_reasoning(response_obj) if response_obj is not None else ""
         stored_result = result
@@ -1299,6 +1364,7 @@ def run_tree_mode(
             output_error = _tree_exception_message(exc)
             if error_text is None:
                 error_text = output_error
+            error_type = "perm"
         response_cost_components = response_cost_amounts(token_cost, usage)
         response_cost = response_cost_line(token_cost, usage)
         statsline = print_stats(
@@ -1329,7 +1395,15 @@ def run_tree_mode(
                     log_file.write(f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n")
                     log_file.write("</tree_file>\n")
                     log_file.flush()
-        success = error_text is None and output_error is None
+        if error_text is None and output_error is None:
+            set_status(rel_str, "complete")
+            success = True
+            error_type = "none"
+        else:
+            if error_type == "none":
+                error_type = "perm"
+            set_status(rel_str, f"{error_type}_error:{error_text or 'unknown'}")
+            success = False
         record = {
             "path": file_path,
             "relative_path": relative_path,
@@ -1339,41 +1413,75 @@ def run_tree_mode(
             "usage": usage,
             "response_cost_components": response_cost_components,
             "success": success,
+            "error_type": error_type,
         }
-        with log_lock:
-            records.append(record)
-            if VERBOSE:
-                status = "ok" if success else "error"
-                print(f"tree_file={file_path} status={status} {statsline}", file=sys.stderr)
         return record
-
-    try:
-        with ThreadPoolExecutor(max_workers=tree_parallel) as executor:
-            futures = [executor.submit(process_file, file_path) for file_path in file_paths]
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except BaseException as exc:
-                    print(f"ERROR: Tree worker failed: {_tree_exception_message(exc)}", file=sys.stderr)
-    except Exception as exc:
-        print(f"ERROR: Failed to run tree workers: {exc}", file=sys.stderr)
-        return 1
-
-    ordered_records = sorted(records, key=lambda record: record["relative_path"].as_posix())
+    records: list[dict[str, Any]] = []
+    max_backoff = 300
+    backoff = 5
+    concurrency = max(1, tree_parallel)
+    while True:
+        pending = get_pending_files()
+        if not pending:
+            break
+        workers = min(concurrency, len(pending))
+        if workers < 1:
+            workers = 1
+        temp_errors_this_round = 0
+        success_this_round = 0
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_rel: dict = {}
+                for rel, fp in pending:
+                    fut = executor.submit(process_file, fp)
+                    future_to_rel[fut] = rel
+                for future in as_completed(future_to_rel):
+                    rel = future_to_rel[future]
+                    try:
+                        record = future.result()
+                        with log_lock:
+                            records.append(record)
+                            if VERBOSE:
+                                status = "ok" if record["success"] else "error"
+                                print(f"tree_file={record['path']} status={status} {record['statsline']}", file=sys.stderr)
+                        if record.get("success"):
+                            success_this_round += 1
+                        elif record.get("error_type") == "temp":
+                            temp_errors_this_round += 1
+                    except BaseException as exc:
+                        print(f"ERROR: Tree worker failed: {_tree_exception_message(exc)}", file=sys.stderr)
+                        set_status(rel, f"temp_error:{_tree_exception_message(exc)}")
+                        temp_errors_this_round += 1
+        except Exception as exc:
+            print(f"ERROR: Failed to run tree workers: {exc}", file=sys.stderr)
+            temp_errors_this_round += 1
+        if temp_errors_this_round > 0:
+            concurrency = max(1, concurrency // 2)
+            backoff = min(backoff * 2, max_backoff)
+            time.sleep(backoff)
+        else:
+            concurrency = min(tree_parallel, concurrency + 1)
+            backoff = 1
+        if temp_errors_this_round > 0 and success_this_round == 0:
+            time.sleep(min(5, backoff))
+    all_complete = True
+    for rel in rel_to_path:
+        if not get_status(rel).startswith("complete"):
+            all_complete = False
+            break
     total_input_tokens = 0
     total_output_tokens = 0
     total_response_cost = 0.0
-    for record in ordered_records:
-        usage = record["usage"]
-        if usage is not None:
-            try:
-                total_input_tokens += int(usage["input_tokens"])
-                total_output_tokens += int(usage["output_tokens"])
-            except (KeyError, TypeError, ValueError):
-                pass
-        response_cost_components = record["response_cost_components"]
-        if response_cost_components is not None:
-            total_response_cost += response_cost_components[2]
+    for record in records:
+        usage = record.get("usage") or {}
+        try:
+            total_input_tokens += int(usage.get("input_tokens", 0))
+            total_output_tokens += int(usage.get("output_tokens", 0))
+        except (KeyError, TypeError, ValueError):
+            pass
+        comps = record.get("response_cost_components")
+        if comps is not None:
+            total_response_cost += comps[2] if len(comps) > 2 else 0
     tree_token_total_line = (
         f" tree_input_tokens={total_input_tokens}"
         f" tree_output_tokens={total_output_tokens}"
@@ -1382,12 +1490,17 @@ def run_tree_mode(
     if token_cost is not None:
         response_cost_total_line = f" tree_token_cost={total_response_cost:.4f}"
     combined_parts: list[str] = []
-    for record in ordered_records:
+    for rel in sorted(rel_to_path.keys()):
+        out_path = tree_session_dir / rel
+        try:
+            res = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
+        except Exception:
+            res = f"ERROR: cannot read {out_path}"
         combined_parts.append(
             f"------------------------------------------------------------------------\n"
-            f"# **{record['relative_path'].as_posix()}**\n"
+            f"# **{rel}**\n"
             f"------------------------------------------------------------------------\n"
-            f"\n{record['result'].rstrip()}\n\n"
+            f"\n{res.rstrip()}\n\n"
         )
     try:
         combined_tree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1401,7 +1514,7 @@ def run_tree_mode(
             f"tree_output_directory={tree_session_dir}{tree_token_total_line}{response_cost_total_line}",
             file=sys.stderr,
         )
-    return 0 if len(records) == len(file_paths) and all(record["success"] for record in records) else 1
+    return 0 if all_complete else 1
 
 
 # -------------------------------------------------------------------
@@ -1522,6 +1635,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         metavar="N",
         help="Maximum parallel tree calls (default: 16)",
+    )
+    parser.add_argument(
+        "--tree-reuse-session",
+        metavar="NAME",
+        help="Specify the session name for completion if unfinished",
     )
     parser.add_argument(
         "-p",
@@ -2333,7 +2451,6 @@ def main() -> int:
         if tree_parallel < 1:
             print("ERROR: --tree-parallel must be at least 1.", file=sys.stderr)
             return 1
-
         try:
             if args.tree_system_prompt_file:
                 tree_system_prompts = read_tree_system_prompts(args.tree_system_prompt_file)
@@ -2342,7 +2459,6 @@ def main() -> int:
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-
         tree_relative_paths: dict[Path, Path] = {}
         used_relative_paths: set[Path] = set()
         for tree_file_path in tree_file_paths:
@@ -2352,16 +2468,18 @@ def main() -> int:
                 return 1
             used_relative_paths.add(relative_path)
             tree_relative_paths[tree_file_path] = relative_path
-
-        tree_session_dir = APP_DIR / "trees" / session_stem
-        combined_tree_path = APP_DIR / "trees" / f"{session_stem}.md"
+        tree_reuse_session = getattr(args, "tree_reuse_session", None)
+        tree_session_stem = tree_reuse_session if tree_reuse_session else session_stem
+        tree_session_dir = APP_DIR / "trees" / tree_session_stem
+        combined_tree_path = APP_DIR / "trees" / f"{tree_session_stem}.md"
         try:
             tree_session_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             print(f"ERROR: Failed to create tree output directory {tree_session_dir}: {exc}", file=sys.stderr)
             return 1
-
         max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
+        if VERBOSE:
+            print(f"tree_session_name={tree_session_stem}")
         return run_tree_mode(
             file_paths=tree_file_paths,
             relative_paths=tree_relative_paths,
@@ -2399,6 +2517,7 @@ def main() -> int:
             combined_tree_path=combined_tree_path,
             log_enabled=log_enabled,
             log_path=log_path,
+            tree_session_stem=tree_session_stem,
         )
 
     if ask_mode:
