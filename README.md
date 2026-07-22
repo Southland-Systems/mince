@@ -11,6 +11,39 @@
 - Provides optional local session logging, API storage controls, usage statistics, and cost estimates
 - Creates a context-controlled, continuously verified workflow and maximizes cost effectiveness
 
+## Core workflows: four modes, one focused assistant ⚡
+
+MinCE centers on four complementary modes. Each mode anchors the model to your selected files while offering varying degrees of control—from quick, precise answers to carefully verified, repeatable edits.
+
+### Task mode — turn context into action
+
+Task mode serves as the primary context-aware workflow. Provide a precise objective via `--task` (or `--task-file`) and specify files with `--files` (or `--files-list`). By default, MinCE assembles these files into a bounded, line-numbered context, which makes code reviews, explanations, and implementation tasks concrete and easy to reference.
+
+### Patch mode — changes you can inspect and trust
+
+Append `--patch` to convert a task into a structured, multi-file edit. The model produces a strict line-replacement manifest. MinCE validates the specified ranges, generates a unified diff, and writes modified files alongside the originals using the `.mcepatched` suffix by default. The diff is also saved to `~/.local/state/mince/patches` for later reference.
+
+Enable `--patch-review` to introduce an approval step: review the diff, then approve or cancel. Approved changes apply to the original files by default. Use `--patch-suffix` if you prefer the result to be written as a separate file. Patch mode requires either `--task` or `--task-file` along with the files to edit.
+
+### Plan mode — think once, execute with intent
+
+The `--plan` flag instructs the model to convert the provided task and file context into a self-contained prompt for the subsequent step. MinCE displays this prompt and requests confirmation; only confirmed plans proceed as the actual task. Combine it with `--patch` to perform a thoughtful planning phase before executing a controlled edit.
+
+### Tree mode — scale the same judgment across a codebase
+
+Tree mode executes one focused request for each matched file. Begin with `--tree-files` (or `--tree-files-list`) and provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, with `.git` excluded by default. Use `--tree-include` and `--tree-exclude` to refine the scope. Requests execute concurrently, supporting up to 16 workers by default.
+
+Assign distinct instructions to different file types using entries like `.py:task`, `*:task`, and corresponding settings in `--tree-system-prompt-file`. Outputs are saved both per file and in a consolidated Markdown report under `~/.local/state/mince/trees`. Employ `--tree-show-only` to preview the filtered files without issuing API calls, or `--tree-reuse-session NAME` to continue an interrupted session.
+
+### Profiles — save your best operating setup
+
+Profiles allow you to capture reliable workflows behind a single flag. The default profile resides at `~/.local/state/mince/config.json`; additional named profiles are stored alongside it and can independently configure the model, endpoint, prompts, patch settings, limits, and logging options. Activate a profile with `-p NAME`, initialize or modify one using `--init-profile NAME`, and manage them via `--copy-profile`, `--list-profiles`, or `--remove-profile`.
+
+```bash
+mince --init-profile review
+mince -p review --task "Review the public API" --files src/api.py README.md
+```
+
 ## Requirements 📦
 
 - `python` 3.10 or newer and the `pip` package manager
@@ -55,40 +88,6 @@ mince --init
 ```
 
 This creates `~/.local/state/mince/config.json`.
-
-
-## Core workflows: four modes, one focused assistant ⚡
-
-MinCE centers on four complementary modes. Each mode anchors the model to your selected files while offering varying degrees of control—from quick, precise answers to carefully verified, repeatable edits.
-
-### Task mode — turn context into action
-
-Task mode serves as the primary context-aware workflow. Provide a precise objective via `--task` (or `--task-file`) and specify files with `--files` (or `--files-list`). By default, MinCE assembles these files into a bounded, line-numbered context, which makes code reviews, explanations, and implementation tasks concrete and easy to reference.
-
-### Patch mode — changes you can inspect and trust
-
-Append `--patch` to convert a task into a structured, multi-file edit. The model produces a strict line-replacement manifest. MinCE validates the specified ranges, generates a unified diff, and writes modified files alongside the originals using the `.mcepatched` suffix by default. The diff is also saved to `~/.local/state/mince/patches` for later reference.
-
-Enable `--patch-review` to introduce an approval step: review the diff, then approve or cancel. Approved changes apply to the original files by default. Use `--patch-suffix` if you prefer the result to be written as a separate file. Patch mode requires either `--task` or `--task-file` along with the files to edit.
-
-### Plan mode — think once, execute with intent
-
-The `--plan` flag instructs the model to convert the provided task and file context into a self-contained prompt for the subsequent step. MinCE displays this prompt and requests confirmation; only confirmed plans proceed as the actual task. Combine it with `--patch` to perform a thoughtful planning phase before executing a controlled edit.
-
-### Tree mode — scale the same judgment across a codebase
-
-Tree mode executes one focused request for each matched file. Begin with `--tree-files` (or `--tree-files-list`) and provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, with `.git` excluded by default. Use `--tree-include` and `--tree-exclude` to refine the scope. Requests execute concurrently, supporting up to 16 workers by default.
-
-Assign distinct instructions to different file types using entries like `.py:task`, `*:task`, and corresponding settings in `--tree-system-prompt-file`. Outputs are saved both per file and in a consolidated Markdown report under `~/.local/state/mince/trees`. Employ `--tree-show-only` to preview the filtered files without issuing API calls, or `--tree-reuse-session NAME` to continue an interrupted session.
-
-### Profiles — save your best operating setup
-
-Profiles allow you to capture reliable workflows behind a single flag. The default profile resides at `~/.local/state/mince/config.json`; additional named profiles are stored alongside it and can independently configure the model, endpoint, prompts, patch settings, limits, and logging options. Activate a profile with `-p NAME`, initialize or modify one using `--init-profile NAME`, and manage them via `--copy-profile`, `--list-profiles`, or `--remove-profile`.
-
-```bash
-mince --init-profile review
-mince -p review --task "Review the public API" --files src/api.py README.md
-```
 
 ## Basic usage 💡
 
@@ -305,7 +304,6 @@ Environment variable reference.
 
 If token costs are set in the configuration and `--model` is specified, `--token-cost` must also be specified, otherwise the cost calculation will be absent to prevent inaccuracies.
 
-
 ## Make targets 🚀
 
 The project ships with a **Makefile** that handles both *user* and *system‑wide* installations.
@@ -325,9 +323,14 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make changelog` | Displays the changelog for the last two weeks or last 20 entries. |
 | `make help` | Prints this table and a short description of each target. |
 
+## Reporting Issues ⚠️
+
+Create an Issue on GitHub or fill out the contact form on southlandsys.com or email contact@southlandsys.com (no reply will be given). Include as much detail as possible to ensure the issue is resolved.
+
+Reporting an issue is much appreciated, reporting improves quality for everyone.
+
 ## License and Copyright 📄
 
 This project is licensed under the **Apache-2.0 License**
 
 © 2026 Southland Systems, Ontario, Canada
-
