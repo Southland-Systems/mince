@@ -1222,6 +1222,13 @@ def run_tree_mode(
                     key = rel.encode("utf-8")
                     if key not in state_db:
                         state_db[key] = b"pending"
+                for key in list(state_db.keys()):
+                    try:
+                        val = state_db[key].decode("utf-8", errors="replace")
+                        if val.startswith("perm"):
+                            state_db[key] = b"temp"
+                    except Exception:
+                        pass
             finally:
                 state_db.close()
     except Exception as exc:
@@ -1417,7 +1424,7 @@ def run_tree_mode(
         }
         return record
     records: list[dict[str, Any]] = []
-    max_backoff = 300
+    max_backoff = 120
     backoff = 5
     concurrency = max(1, tree_parallel)
     while True:

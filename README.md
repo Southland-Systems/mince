@@ -56,6 +56,40 @@ mince --init
 
 This creates `~/.local/state/mince/config.json`.
 
+
+## Core workflows: four modes, one focused assistant ⚡
+
+MinCE centers on four complementary modes. Each mode anchors the model to your selected files while offering varying degrees of control—from quick, precise answers to carefully verified, repeatable edits.
+
+### Task mode — turn context into action
+
+Task mode serves as the primary context-aware workflow. Provide a precise objective via `--task` (or `--task-file`) and specify files with `--files` (or `--files-list`). By default, MinCE assembles these files into a bounded, line-numbered context, which makes code reviews, explanations, and implementation tasks concrete and easy to reference.
+
+### Patch mode — changes you can inspect and trust
+
+Append `--patch` to convert a task into a structured, multi-file edit. The model produces a strict line-replacement manifest. MinCE validates the specified ranges, generates a unified diff, and writes modified files alongside the originals using the `.mcepatched` suffix by default. The diff is also saved to `~/.local/state/mince/patches` for later reference.
+
+Enable `--patch-review` to introduce an approval step: review the diff, then approve or cancel. Approved changes apply to the original files by default. Use `--patch-suffix` if you prefer the result to be written as a separate file. Patch mode requires either `--task` or `--task-file` along with the files to edit.
+
+### Plan mode — think once, execute with intent
+
+The `--plan` flag instructs the model to convert the provided task and file context into a self-contained prompt for the subsequent step. MinCE displays this prompt and requests confirmation; only confirmed plans proceed as the actual task. Combine it with `--patch` to perform a thoughtful planning phase before executing a controlled edit.
+
+### Tree mode — scale the same judgment across a codebase
+
+Tree mode executes one focused request for each matched file. Begin with `--tree-files` (or `--tree-files-list`) and provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, with `.git` excluded by default. Use `--tree-include` and `--tree-exclude` to refine the scope. Requests execute concurrently, supporting up to 16 workers by default.
+
+Assign distinct instructions to different file types using entries like `.py:task`, `*:task`, and corresponding settings in `--tree-system-prompt-file`. Outputs are saved both per file and in a consolidated Markdown report under `~/.local/state/mince/trees`. Employ `--tree-show-only` to preview the filtered files without issuing API calls, or `--tree-reuse-session NAME` to continue an interrupted session.
+
+### Profiles — save your best operating setup
+
+Profiles allow you to capture reliable workflows behind a single flag. The default profile resides at `~/.local/state/mince/config.json`; additional named profiles are stored alongside it and can independently configure the model, endpoint, prompts, patch settings, limits, and logging options. Activate a profile with `-p NAME`, initialize or modify one using `--init-profile NAME`, and manage them via `--copy-profile`, `--list-profiles`, or `--remove-profile`.
+
+```bash
+mince --init-profile review
+mince -p review --task "Review the public API" --files src/api.py README.md
+```
+
 ## Basic usage 💡
 
 Ask a direct question without file context:
@@ -173,7 +207,7 @@ mince --openai-base-url http://localhost:11434/v1 \
 | OpenAI | GPT 5.6 | ✅ |
 | Alibaba | Qwen 3.7 |  ✅ |
 | Oracle | GPT-OSS-120b | ✅ |
-| xAI | Grok Build 0.1  | ✅ |
+| xAI | Grok 4.5  | ✅ |
 | AWS | GPT-OSS-120b | ✅ |
 
 
@@ -200,12 +234,15 @@ All the `mince` CLI arguments for reference.
 | `--files-list FILE` | Read context-file paths from a file, one per line. |
 | `--tree-files PATH...` | Recursively process files or directories in tree mode. |
 | `--tree-files-list FILE` | Read tree-mode file or directory roots from a file, one per line. |
-| `--tree-task-file FILE` | Read the required tree-mode task from a file. |
+| `--tree-task TEXT...` | Set the required tree-mode task directly (use `-` for standard input). |
+| `--tree-task-file FILE` | Read tree-mode tasks from a file; use extension-specific, wildcard, or overall task lines. |
 | `--tree-system-prompt-file FILE` | Select tree-mode system prompts by extension (`.ext:prompt`, `*:prompt`, and an overall `prompt`). |
 | `--tree-include PATTERN...` | Include only tree files matching at least one pattern. |
 | `--tree-exclude PATTERN...` | Exclude tree files matching any pattern. |
 | `--tree-exclude-git [BOOL]` | Exclude `.git` directories (default: `on`). |
-| `--tree-parallel [N]` | Set the maximum number of parallel tree-mode requests (default: `64`). |
+| `--tree-show-only` | Print only the filtered tree file list and exit without making requests. |
+| `--tree-parallel [N]` | Set the maximum number of parallel tree-mode requests (default: `16`). |
+| `--tree-reuse-session NAME` | Reuse a named tree session to resume unfinished work. |
 | `-p NAME`, `--profile NAME` | Select a configuration profile. |
 | `-o FILE`, `--output-file FILE` | Write the response to the given file, overwriting it if it exists. |
 | `--patch` | Patch specified files and write changes to the filename plus the patch suffix. |
@@ -230,7 +267,7 @@ All the `mince` CLI arguments for reference.
 | `--response-verbosity {low,medium,high,off}` | Set the verbosity level for text responses. |
 | `--temperature FLOAT` | Set the sampling temperature from 0.0 to 2.0, or `off`. |
 | `--top-p FLOAT` | Set top-p nucleus sampling from 0.0 to 1.0, or `off`. |
-| `--openai-reasoning {none,minimal,low,medium,high,xhigh,max}` | Set the reasoning effort level. |
+| `--openai-reasoning {off,none,minimal,low,medium,high,xhigh,max}` | Set the reasoning effort level, or `off` to disable it. |
 | `--reasoning-mode {standard,pro}` | Select standard or pro reasoning mode. |
 | `--openai-extra-body KEY=VALUE[,KEY=VALUE,...]` | Add custom model parameters. |
 | `--token-limit LIMIT` | Set the maximum allowed estimated input-token count. |
