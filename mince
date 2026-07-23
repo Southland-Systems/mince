@@ -657,7 +657,13 @@ def init_config_interactive() -> None:
     ensure_config_exists()
     config = load_config()
 
-    print(f"Config file: {CONFIG_FILE}\nUse DEFAULT to reset any value\n")
+    print(
+        f"Config file: {CONFIG_FILE}\n"
+        f"Use DEFAULT to reset any value. "
+        f"Use - to blank text values.\n"
+        f"Syntax for prompt file includes:\n"
+        f"  ./prompt_name.md|/path/file|./prompt.md additional text\n"
+    )
 
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
@@ -667,7 +673,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
-    prompt_config_value(config, "system_prompt", "System prompt (use - to blank or ./promptname.md|/path/file text)")
+    prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
@@ -2161,7 +2167,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         type=parse_bool,
         metavar="BOOL",
-        help="Expand ^^promptname^^ references using the prompt library",
+        help="Expand ^^promptname^^ references using the prompt library (default: off)",
     )
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
