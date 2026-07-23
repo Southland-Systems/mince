@@ -633,6 +633,8 @@ def prompt_config_value(
     try:
         if value == "DEFAULT":
             config[key] = get_default_config_value(key)
+        elif value == "-" and key in PROMPT_CONFIG_KEYS:
+            config[key] = ""
         else:
             config[key] = cast(value) if cast else value
     except Exception:
@@ -653,15 +655,15 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
-    prompt_config_value(config, "system_prompt", "System prompt (use - to disable, ./name.md or /path/file[|/path/file...] with optional text)")
+    prompt_config_value(config, "system_prompt", "System prompt (use - to blank or ./promptname.md|/path/file text)")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
+    prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "patch_save", "Save patch file to HOME/.local/state/mince/patches (off, on)")
-    prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
@@ -2331,7 +2333,7 @@ def parse_args() -> argparse.Namespace:
     profile_action_group.add_argument(
         "--prompt-list",
         action="store_true",
-        help="List stored prompts and their configuration assignments",
+        help="List stored prompts and their profile assignments",
     )
     profile_action_group.add_argument(
         "--prompt-edit",
@@ -2361,7 +2363,7 @@ def parse_args() -> argparse.Namespace:
         "--prompt-unassign",
         nargs="+",
         metavar=("NAME PROFILE", "TYPE"),
-        help="Remove prompt NAME from PROFILE prompt TYPE",
+        help="Remove prompt NAME from PROFILE with optional prompt TYPE",
     )
     profile_action_group.add_argument(
         "--prompt-remove",
@@ -2735,7 +2737,7 @@ def main() -> int:
             config.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
             DEFAULT_SYSTEM_PROMPT,
         )
-        system_prompt = "" if configured_system_prompt == "-" else configured_system_prompt
+        system_prompt = configured_system_prompt
 
     if args.linenum_system_prompt:
         linenum_system_prompt = str(args.linenum_system_prompt).strip()
