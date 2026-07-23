@@ -342,6 +342,12 @@ Create an Issue on GitHub or fill out the contact form on https://southlandsys.c
 
 Reporting an issue is much appreciated, reporting improves quality for everyone.
 
+## Repository Locations 📍
+
+https://github.com/Southland-Systems/mince
+
+https://codeberg.org/Southland-Systems/mince
+
 ## License and Copyright 📄
 
 This project is licensed under the **Apache-2.0 License**

@@ -1,3 +1,5 @@
+MAKEFLAGS    += --silent
+
 PROGRAM      ?= mince
 SOURCE       ?= mince
 PYTHON       ?= python3
@@ -62,13 +64,15 @@ update-user:
 		echo "User install not found; running install-user"; \
 		$(MAKE) install-user; \
 	else \
-		git pull; \
+		if [ -d ".git" ]; then \
+			git pull; \
+		fi; \
 		cp -f "$(SOURCE)" "$(USER_DIR)/$(PROGRAM)"; \
 		chmod 755 "$(USER_DIR)/$(PROGRAM)"; \
 		if [ ! -x "$(USER_VENV)/bin/python" ]; then \
 			"$(PYTHON)" -m venv "$(USER_VENV)"; \
 		fi; \
-		"$(USER_VENV)/bin/python" -m pip install --upgrade pip openai tiktoken; \
+		"$(USER_VENV)/bin/python" -m pip install --upgrade -q pip openai tiktoken; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 		chmod 755 "$(USER_LAUNCH)"; \
 	fi
@@ -99,13 +103,15 @@ update-global:
 		echo "Global install not found; running install-global"; \
 		$(MAKE) install-global; \
 	else \
-		git pull; \
+		if [ -d ".git" ]; then \
+			git pull; \
+		fi; \
 		$(SUDO) cp -f "$(SOURCE)" "$(GLOBAL_DIR)/$(PROGRAM)"; \
 		$(SUDO) chmod 755 "$(GLOBAL_DIR)/$(PROGRAM)"; \
 		if [ ! -x "$(GLOBAL_VENV)/bin/python" ]; then \
 			$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 		fi; \
-		$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --upgrade pip openai tiktoken; \
+		$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --upgrade -q pip openai tiktoken; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 		$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 	fi
