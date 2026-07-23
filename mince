@@ -380,23 +380,26 @@ def unassign_prompt_from_config(
     return changed
 
 
-def handle_prompt_edit(name: str) -> int:
+def handle_prompt_edit(values: list[str]) -> int:
+    name = values[0]
     try:
         prompt_path = prompt_file_path(name)
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        initial_text = (
-            prompt_path.read_text(encoding="utf-8")
-            if prompt_path.exists()
-            else ""
-        )
-        edited_text = edit_text(initial_text, suffix=".md")
+        if len(values) > 1:
+            edited_text = " ".join(values[1:]).strip()
+        else:
+            initial_text = (
+                prompt_path.read_text(encoding="utf-8")
+                if prompt_path.exists()
+                else ""
+            )
+            edited_text = edit_text(initial_text, suffix=".md")
         prompt_path.write_text(edited_text, encoding="utf-8")
     except Exception as exc:
         print(f"ERROR: Failed to edit prompt: {exc}", file=sys.stderr)
         return 1
     print(f"prompt_file={prompt_path}")
     return 0
-
 
 def handle_prompt_assign(
     values: list[str],
@@ -2332,31 +2335,32 @@ def parse_args() -> argparse.Namespace:
     )
     profile_action_group.add_argument(
         "--prompt-edit",
-        metavar="NAME",
-        help="Edit or create the prompt NAME in the prompts library",
+        nargs="+",
+        metavar=("NAME", "TEXT"),
+        help="Edit or create the prompt NAME or form it from additional TEXT arguments",
     )
     profile_action_group.add_argument(
         "--prompt-assign",
-        nargs="+",
-        metavar="NAME PROFILE TYPE",
+        nargs=3,
+        metavar=("NAME", "PROFILE", "TYPE"),
         help="Add prompt NAME to PROFILE prompt TYPE (types: system, linenum, patch, plan)",
     )
     profile_action_group.add_argument(
         "--prompt-assign-text",
-        nargs="+",
-        metavar="NAME PROFILE TYPE",
+        nargs=3,
+        metavar=("NAME", "PROFILE", "TYPE"),
         help="Replace PROFILE prompt TYPE with text content of prompt NAME",
     )
     profile_action_group.add_argument(
         "--prompt-assign-replace",
-        nargs="+",
-        metavar="NAME PROFILE TYPE",
+        nargs=3,
+        metavar=("NAME", "PROFILE", "TYPE"),
         help="Replace PROFILE prompt TYPE with prompt NAME",
     )
     profile_action_group.add_argument(
         "--prompt-unassign",
         nargs="+",
-        metavar="NAME PROFILE [TYPE]",
+        metavar=("NAME PROFILE", "TYPE"),
         help="Remove prompt NAME from PROFILE prompt TYPE",
     )
     profile_action_group.add_argument(
@@ -3431,4 +3435,3 @@ except Exception as e:
     print(e, file=sys.stderr)
 finally:
     sys.exit(rv)
-

@@ -46,7 +46,7 @@ mince -p review --task "Review the public API" --files src/api.py README.md
 
 ### Prompt library — reusable instructions
 
-Reusable prompts can be stored as Markdown files in `~/.local/state/mince/prompts/`. Prompt-library actions do not make an API request. `NAME` is the prompt name in the library (without the .md extension), `PROFILE` is a configuration profile name, and `TYPE` is one of `system`, `linenum`, `patch`, or `plan`.
+Reusable prompts can be stored as Markdown files in `~/.local/state/mince/prompts/`. `NAME` is the prompt name in the library (without the .md extension), `PROFILE` is a configuration profile name, and `TYPE` is one of `system`, `linenum`, `patch`, or `plan`.
 
 Create or edit a prompt with `--prompt-edit NAME`, then assign it to a profile with `--prompt-assign NAME PROFILE TYPE`. Assignment prepends a file-backed prompt reference while retaining existing prompt text. Use `--prompt-assign-text` to store the prompt's text directly, or `--prompt-assign-replace` to replace the target with only its file reference. `--prompt-unassign NAME PROFILE [TYPE]` removes one file-backed reference, or all prompt-type references when `TYPE` is omitted. Finally, `--prompt-remove NAME` removes references to the prompt from all profiles and deletes its file.
 
