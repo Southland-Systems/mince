@@ -44,6 +44,12 @@ mince --init-profile review
 mince -p review --task "Review the public API" --files src/api.py README.md
 ```
 
+### Prompt library — reusable instructions
+
+Reusable prompts can be stored as Markdown files in `~/.local/state/mince/prompts/`. Prompt-library actions do not make an API request. `NAME` is the prompt name in the library (without the .md extension), `PROFILE` is a configuration profile name, and `TYPE` is one of `system`, `linenum`, `patch`, or `plan`.
+
+Create or edit a prompt with `--prompt-edit NAME`, then assign it to a profile with `--prompt-assign NAME PROFILE TYPE`. Assignment prepends a file-backed prompt reference while retaining existing prompt text. Use `--prompt-assign-text` to store the prompt's text directly, or `--prompt-assign-replace` to replace the target with only its file reference. `--prompt-unassign NAME PROFILE [TYPE]` removes one file-backed reference, or all prompt-type references when `TYPE` is omitted. Finally, `--prompt-remove NAME` removes references to the prompt from all profiles and deletes its file.
+
 ## Requirements 📦
 
 - `python` 3.10 or newer and the `pip` package manager
@@ -290,6 +296,13 @@ All the `mince` CLI arguments for reference.
 | `--copy-profile NEW_NAME` | Copy the selected configuration profile to a new profile. |
 | `--remove-profile NAME` | Remove a configuration profile. |
 | `--list-profiles` | List available configuration profiles. |
+| `--prompt-list` | List stored prompts and the profiles to which they are assigned. |
+| `--prompt-edit NAME` | Edit or create `NAME` in the prompt library. |
+| `--prompt-assign NAME PROFILE TYPE` | Add a file-backed reference to `NAME` in `PROFILE` for `TYPE`, preserving existing prompt text. |
+| `--prompt-assign-text NAME PROFILE TYPE` | Replace `PROFILE`'s prompt of `TYPE` with the text from `NAME`. |
+| `--prompt-assign-replace NAME PROFILE TYPE` | Replace `PROFILE`'s prompt of `TYPE` with a reference to `NAME` only. |
+| `--prompt-unassign NAME PROFILE [TYPE]` | Remove a reference to `NAME` from `PROFILE`'s prompt of `TYPE`; omit `TYPE` to check all prompt types. |
+| `--prompt-remove NAME` | Remove references to `NAME` from all profiles and delete it from the prompt library. |
 
 Environment variable reference.
 

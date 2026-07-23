@@ -210,6 +210,343 @@ def save_config(config: dict[str, Any]) -> None:
         encoding="utf-8",
     )
 
+PROMPT_TYPE_ALIASES: dict[str, str] = {
+    "system": "system_prompt",
+    "linenum": "linenum_system_prompt",
+    "patch": "patch_system_prompt",
+    "plan": "plan_system_prompt",
+}
+PROMPT_CONFIG_KEYS = tuple(dict.fromkeys(PROMPT_TYPE_ALIASES.values()))
+
+
+def prompt_type_key(value: str) -> str:
+    normalized = " ".join(
+        value.strip().lower().replace("_", " ").replace("-", " ").split()
+    )
+    try:
+        return PROMPT_TYPE_ALIASES[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown prompt type '{value}'; choose system, linenum, patch, or plan"
+        ) from exc
+
+
+def validate_prompt_name(name: str) -> str:
+    name = name.strip()
+    if (
+        not name
+        or name in (".", "..")
+        or any(character in name for character in ("/", "\\", "|"))
+        or any(ord(character) < 32 for character in name)
+    ):
+        raise ValueError("invalid prompt name")
+    return name
+
+
+def prompt_file_path(name: str) -> Path:
+    return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
+
+
+def validate_prompt_profile_name(name: str) -> str:
+    name = name.strip()
+    if not name.isidentifier():
+        raise ValueError(f"invalid profile name '{name}'")
+    return name
+
+
+def read_config_document(path: Path, missing_ok: bool = False) -> dict[str, Any]:
+    if not path.exists():
+        if missing_ok:
+            return {}
+        raise ValueError(f"configuration file does not exist: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot read configuration file {path} ({exc})") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"configuration file {path} must contain a JSON object")
+    return raw
+
+
+def write_config_document(path: Path, config: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(config, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def parse_prompt_file_definitions(value: Any) -> tuple[list[str], str] | None:
+    if not isinstance(value, str):
+        return None
+
+    prompt = value.strip()
+    if not prompt.startswith(("/", "./")):
+        return None
+
+    match = re.match(r"^(\S+)(?:\s+(.*))?$", prompt, re.DOTALL)
+    if match is None:
+        return None
+
+    definitions = match.group(1).split("|")
+    if not definitions or any(
+        not definition
+        or not definition.startswith(("/", "./"))
+        for definition in definitions
+    ):
+        return None
+    return definitions, (match.group(2) or "").strip()
+
+
+def configured_prompt_file_path(value: str) -> Path:
+    candidate = value.strip()
+    if candidate.startswith("./"):
+        filename = candidate[2:]
+        if (
+            not filename
+            or filename in (".", "..")
+            or Path(filename).name != filename
+        ):
+            raise ValueError(
+                "relative configured prompt files must be filenames"
+            )
+        return APP_DIR / "prompts" / filename
+    return Path(candidate)
+
+
+def prompt_path_matches(value: str, prompt_path: Path) -> bool:
+    candidate = value.strip()
+    if candidate == str(prompt_path):
+        return True
+    if not candidate.startswith(("/", "./")):
+        return False
+    try:
+        return (
+            configured_prompt_file_path(candidate).resolve()
+            == prompt_path.resolve()
+        )
+    except Exception:
+        return False
+
+
+def remove_prompt_reference(
+    value: Any,
+    prompt_path: Path,
+ ) -> tuple[Any, bool]:
+    if not isinstance(value, str):
+        return value, False
+
+    parsed = parse_prompt_file_definitions(value)
+    if parsed is None:
+        return value, False
+
+    definitions, prompt_text = parsed
+    remaining: list[str] = []
+    removed = False
+    for definition in definitions:
+        if prompt_path_matches(definition, prompt_path):
+            removed = True
+        else:
+            remaining.append(definition)
+    if not removed:
+        return value, False
+    if not remaining:
+        return prompt_text or None, True
+
+    new_value = "|".join(remaining)
+    if prompt_text:
+        new_value += f" {prompt_text}"
+    return new_value, True
+
+
+def unassign_prompt_from_config(
+    config: dict[str, Any],
+    prompt_path: Path,
+    keys: tuple[str, ...],
+ ) -> bool:
+    changed = False
+    for key in keys:
+        if key not in config:
+            continue
+        new_value, removed = remove_prompt_reference(config[key], prompt_path)
+        if not removed:
+            continue
+        config[key] = (
+            get_default_config_value(key)
+            if new_value is None
+            else new_value
+        )
+        changed = True
+    return changed
+
+
+def handle_prompt_edit(name: str) -> int:
+    try:
+        prompt_path = prompt_file_path(name)
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        initial_text = (
+            prompt_path.read_text(encoding="utf-8")
+            if prompt_path.exists()
+            else ""
+        )
+        edited_text = edit_text(initial_text, suffix=".md")
+        prompt_path.write_text(edited_text, encoding="utf-8")
+    except Exception as exc:
+        print(f"ERROR: Failed to edit prompt: {exc}", file=sys.stderr)
+        return 1
+    print(f"prompt_file={prompt_path}")
+    return 0
+
+
+def handle_prompt_assign(
+    values: list[str],
+    assignment_mode: str = "prepend",
+) -> int:
+    name, profile, prompt_type = values
+    try:
+        prompt_path = prompt_file_path(name)
+        if not prompt_path.is_file():
+            raise ValueError(
+                f"prompt file does not exist: {prompt_path}; use --prompt-edit first"
+            )
+        profile = validate_prompt_profile_name(profile)
+        config_key = prompt_type_key(prompt_type)
+        profile_path = get_profile_path(profile)
+        config = read_config_document(profile_path, missing_ok=True)
+        prompt_reference = f"./{prompt_path.name}"
+        existing = config.get(config_key)
+        if assignment_mode == "string":
+            config[config_key] = prompt_path.read_text(
+                encoding="utf-8"
+            ).strip()
+        elif assignment_mode == "replace":
+            config[config_key] = prompt_reference
+        else:
+            parsed = parse_prompt_file_definitions(existing)
+            if parsed is None:
+                existing_string = (
+                    existing.strip()
+                    if isinstance(existing, str)
+                    else ""
+                )
+                config[config_key] = (
+                    f"{prompt_reference} {existing_string}".strip()
+                )
+            else:
+                references, prompt_text = parsed
+                if not any(
+                    prompt_path_matches(reference, prompt_path)
+                    for reference in references
+                ):
+                    references.insert(0, prompt_reference)
+                config[config_key] = "|".join(references)
+                if prompt_text:
+                    config[config_key] += f" {prompt_text}"
+        write_config_document(profile_path, config)
+    except Exception as exc:
+        print(f"ERROR: Failed to assign prompt: {exc}", file=sys.stderr)
+        return 1
+    print(f"prompt_assigned={prompt_path} profile={profile} type={config_key}")
+    return 0
+
+
+def handle_prompt_unassign(values: list[str]) -> int:
+    if len(values) not in (2, 3):
+        print(
+            "ERROR: --prompt-unassign requires NAME PROFILE and optional TYPE",
+            file=sys.stderr,
+        )
+        return 1
+    name, profile = values[:2]
+    try:
+        prompt_path = prompt_file_path(name)
+        profile = validate_prompt_profile_name(profile)
+        profile_path = get_profile_path(profile)
+        config = read_config_document(profile_path)
+        keys = (
+            (prompt_type_key(values[2]),)
+            if len(values) == 3
+            else PROMPT_CONFIG_KEYS
+        )
+        changed = unassign_prompt_from_config(config, prompt_path, keys)
+        if changed:
+            write_config_document(profile_path, config)
+    except Exception as exc:
+        print(f"ERROR: Failed to unassign prompt: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"prompt_unassigned={prompt_path} profile={profile}"
+        + (f" type={keys[0]}" if len(keys) == 1 else "")
+    )
+    return 0
+
+
+def handle_prompt_remove(name: str) -> int:
+    try:
+        prompt_path = prompt_file_path(name)
+        if prompt_path.exists() and not prompt_path.is_file():
+            raise ValueError(f"prompt path is not a file: {prompt_path}")
+
+        documents: list[tuple[Path, dict[str, Any]]] = []
+        for config_path in sorted(APP_DIR.glob("*.json")):
+            documents.append((config_path, read_config_document(config_path)))
+
+        for config_path, config in documents:
+            if unassign_prompt_from_config(
+                config, prompt_path, PROMPT_CONFIG_KEYS
+            ):
+                write_config_document(config_path, config)
+
+        if prompt_path.exists():
+            prompt_path.unlink()
+    except Exception as exc:
+        print(f"ERROR: Failed to remove prompt: {exc}", file=sys.stderr)
+        return 1
+    print(f"prompt_removed={prompt_path}")
+    return 0
+
+
+def handle_prompt_list() -> int:
+    prompt_dir = APP_DIR / "prompts"
+    try:
+        prompt_paths = sorted(
+            (
+                path
+                for path in prompt_dir.glob("*.md")
+                if path.is_file()
+            ),
+            key=lambda path: path.stem,
+        )
+        config_documents = [
+            (
+                config_path.stem,
+                read_config_document(config_path),
+            )
+            for config_path in sorted(APP_DIR.glob("*.json"))
+        ]
+    except Exception as exc:
+        print(f"ERROR: Failed to list prompts: {exc}", file=sys.stderr)
+        return 1
+
+    for prompt_path in prompt_paths:
+        profiles: set[str] = set()
+        for profile_name, config in config_documents:
+            for key in PROMPT_CONFIG_KEYS:
+                parsed = parse_prompt_file_definitions(config.get(key))
+                if parsed is not None and any(
+                    prompt_path_matches(reference, prompt_path)
+                    for reference in parsed[0]
+                ):
+                    profiles.add(profile_name)
+                    break
+
+        output = prompt_path.stem
+        if profiles:
+            output += f" {' '.join(sorted(profiles))}"
+        print(output)
+    return 0
+
+
 def get_default_config_value(name: str) -> Any:
     if name not in DEFAULT_CONFIG:
         raise ValueError(f"{name} has no built-in default value")
@@ -250,13 +587,13 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
     return name, raw_value
 
 
-
 def format_config_value(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if value is None:
         return ""
     return str(value)
+
 
 def mask_api_key(value: Any) -> str:
     key = "" if value is None else str(value)
@@ -313,7 +650,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "openai_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
-    prompt_config_value(config, "system_prompt", "System prompt (use - to disable, /path/file[|/path/file...] for multiple files)")
+    prompt_config_value(config, "system_prompt", "System prompt (use - to disable, ./name.md or /path/file[|/path/file...] with optional text)")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
@@ -665,15 +1002,23 @@ def read_prompt_argument(value: str | list[str]) -> str:
 
 def resolve_configured_prompt(value: Any, default: str) -> str:
     prompt = str(value if value is not None else default).strip()
-    if prompt.startswith("/"):
-        try:
-            prompt = "\n".join(
-                read_file(Path(prompt_file.strip())).strip()
-                for prompt_file in prompt.split("|")
-            )
-        except Exception as exc:
-            raise ValueError(f"cannot read configured system prompt file {value} ({exc})") from exc
-    return prompt
+    parsed = parse_prompt_file_definitions(prompt)
+    if parsed is None:
+        return prompt
+
+    file_definitions, prompt_text = parsed
+    try:
+        prompt_parts = [
+            read_file(
+                configured_prompt_file_path(prompt_file)
+            ).strip()
+            for prompt_file in file_definitions
+        ]
+        if prompt_text:
+            prompt_parts.append(prompt_text)
+        return "\n".join(part for part in prompt_parts if part).strip()
+    except Exception as exc:
+        raise ValueError(f"cannot read configured system prompt file {value} ({exc})") from exc
 
 
 def read_files_list(path: Path) -> list[str]:
@@ -1980,8 +2325,46 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List available configuration profiles",
     )
+    profile_action_group.add_argument(
+        "--prompt-list",
+        action="store_true",
+        help="List stored prompts and their configuration assignments",
+    )
+    profile_action_group.add_argument(
+        "--prompt-edit",
+        metavar="NAME",
+        help="Edit or create the prompt NAME in the prompts library",
+    )
+    profile_action_group.add_argument(
+        "--prompt-assign",
+        nargs="+",
+        metavar="NAME PROFILE TYPE",
+        help="Add prompt NAME to PROFILE prompt TYPE (types: system, linenum, patch, plan)",
+    )
+    profile_action_group.add_argument(
+        "--prompt-assign-text",
+        nargs="+",
+        metavar="NAME PROFILE TYPE",
+        help="Replace PROFILE prompt TYPE with text content of prompt NAME",
+    )
+    profile_action_group.add_argument(
+        "--prompt-assign-replace",
+        nargs="+",
+        metavar="NAME PROFILE TYPE",
+        help="Replace PROFILE prompt TYPE with prompt NAME",
+    )
+    profile_action_group.add_argument(
+        "--prompt-unassign",
+        nargs="+",
+        metavar="NAME PROFILE [TYPE]",
+        help="Remove prompt NAME from PROFILE prompt TYPE",
+    )
+    profile_action_group.add_argument(
+        "--prompt-remove",
+        metavar="NAME",
+        help="Remove prompt NAME from all profiles and delete it",
+    )
     return parser.parse_args()
-
 
 # -------------------------------------------------------------------
 # Main
@@ -2008,6 +2391,22 @@ def main() -> int:
     if args.init:
         init_config_interactive()
         return 0
+
+    if args.prompt_list:
+        return handle_prompt_list()
+    if args.prompt_edit is not None:
+        return handle_prompt_edit(args.prompt_edit)
+    if args.prompt_assign is not None:
+        return handle_prompt_assign(args.prompt_assign)
+    if args.prompt_assign_text is not None:
+        return handle_prompt_assign(args.prompt_assign_text, "string")
+    if args.prompt_assign_replace is not None:
+        return handle_prompt_assign(args.prompt_assign_replace, "replace")
+    if args.prompt_unassign is not None:
+        return handle_prompt_unassign(args.prompt_unassign)
+    if args.prompt_remove is not None:
+        return handle_prompt_remove(args.prompt_remove)
+
 
     base_profile = args.profile or "config"
 
@@ -2337,16 +2736,20 @@ def main() -> int:
     if args.linenum_system_prompt:
         linenum_system_prompt = str(args.linenum_system_prompt).strip()
     else:
-        linenum_system_prompt = str(
-            config.get("linenum_system_prompt", DEFAULT_LINENUM_SYSTEM_PROMPT)
+        linenum_system_prompt = resolve_configured_prompt(
+            config.get("linenum_system_prompt", DEFAULT_LINENUM_SYSTEM_PROMPT),
+            DEFAULT_LINENUM_SYSTEM_PROMPT,
         ).strip()
 
     if args.patch_system_prompt:
         patch_system_prompt = str(args.patch_system_prompt).strip()
     else:
-        patch_system_prompt = str(
-            config.get("patch_system_prompt", DEFAULT_PATCH_SYSTEM_PROMPT)
+        patch_system_prompt = resolve_configured_prompt(
+            config.get("patch_system_prompt", DEFAULT_PATCH_SYSTEM_PROMPT),
+            DEFAULT_PATCH_SYSTEM_PROMPT,
         ).strip()
+
+
     if args.plan_system_prompt:
         plan_system_prompt = str(args.plan_system_prompt).strip()
     else:
