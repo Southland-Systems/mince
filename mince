@@ -267,6 +267,17 @@ def validate_prompt_name(name: str) -> str:
     return name
 
 
+def validate_session_name(name: str) -> str:
+    name = name.strip()
+    if (
+        not name
+        or name in (".", "..")
+        or any(character in name for character in ("/", "\\"))
+        or any(ord(character) < 32 for character in name)
+    ):
+        raise ValueError("invalid session name")
+    return name
+
 def prompt_file_path(name: str) -> Path:
     return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
 
@@ -748,6 +759,28 @@ def get_profile_path(name: str) -> Path:
     return APP_DIR / f"{name}.json"
 
 
+def handle_session_view(view_type: str, session_name: str) -> int:
+    view_specs = {
+        "log": ("logs", ".txt"),
+        "patch": ("patches", ".patch"),
+        "tree": ("trees", ".md"),
+    }
+    try:
+        session_name = validate_session_name(session_name)
+        directory, suffix = view_specs[view_type]
+        path = APP_DIR / directory / f"{session_name}{suffix}"
+        if not path.is_file():
+            raise ValueError(f"session file does not exist: {path}")
+        pydoc.pager(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(
+            f"ERROR: Failed to view {view_type} session: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 # -------------------------------------------------------------------
 # Patch helpers
 # -------------------------------------------------------------------
@@ -782,6 +815,28 @@ def detect_line_ending(text: str) -> str:
 def eol_for(line_ending: str) -> str:
     return "\r\n" if line_ending == "crlf" else "\n"
 
+
+PATCH_REVISION_HEADING = (
+    "# Changes made below this line will be ignored; only text above this line will be used as the next task."
+)
+
+
+def build_patch_revision_editor_text(
+    diff_text: str,
+    previous_task: str = "",
+) -> str:
+    previous_task = previous_task.strip()
+    return (
+        ("\n" * 2)
+        + f"{PATCH_REVISION_HEADING}\n\n"
+        + (f"{previous_task}\n\n" if previous_task else "")
+        + diff_text
+    )
+
+
+def extract_patch_revision_task(edited_text: str) -> str:
+    task_text, separator, _ = edited_text.partition(PATCH_REVISION_HEADING)
+    return (task_text if separator else edited_text).strip()
 
 def normalize_line_for_write(text: str) -> str:
     if "\n" in text or "\r" in text:
@@ -970,6 +1025,7 @@ def usage_to_dict(usage: Any) -> dict[str, Any] | None:
 
 def print_stats(
     *,
+    session_name: str,
     request_characters: int,
     request_tokens: int,
     processing_time: float | None = None,
@@ -989,6 +1045,7 @@ def print_stats(
                 stats.append(f"response_{key}={usage[key]}")
     if response_cost is not None:
         stats.append(response_cost)
+    stats.append(f"session_name={session_name}")
     return " ".join(stats)
 
 def coerce_bool(value: Any, default: bool = False) -> bool:
@@ -1217,14 +1274,28 @@ def build_user_prompt(
     context: str,
     response_format: str = "text",
     json_schema: dict[str, Any] | None = None,
-) -> str:
+    json_patch_responses: list[str] | None = None,
+    json_patch_task: str | None = None,
+ ) -> str:
     schema_block = ""
+    json_patch_block = ""
 
     if response_format == "schema" and json_schema is not None:
         schema_block = (
             "<json_schema instructions='Return JSON that matches this schema exactly'>\n"
             f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
             "</json_schema>\n"
+        )
+    if json_patch_responses:
+        last_response = json_patch_responses[-1]
+        task_block = (
+            f"<json_patch_task>\n{json_patch_task}\n</json_patch_task>\n"
+            if json_patch_task is not None
+            else ""
+        )
+        json_patch_block = (
+            f"{task_block}<json_patch>\n"
+            f"{last_response}\n</json_patch>"
         )
 
     return f"""
@@ -1234,7 +1305,7 @@ def build_user_prompt(
 <files current_working_directory='{os.getcwd()}'>
 {context}
 </files>
-{schema_block}
+{schema_block}{json_patch_block}
 """.strip()
 
 
@@ -1873,6 +1944,7 @@ def run_tree_mode(
         response_cost_components = response_cost_amounts(token_cost, usage)
         response_cost = response_cost_line(token_cost, usage)
         statsline = print_stats(
+            session_name=tree_session_stem,
             request_characters=request_characters,
             request_tokens=request_tokens,
             processing_time=elapsed,
@@ -2156,6 +2228,22 @@ def parse_args() -> argparse.Namespace:
         "--profile",
         metavar="NAME",
         help="Select configuration profile",
+    )
+    session_view_group = parser.add_mutually_exclusive_group()
+    session_view_group.add_argument(
+        "--log-view",
+        metavar="SESSION",
+        help="Display a saved log session",
+    )
+    session_view_group.add_argument(
+        "--patch-view",
+        metavar="SESSION",
+        help="Display a saved patch session",
+    )
+    session_view_group.add_argument(
+        "--tree-view",
+        metavar="SESSION",
+        help="Display a saved combined tree manifest",
     )
     parser.add_argument(
         "-o",
@@ -2564,13 +2652,22 @@ def main() -> int:
     tokenizer_padding = 0
 
     json_schema = None
-    reasoning = ""
+    json_schema = None
+    json_patch_responses: list[str] = []
+    json_patch_task: str | None = None
 
     global CONFIG_FILE
     global VERBOSE
     global DEBUG
 
     args = parse_args()
+
+    if args.log_view is not None:
+        return handle_session_view("log", args.log_view)
+    if args.patch_view is not None:
+        return handle_session_view("patch", args.patch_view)
+    if args.tree_view is not None:
+        return handle_session_view("tree", args.tree_view)
 
     if args.quiet:
         VERBOSE = 0
@@ -3360,6 +3457,7 @@ def main() -> int:
             return 1
         plan_response_cost = response_cost_line(token_cost, plan_usage)
         plan_statsline = print_stats(
+            session_name=session_stem,
             request_characters=plan_request_characters,
             request_tokens=plan_request_tokens,
             processing_time=plan_elapsed,
@@ -3371,28 +3469,34 @@ def main() -> int:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_response>\n{plan_result}\n</plan_response>\n")
                 f.write(f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n")
-        if VERBOSE:
-            print(plan_statsline, file=sys.stderr)
         while True:
             print()
             print(plan_result)
             print()
-            plan_choice = input("Use this plan? [y/N/e]: ").strip().lower()
+            plan_choice = input("Use this plan? [y/n/p/e]: ").strip().lower()
+            if plan_choice == "p":
+                pydoc.pager(plan_result)
+                continue
             if plan_choice in ("e", "edit"):
                 try:
                     plan_result = edit_text(plan_result).strip()
                 except Exception as exc:
                     print(f"ERROR: Failed to edit plan: {exc}", file=sys.stderr)
                 continue
-            accepted = plan_choice in ("y", "yes")
-            break
+            if plan_choice in ("y", "yes", "n", "no"):
+                accepted = plan_choice in ("y", "yes")
+                break
+            print("Please answer y, n, p, or e.")
         if log_enabled:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_review>{'accepted' if accepted else 'rejected'}</plan_review>\n")
         if not accepted:
             if VERBOSE:
                 print("Aborted.", file=sys.stderr)
+                print(plan_statsline, file=sys.stderr)
             return 0
+        if VERBOSE:
+            print(plan_statsline, file=sys.stderr)
         print()
         task = expand_prompt_names(plan_result, prompt_expansion_enabled)
         user_prompt = build_user_prompt(
@@ -3527,6 +3631,7 @@ def main() -> int:
         reasoning = ""
 
     statsline = print_stats(
+        session_name=session_stem,
         request_characters=request_characters,
         request_tokens=request_tokens,
         processing_time=elapsed,
@@ -3543,68 +3648,286 @@ def main() -> int:
             f.write(f"<response_stats>\n{statsline}\n</response_stats>\n")
             f.write(f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n")
 
+    def call_patch_revision_request(
+        revision_user_prompt: str,
+    ) -> tuple[str, str, Any, dict[str, Any] | None]:
+        revision_request_tokens = (
+            estimate_request_tokens(
+                model=model,
+                system_prompt=full_system_prompt,
+                user_prompt=revision_user_prompt,
+            )
+            + tokenizer_padding
+        )
+        revision_request_characters = len(
+            full_system_prompt + revision_user_prompt
+        )
+        revision_request_cost_log = ''
+        if token_cost is not None:
+            revision_request_cost_log = (
+                f' request_cost_estimate='
+                f'{revision_request_tokens * token_cost[0] / 1_000_000:.4f}'
+            )
+        if revision_request_tokens > token_limit:
+            raise ValueError(
+                f'Estimated input token count ({revision_request_tokens}) exceeds '
+                f'token limit ({token_limit})'
+            )
+        if log_enabled:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(
+                    f'<request_stats>\n'
+                    f'request_characters={revision_request_characters} '
+                    f'request_tokens_estimate={revision_request_tokens}'
+                    f'{revision_request_cost_log} model={model} '
+                    f'reasoning={openai_reasoning} '
+                    f'reasoning_mode={reasoning_mode} '
+                    f'max_output_tokens={max_output_tokens} api_log={api_log} '
+                    f'timeout={llm_timeout}\n'
+                    f'</request_stats>\n'
+                )
+                f.write(f'<request>\n')
+                f.write(
+                    f'<system_prompt>\n{full_system_prompt}\n'
+                    f'</system_prompt>\n'
+                )
+                f.write(
+                    f'<user_prompt>\n{revision_user_prompt}\n'
+                    f'</user_prompt>\n'
+                )
+                f.write('</request>\n')
+        if VERBOSE:
+            print(
+                f'request_characters={revision_request_characters} '
+                f'request_tokens_estimate={revision_request_tokens}'
+                f'{revision_request_cost_log} model={model} '
+                f'reasoning={openai_reasoning}',
+                file=sys.stderr,
+            )
+
+        revision_start_time = time.perf_counter()
+        revision_response_obj, revision_usage = call_openai(
+            api_key=api_key,
+            openai_base_url=openai_base_url,
+            openai_proxy=openai_proxy,
+            openai_organization=openai_organization,
+            openai_project=openai_project,
+            model=model,
+            system_prompt=full_system_prompt,
+            user_prompt=revision_user_prompt,
+            response_format=response_format,
+            json_schema=json_schema,
+            response_verbosity=response_verbosity,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            openai_service_tier=openai_service_tier,
+            openai_reasoning=openai_reasoning,
+            reasoning_mode=reasoning_mode,
+            extra_body=extra_body,
+            llm_timeout=llm_timeout,
+            safety_identifier=safety_identifier,
+            store=api_log,
+            stream=False,
+        )
+        revision_result = str(
+            getattr(revision_response_obj, 'output_text', '') or ''
+        )
+        revision_elapsed = time.perf_counter() - revision_start_time
+        revision_statsline = print_stats(
+            session_name=session_stem,
+            request_characters=revision_request_characters,
+            request_tokens=revision_request_tokens,
+            processing_time=revision_elapsed,
+            response_text=revision_result,
+            usage=revision_usage,
+            response_cost=response_cost_line(
+                token_cost, revision_usage
+            ),
+        )
+        if log_enabled:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(
+                    f'<response>\n{revision_result}\n'
+                    f'</response>\n'
+                )
+                f.write(
+                    f'<response_stats>\n{revision_statsline}\n'
+                    f'</response_stats>\n'
+                )
+                f.write(
+                    f'<end_time>{time.ctime(int(time.time()))} '
+                    f'[{int(time.time())}]</end_time>\n'
+                )
+        return (
+            revision_result,
+            revision_statsline,
+            revision_response_obj,
+            revision_usage,
+        )
+
     if patch_mode:
-        try:
-            if not result or not result.strip():
-                print("ERROR: LLM returned empty response for patch manifest", file=sys.stderr)
-                return 1
-
-            result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
-            manifest = json.loads(result)
-        except json.JSONDecodeError as exc:
-            print(result)
-            if VERBOSE:
-                print(statsline, file=sys.stderr)
-            print(f"ERROR: Failed to parse patch manifest JSON: {exc}", file=sys.stderr)
-            return 1
-
-        updated_texts = apply_combined_patch_manifest(original_texts, manifest)
-        diffs = []
-        for fp, ut in updated_texts.items():
-            ot = original_texts.get(fp, "")
-            if ut != ot:
-                d = generate_unified_diff(ot, ut, fp)
-                if d: diffs.append(d)
-        if not diffs:
-            if VERBOSE:
-                print("No changes.", file=sys.stderr)
-                print(statsline, file=sys.stderr)
-            return 0
-        diff_text = "\n".join(diffs)
-        if patch_save_path is not None:
+        while True:
             try:
-                patch_save_path.parent.mkdir(parents=True, exist_ok=True)
-                patch_save_path.write_text(diff_text, encoding="utf-8")
-            except Exception as exc:
-                print(f"ERROR: Failed to save patch file to {patch_save_path}: {exc}", file=sys.stderr)
-                return 1
-            if VERBOSE:
-                print(f"patch_file={patch_save_path}", file=sys.stderr)
-        if VERBOSE or patch_review:
-            print()
-            print(diff_text)
-        if patch_review:
-            if input("\nApply these changes? [y/N]: ").strip().lower() not in ("y", "yes"):
+                if not result or not result.strip():
+                    print(
+                        'ERROR: LLM returned empty response for patch manifest',
+                        file=sys.stderr,
+                    )
+                    return 1
+
+                result = re.sub(
+                    r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)',
+                    '',
+                    result,
+                ).strip()
+                manifest = json.loads(result)
+            except json.JSONDecodeError as exc:
+                print(result)
                 if VERBOSE:
-                    print("Aborted.", file=sys.stderr)
+                    print(statsline, file=sys.stderr)
+                print(
+                    f'ERROR: Failed to parse patch manifest JSON: {exc}',
+                    file=sys.stderr,
+                )
+                return 1
+
+            updated_texts = apply_combined_patch_manifest(
+                original_texts, manifest
+            )
+            diffs = []
+            for fp, ut in updated_texts.items():
+                ot = original_texts.get(fp, '')
+                if ut != ot:
+                    d = generate_unified_diff(ot, ut, fp)
+                    if d:
+                        diffs.append(d)
+            if not diffs:
+                if VERBOSE:
+                    print('No changes.', file=sys.stderr)
                     print(statsline, file=sys.stderr)
                 return 0
-            for fp, ut in updated_texts.items():
-                if ut == original_texts.get(fp, ""): continue
-                tgt = append_suffix_to_path(Path(fp), patch_suffix) if suffix_provided else Path(fp)
-                tgt.write_text(ut, encoding="utf-8")
-                print(f"file_written={str(tgt) if suffix_provided else fp}")
-        else:
-            for fp, ut in updated_texts.items():
-                if ut == original_texts.get(fp, ""): continue
-                outp = append_suffix_to_path(Path(fp), patch_suffix)
-                outp.write_text(ut, encoding="utf-8")
-                print(f"file_written={outp}")
+            diff_text = '\n'.join(diffs)
+            if patch_save_path is not None:
+                try:
+                    patch_save_path.parent.mkdir(parents=True, exist_ok=True)
+                    patch_save_path.write_text(diff_text, encoding='utf-8')
+                except Exception as exc:
+                    print(
+                        f'ERROR: Failed to save patch file to '
+                        f'{patch_save_path}: {exc}',
+                        file=sys.stderr,
+                    )
+                    return 1
+                if VERBOSE:
+                    print(f'patch_file={patch_save_path}', file=sys.stderr)
+            if VERBOSE or patch_review:
+                print()
+                print(diff_text)
 
-        if VERBOSE:
-            print(statsline, file=sys.stderr)
+            revision_task: str | None = None
+            if patch_review:
+                while True:
+                    patch_input = input(
+                        'Apply these changes? [y/n/p/e/E <prompt>]: '
+                    ).strip()
+                    if not patch_input:
+                        print('Usage: y, n, p, e, or E <prompt>')
+                        continue
+                    patch_choice = patch_input.lower()
+                    if patch_choice in ('y', 'yes', 'n', 'no'):
+                        break
+                    if patch_choice == 'p':
+                        pydoc.pager(diff_text)
+                        continue
+                    if patch_choice == 'e':
+                        try:
+                            edited_text = edit_text(
+                                build_patch_revision_editor_text(
+                                    diff_text,
+                                    task,
+                                ),
+                            )
+                            revision_task = extract_patch_revision_task(
+                                edited_text
+                            )
+                        except Exception as exc:
+                            print(
+                                f'ERROR: Failed to edit patch revision: {exc}',
+                                file=sys.stderr,
+                            )
+                            continue
+                        if not revision_task:
+                            continue
+                        break
+                    if (
+                        patch_input.startswith('E')
+                        and len(patch_input) > 1
+                        and patch_input[1].isspace()
+                    ):
+                        revision_task = patch_input[1:].strip()
+                        if not revision_task:
+                            print('Revision task cannot be empty.')
+                            continue
+                        break
+                    print('Please answer y, n, p, e, or E followed by a prompt.')
+                if patch_choice in ('n', 'no'):
+                    if VERBOSE:
+                        print('Aborted.', file=sys.stderr)
+                        print(statsline, file=sys.stderr)
+                    return 0
+                if revision_task is not None:
+                    if VERBOSE:
+                        print(statsline, file=sys.stderr)
+                    json_patch_task = task
+                    task = expand_prompt_names(
+                        revision_task, prompt_expansion_enabled
+                    )
+                    json_patch_responses = [result]
+                    user_prompt = build_user_prompt(
+                        task=task,
+                        context=context,
+                        response_format=response_format,
+                        json_schema=json_schema,
+                        json_patch_responses=json_patch_responses,
+                        json_patch_task=json_patch_task,
+                    )
+                    user_prompt = user_prompt + '\n' + patch_system_prompt
+                    try:
+                        (
+                            result,
+                            statsline,
+                            response_obj,
+                            usage,
+                        ) = call_patch_revision_request(user_prompt)
+                    except Exception as exc:
+                        print(f'API error: {exc}', file=sys.stderr)
+                        return 1
+                    continue
 
-        return 0
+            for fp, ut in updated_texts.items():
+                if ut == original_texts.get(fp, ''):
+                    continue
+                if patch_review:
+                    tgt = (
+                        append_suffix_to_path(Path(fp), patch_suffix)
+                        if suffix_provided
+                        else Path(fp)
+                    )
+                    tgt.write_text(ut, encoding='utf-8')
+                    print(
+                        f'file_written='
+                        f'{str(tgt) if suffix_provided else fp}'
+                    )
+                else:
+                    outp = append_suffix_to_path(Path(fp), patch_suffix)
+                    outp.write_text(ut, encoding='utf-8')
+                    print(f'file_written={outp}')
+
+            if VERBOSE:
+                print(statsline, file=sys.stderr)
+
+            return 0
 
     if response_format in ("json", "schema"):
         try:
