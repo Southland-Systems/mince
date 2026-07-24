@@ -147,7 +147,7 @@ mince -t "Add single-user locking to the provided script. Only output the whole 
   -f taskedit.py -o taskedit-new.py
 ```
 
-Validate structured output against a JSON Schema:
+Validate structured output against the included example JSON Schema:
 
 ```bash
 mince --task "Provide the file name and line count as JSON" \
@@ -313,9 +313,13 @@ Environment variable reference.
 
 ## Usage Notes 🪧
 
-**Prevent incorrect cost calculation when specifying --model:**
+**Prevent incorrect cost calculation when specifying --model**
 
 If token costs are set in the configuration and `--model` is specified, `--token-cost` must also be specified, otherwise the cost calculation will be absent to prevent inaccuracies.
+
+**Patch is writing added lines and nothing else**
+
+If the patch is writing a new file when it should be a diff, this may happen with large context (over 64k), first reset the patch system prompt to default, then try adding instructions like "prepare a text block based patch using the provided JSON schema" or re-word the current task to be more patch oriented.  Lastly try altering the patch system prompt to be more explicit.
 
 ## Make targets 🚀
 

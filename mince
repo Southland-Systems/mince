@@ -57,17 +57,17 @@ CONFIG_FILE = DEFAULT_CONFIG_FILE
 
 DEFAULT_SYSTEM_PROMPT = "You are a concise and technically accurate software engineering assistant."
 DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from the start of each line."
-DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a patch using the provided JSON Schema for one or more text files. Return only JSON that matches the provided schema."
+DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a text block based patch using the provided JSON Schema named `line_replace_manifest` for one or more text files."
 DEFAULT_PLAN_SYSTEM_PROMPT = "Create a clear, self-contained AI prompt for the next step and design it only for the provided context and task. Return only the prompt, without commentary or code fences."
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.6-luna",
     "api_key": "",
-    "openai_base_url": "https://api.openai.com/v1",
-    "openai_proxy": "",
-    "openai_organization": "",
-    "openai_project": "",
-    "openai_service_tier": "off",
+    "base_url": "https://api.openai.com/v1",
+    "proxy_server": "",
+    "meta_organization": "",
+    "meta_project": "",
+    "service_tier": "off",
     "safety_identifier": "",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
@@ -83,7 +83,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "quiet": "off",
     "temperature": "off",
     "top_p": "off",
-    "openai_reasoning": "medium",
+    "reasoning": "medium",
     "reasoning_mode": "standard",
     "print_reasoning": "off",
     "token_limit": 65534,
@@ -94,11 +94,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "stream": "off",
     "response_verbosity": "off",
     "llm_timeout": 300,
-    "openai_extra_body": "",
+    "extra_body": "",
     "log": "on",
     "api_log": "on",
 }
-
+DEPRECATED_CONFIG_KEYS: dict[str, str] = {
+    "openai_base_url": "base_url",
+    "openai_proxy": "proxy_server",
+    "openai_organization": "meta_organization",
+    "openai_project": "meta_project",
+    "openai_service_tier": "service_tier",
+    "openai_reasoning": "reasoning",
+    "openai_extra_body": "extra_body",
+}
 PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "name": "line_replace_manifest",
@@ -183,11 +191,26 @@ def merged_config() -> dict[str, Any]:
             raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 config.update(raw)
+                for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
+                    if deprecated in raw and replacement not in raw:
+                        config[replacement] = raw[deprecated]
         except Exception:
             print(f"ERROR: Failed to parse config: {CONFIG_FILE}", file=sys.stderr)
             raise SystemExit(1)
 
     return config
+
+
+def migrate_deprecated_config(config: dict[str, Any]) -> bool:
+    changed = False
+    for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
+        if deprecated not in config:
+            continue
+        if replacement not in config:
+            config[replacement] = config[deprecated]
+        del config[deprecated]
+        changed = True
+    return changed
 
 
 def ensure_config_exists() -> None:
@@ -578,10 +601,20 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
         raise ValueError("configuration name cannot be empty")
     raw_value = raw_value.strip()
 
-    if raw_value == "DEFAULT":
-        return name, get_default_config_value(name)
+    if name in DEPRECATED_CONFIG_KEYS and name not in config:
+        raise ValueError(
+            f"{name} is deprecated and is not present in the config"
+        )
 
-    expected = DEFAULT_CONFIG[name] if name in DEFAULT_CONFIG else config.get(name)
+    canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+    if raw_value == "DEFAULT":
+        return name, get_default_config_value(canonical_name)
+
+    expected = (
+        DEFAULT_CONFIG[canonical_name]
+        if canonical_name in DEFAULT_CONFIG
+        else config.get(name)
+    )
     if isinstance(expected, int) and not isinstance(expected, bool):
         try:
             return name, int(raw_value)
@@ -656,23 +689,27 @@ def prompt_config_value(
 def init_config_interactive() -> None:
     ensure_config_exists()
     config = load_config()
+    config_document = read_config_document(CONFIG_FILE)
+    if migrate_deprecated_config(config_document):
+        write_config_document(CONFIG_FILE, config_document)
+        config = load_config()
 
     print(
         f"Config file: {CONFIG_FILE}\n"
         f"Use DEFAULT to reset any value. "
         f"Use - to blank text values.\n"
-        f"Syntax for prompt file includes:\n"
+        f"System prompt file include syntax:\n"
         f"  ./prompt_name.md|/path/file|./prompt.md additional text\n"
     )
 
     prompt_config_value(config, "model", "Model")
     prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
-    prompt_config_value(config, "openai_base_url", "OpenAI-compatible base URL")
-    prompt_config_value(config, "openai_proxy", "HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)")
-    prompt_config_value(config, "openai_organization", "Organization name or ID (optional)")
-    prompt_config_value(config, "openai_project", "Project name or ID (optional)")
+    prompt_config_value(config, "base_url", "OpenAI-compatible base URL")
+    prompt_config_value(config, "proxy_server", "HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)")
+    prompt_config_value(config, "meta_organization", "Organization name or ID (optional)")
+    prompt_config_value(config, "meta_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
-    prompt_config_value(config, "openai_service_tier", "Service tier (off, auto, default, flex, scale, priority)")
+    prompt_config_value(config, "service_tier", "Service tier (off, auto, default, flex, scale, priority)")
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
@@ -683,14 +720,14 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "patch_save", "Save patch file to HOME/.local/state/mince/patches (off, on)")
     prompt_config_value(config, "prompt_expansion", "Expand ^^promptname^^ references found in prompts (off, on)")
-    prompt_config_value(config, "temperature", "Temperature (0.0-2.0) or 'off' to disable")
-    prompt_config_value(config, "top_p", "Top P (0.0-1.0) or 'off' to disable")
+    prompt_config_value(config, "temperature", "Temperature (0.0-2.0 or off)")
+    prompt_config_value(config, "top_p", "Top P (0.0-1.0 or off)")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
     prompt_config_value(config, "stream", "Streaming text responses (off, on)")
-    prompt_config_value(config, "openai_reasoning", "Reasoning (off, none, minimal, low, medium, high, xhigh, max)")
+    prompt_config_value(config, "reasoning", "Reasoning (off, none, minimal, low, medium, high, xhigh, max)")
     prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
     prompt_config_value(config, "print_reasoning", "Include reasoning output in <think> tags (off, on)")
-    prompt_config_value(config, "openai_extra_body", "Custom model parameters (key=value pairs separated by commas)")
+    prompt_config_value(config, "extra_body", "Custom model parameters (key=value pairs separated by commas)")
     prompt_config_value(config, "token_limit", "Input token limit", int)
     prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
     prompt_config_value(config, "token_cost", "Token cost per million tokens (input:output, off)")
@@ -1228,7 +1265,6 @@ def _handle_openai_error(exc: Exception) -> None:
         msg = f"OpenAI API internal server error: {exc}"
     else:
         msg = f"Unexpected error: {exc}"
-    print(f"ERROR: {msg}", file=sys.stderr)
     raise exc
 
 
@@ -1851,6 +1887,7 @@ def run_tree_mode(
                     log_file.write("<tree_request_stats>\n")
                     log_file.write(
                         f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+                        f"reasoning={openai_reasoning} reasoning_mode={reasoning_mode} "
                         f"max_output_tokens={max_output_tokens} api_log={api_log} timeout={llm_timeout}\n"
                     )
                     log_file.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
@@ -2202,29 +2239,69 @@ def parse_args() -> argparse.Namespace:
         help="List available models",
     )
     parser.add_argument(
-        "--openai-base-url",
+        "--base-url",
+        dest="base_url",
         metavar="URL",
         help="OpenAI-compatible API base URL",
     )
     parser.add_argument(
-        "--openai-proxy",
+        "--openai-base-url",
+        dest="base_url",
+        metavar="URL",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--proxy-server",
+        dest="proxy_server",
         metavar="URL",
         help="HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)",
     )
     parser.add_argument(
-        "--openai-organization",
+        "--openai-proxy",
+        dest="proxy_server",
+        metavar="URL",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--meta-organization",
+        dest="meta_organization",
         metavar="TEXT",
         help="Optional organization ID",
     )
     parser.add_argument(
-        "--openai-project",
+        "--openai-organization",
+        dest="meta_organization",
+        metavar="TEXT",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--meta-project",
+        dest="meta_project",
         metavar="TEXT",
         help="Optional project name or ID",
     )
     parser.add_argument(
-        "--openai-service-tier",
+        "--openai-project",
+        dest="meta_project",
+        metavar="TEXT",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--service-tier",
+        dest="service_tier",
         choices=("off", "auto", "default", "flex", "scale", "priority"),
         help="Service tier",
+    )
+    parser.add_argument(
+        "--openai-service-tier",
+        dest="service_tier",
+        choices=("off", "auto", "default", "flex", "scale", "priority"),
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--response-format",
@@ -2266,19 +2343,36 @@ def parse_args() -> argparse.Namespace:
         help="Top-p nucleus sampling (0.0-1.0) or 'off' to disable",
     )
     parser.add_argument(
-        "--openai-reasoning",
+        "--reasoning",
+        dest="reasoning",
         choices=("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"),
         help="Reasoning effort level (off to disable)",
     )
     parser.add_argument(
+        "--openai-reasoning",
+        dest="reasoning",
+        choices=("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--reasoning-mode",
         choices=("standard", "pro"),
+        type=str,
         help="Reasoning mode (standard or pro)",
     )
     parser.add_argument(
-        "--openai-extra-body",
+        "--extra-body",
+        dest="extra_body",
         metavar="KEY=VALUE[,KEY=VALUE,...]",
         help="Custom model parameters",
+    )
+    parser.add_argument(
+        "--openai-extra-body",
+        dest="extra_body",
+        metavar="KEY=VALUE[,KEY=VALUE,...]",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--token-limit",
@@ -2587,6 +2681,9 @@ def main() -> int:
 
         for name, value in updates:
             config[name] = value
+            replacement = DEPRECATED_CONFIG_KEYS.get(name)
+            if replacement is not None:
+                config[replacement] = value
         save_config(config)
         return 0
 
@@ -2801,10 +2898,10 @@ def main() -> int:
     )
 
     model = str(args.model or config.get("model")).strip()
-    openai_base_url = str(args.openai_base_url or config.get("openai_base_url")).strip()
-    openai_proxy = str(args.openai_proxy or config.get("openai_proxy", "")).strip()
-    openai_organization = str(args.openai_organization or config.get("openai_organization", "")).strip()
-    openai_project = str(args.openai_project or config.get("openai_project", "")).strip()
+    openai_base_url = str(args.base_url or config.get("base_url")).strip()
+    openai_proxy = str(args.proxy_server or config.get("proxy_server", "")).strip()
+    openai_organization = str(args.meta_organization or config.get("meta_organization", "")).strip()
+    openai_project = str(args.meta_project or config.get("meta_project", "")).strip()
     safety_identifier = config.get("safety_identifier", None)
     api_log = (
         args.no_api_log
@@ -2934,9 +3031,9 @@ def main() -> int:
     )
 
     openai_reasoning = (
-        args.openai_reasoning
-        if args.openai_reasoning is not None
-        else config.get("openai_reasoning", "medium")
+        args.reasoning
+        if args.reasoning is not None
+        else config.get("reasoning", "medium")
     )
     if str(openai_reasoning).strip().lower() == "off":
         print_reasoning = False
@@ -2952,16 +3049,16 @@ def main() -> int:
         return 1
 
     extra_body_raw = (
-        args.openai_extra_body
-        if args.openai_extra_body is not None
-        else config.get("openai_extra_body")
+        args.extra_body
+        if args.extra_body is not None
+        else config.get("extra_body")
     )
     if isinstance(extra_body_raw, dict):
         extra_body = extra_body_raw
     else:
         extra_body = parse_extra_body(str(extra_body_raw or ""))
 
-    openai_service_tier = str(args.openai_service_tier or config.get("openai_service_tier", "off")).strip()
+    openai_service_tier = str(args.service_tier or config.get("service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
     if args.model is not None and args.token_cost is None:
         token_cost_raw = "off"
@@ -3221,12 +3318,12 @@ def main() -> int:
         if log_enabled:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_request>\n")
-                f.write(f"<plan_request_stats>\nrequest_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model}\n</plan_request_stats>\n")
+                f.write(f"<plan_request_stats>\nrequest_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n")
                 f.write(f"<system_prompt>\n{plan_full_system_prompt}\n</system_prompt>\n")
                 f.write(f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n")
                 f.write("</plan_request>\n")
         if VERBOSE:
-            print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} plan_mode", file=sys.stderr)
+            print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
         plan_start_time = time.perf_counter()
         try:
             plan_response_obj, plan_usage = call_openai(
@@ -3337,6 +3434,7 @@ def main() -> int:
             f.write(
                 f"<request_stats>\n"
                 f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+                f"reasoning={openai_reasoning} reasoning_mode={reasoning_mode} "
                 f"max_output_tokens={max_output_tokens} api_log={api_log} temperature={temperature} top_p={top_p} "
                 f"safety_identifier='{safety_identifier}' service_tier={openai_service_tier} base_url='{openai_base_url}' "
                 f"timeout={llm_timeout}\n</request_stats>\n"
@@ -3347,7 +3445,7 @@ def main() -> int:
             f.write("</request>\n")
 
     if VERBOSE:
-        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model}", file=sys.stderr)
+        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
 
     start_time = time.perf_counter()
     stream_file = None
@@ -3404,7 +3502,7 @@ def main() -> int:
         else:
             result = getattr(response_obj, "output_text", "")
     except Exception as exc:
-        print(f"OpenAI API error: {exc}", file=sys.stderr)
+        print(f"API error: {exc}", file=sys.stderr)
         return 1
     finally:
         if stream_file is not None:
