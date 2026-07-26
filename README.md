@@ -3,13 +3,13 @@
 ## What it does ✨
 
 - Answers direct prompts or performs tasks using one or more local files as context
-- Sends requests to an OpenAI-compatible model endpoint
-- Processes files recursively in tree mode, making one request per matched file
+- Sends requests to an OpenAI-compatible model endpoint, including optional local model servers
 - Generates structured multi-file patches with diffs, optional review, and configurable output suffixes
-- Supports text, JSON, JSON Schema Structured Outputs, and streamed text responses
-- Supports configuration profiles, custom system prompts, reasoning controls, and model parameters
-- Provides optional local session logging, API storage controls, usage statistics, and cost estimates
-- Creates a context-controlled, continuously verified workflow and maximizes cost effectiveness
+- Processes files recursively in tree mode with include/exclude filters, concurrent requests, retries, and resumable sessions
+- Supports plan mode plus text, JSON, JSON Schema Structured Outputs, and streamed text responses
+- Supports configuration profiles, reusable prompt-library entries, custom system prompts, reasoning controls, and model parameters
+- Provides optional local session logging, API storage controls, usage statistics, token estimates, and cost estimates
+- Creates a context-controlled, continuously verified workflow that maximizes cost effectiveness
 
 ## Requirements 📦
 
@@ -211,13 +211,12 @@ systemd-run --user -qt -p ProtectSystem=strict \
 # https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
 ```
 
-
 ## Local model servers 🌐
 
 Use any OpenAI‑compatible base URL, including Ollama:
 
 ```bash
-mince ---base-url http://localhost:11434/v1 \
+mince --base-url http://localhost:11434/v1 \
   --task "Summarize the project" \
   --files README.md
 ```
@@ -248,7 +247,7 @@ The `--plan` option asks the model to turn the supplied task and file context in
 
 Tree mode makes one focused request per matched file. Start with `--tree-files` or `--tree-files-list`, then provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, `.git` directories are excluded by default, and `--tree-include` and `--tree-exclude` refine the scope. Requests run concurrently with up to 16 workers by default, adjustable with `--tree-parallel`; transient failures are retried with adaptive concurrency and backoff.
 
-Use `.ext:task`, `*:task`, and unprefixed overall-task lines in `--tree-task-file`. `--tree-system-prompt-file` supports the same extension, wildcard, and overall-prompt selection for system instructions. Per-file results, resumable state, and a consolidated Markdown report are stored under `~/.local/state/mince/trees/SESSION_NAME`. Use `--tree-show-only` to preview the filtered files without API calls, or `--tree-reuse-session NAME` to continue unfinished work. Tree mode cannot be combined with regular ask/task inputs, plan mode, or patch mode.
+Use `.ext:task`, `*:task`, and unprefixed overall-task lines in `--tree-task-file`. `--tree-system-prompt-file` supports the same extension, wildcard, and overall-prompt selection for system instructions. Per-file results, resumable state, and a consolidated Markdown report are stored under `~/.local/state/mince/trees/SESSION_NAME`. Use `--reuse-session NAME` to continue unfinished work. Tree mode cannot be combined with regular ask/task inputs, plan mode, or patch mode.
 
 ### Profiles — save your best operating setup
 
@@ -287,7 +286,7 @@ Create or edit a prompt with `--prompt-edit NAME`, then assign it to a profile w
 
 ## Command line arguments 📋
 
-All `mince` CLI arguments for reference. 
+All public `mince` CLI arguments for reference.
 
 | Argument | Description |
 |----------|-------------|
@@ -309,7 +308,7 @@ All `mince` CLI arguments for reference.
 | `--tree-include PATTERN...` | Include only tree files matching at least one supplied pattern. |
 | `--tree-show-only` | Print the filtered tree file list and exit without making API calls. |
 | `--tree-parallel [N]` | Set the maximum number of concurrent tree requests; default is `16`, and `N` must be at least `1`. |
-| `--tree-reuse-session NAME` | Use the named tree session output and state so unfinished work can be resumed. |
+| `--reuse-session SESSION_NAME [TURN]` | Reuse the named session's saved context and state; optionally select a completed turn. In tree mode, resume unfinished work. |
 | `-p NAME`, `--profile NAME` | Select a configuration profile. |
 | `--log-view SESSION` | Display a saved local log session. |
 | `--patch-view SESSION` | Display a saved patch session. |
@@ -380,16 +379,6 @@ Environment variable reference.
 | `OPENAI_API_KEY` | OpenAI-compatible API key; it overrides the key stored in the selected configuration profile. |
 | `EDITOR` | Editor command used for `e` prompts and interactive plan, patch-review, and prompt editing. |
 
-## Usage Notes 🪧
-
-**Prevent incorrect cost calculation when specifying --model**
-
-If token costs are set in the configuration and `--model` is specified, `--token-cost` must also be specified, otherwise the cost calculation will be absent to prevent inaccuracies.
-
-**Patch is writing added lines and nothing else**
-
-If the patch is writing a new file when it should be a diff, this may happen with large context (over 64k), first reset the patch system prompt to default, then try adding instructions like "prepare a text block based patch using the provided JSON schema" or re-word the current task to be more patch oriented.  Lastly try altering the patch system prompt to be more explicit.
-
 ## Make targets 🚀
 
 The project ships with a **Makefile** that handles both *user* and *system‑wide* installations.
@@ -408,6 +397,16 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make shell` | Drops you into a Bash shell with the correct virtual‑env activated (`source …/bin/activate`). Handy for debugging or ad‑hoc runs. |
 | `make changelog` | Displays the changelog for the last two weeks or last 20 entries. |
 | `make help` | Prints this table and a short description of each target. |
+
+## Usage Notes 🪧
+
+**Prevent incorrect cost calculation when specifying --model**
+
+If token costs are set in the configuration and `--model` is specified, `--token-cost` must also be specified, otherwise the cost calculation will be absent to prevent inaccuracies.
+
+**Patch is writing added lines and nothing else**
+
+If the patch is writing a new file when it should be a diff, this may happen with large context (over 64k), first reset the patch system prompt to default, then try adding instructions like "prepare a text block based patch using the provided JSON schema" or re-word the current task to be more patch oriented.  Lastly try altering the patch system prompt to be more explicit.
 
 ## Known Issues and Reporting ⚠️
 

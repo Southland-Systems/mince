@@ -8,6 +8,7 @@ An assistant for turning local files into useful answers.
 from __future__ import annotations
 
 import os
+import hashlib
 import argparse
 import json
 import math
@@ -299,11 +300,28 @@ def next_state_turn_index(state_session_dir: Path) -> int:
             turn_numbers.append(turn)
     return max(turn_numbers, default=-1) + 1
 
-def last_completed_state_turn(state_session_dir: Path) -> Path:
+def last_completed_state_turn(
+    state_session_dir: Path,
+    turn: int | None = None,
+ ) -> Path:
     if not state_session_dir.is_dir():
         raise ValueError(
             f"state session does not exist: {state_session_dir}"
         )
+    if turn is not None:
+        if turn < 0:
+            raise ValueError("session turn must be non-negative")
+        turn_dir = state_session_dir / str(turn)
+        if (
+            not turn_dir.is_dir()
+            or turn_dir.is_symlink()
+            or not (turn_dir / "response").is_file()
+        ):
+            raise ValueError(
+                f"state session has no completed turn {turn}: "
+                f"{state_session_dir}"
+            )
+        return turn_dir
     turn_dirs: list[tuple[int, Path]] = []
     for entry in state_session_dir.iterdir():
         if not entry.is_dir() or entry.is_symlink():
@@ -323,24 +341,78 @@ def last_completed_state_turn(state_session_dir: Path) -> Path:
         f"state session has no completed turns: {state_session_dir}"
     )
 
-def load_reused_session_context(
+def file_checksum(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def load_reused_session_files(
     state_session_dir: Path,
-    include_patch_history: bool = False,
- ) -> str:
-    turn_dir = last_completed_state_turn(state_session_dir)
-    context_path = state_session_dir / "request_files"
-    response_path = turn_dir / "response"
-    request_task_path = turn_dir / "request_task"
-    if not context_path.is_file():
+ ) -> list[tuple[str, str]]:
+    request_files_path = state_session_dir / "request_files"
+    if not request_files_path.is_file():
         raise ValueError(f"state session has no request_files: {state_session_dir}")
     try:
-        context = context_path.read_text(encoding="utf-8")
+        lines = request_files_path.read_text(encoding="utf-8").splitlines()
     except Exception as exc:
         raise ValueError(
-            f"cannot read reused session context {context_path} ({exc})"
+            f"cannot read reused session files {request_files_path} ({exc})"
         ) from exc
-    if not include_patch_history:
-        return context
+    files: list[tuple[str, str]] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        path_text, separator, checksum = line.rpartition(" ")
+        if (
+            not separator
+            or not path_text
+            or re.fullmatch(r"[0-9a-fA-F]{64}", checksum) is None
+        ):
+            raise ValueError(
+                "reused session request_files entry must contain an "
+                f"absolute path followed by a SHA-256 checksum: {line}"
+            )
+        path = Path(path_text)
+        if not path.is_absolute():
+            raise ValueError(
+                f"reused session request_files contains non-absolute path: {path_text}"
+            )
+        files.append((str(path), checksum.lower()))
+    return files
+
+def verify_reused_session_files(
+    file_records: list[tuple[str, str]],
+ ) -> None:
+    mismatches: list[str] = []
+    for path_text, expected_checksum in file_records:
+        try:
+            current_checksum = file_checksum(Path(path_text))
+        except Exception as exc:
+            mismatches.append(
+                f"{path_text} (cannot read current file for checksum: {exc})"
+            )
+            continue
+        if current_checksum != expected_checksum:
+            mismatches.append(
+                f"{path_text} (expected {expected_checksum}, "
+                f"current {current_checksum})"
+            )
+    if mismatches:
+        raise ValueError(
+            "session context checksums do not match current files: "
+            + "; ".join(mismatches)
+        )
+
+def load_reused_session_patch_history(
+    state_session_dir: Path,
+    turn: int | None = None,
+ ) -> str:
+    turn_dir = last_completed_state_turn(state_session_dir, turn)
+    response_path = turn_dir / "response"
+    request_task_path = turn_dir / "request_task"
     if not request_task_path.is_file():
         raise ValueError(f"completed turn has no request_task: {turn_dir}")
     try:
@@ -350,7 +422,7 @@ def load_reused_session_context(
         raise ValueError(
             f"cannot read reused patch history from {turn_dir} ({exc})"
         ) from exc
-    history = (
+    return (
         "<previous_turn>\n"
         "<request_task>\n"
         f"{previous_task}\n"
@@ -360,14 +432,13 @@ def load_reused_session_context(
         "</response>\n"
         "</previous_turn>"
     )
-    return f"{context.rstrip()}\n\n{history}" if context else history
 
 def start_state_turn(
     state_session_dir: Path,
     turn: int,
     system_prompt: str,
     task: str,
-    context: str,
+    file_paths: list[Path],
  ) -> Path:
     turn_dir = state_session_dir / str(turn)
     turn_dir.mkdir(parents=True, exist_ok=True)
@@ -378,11 +449,18 @@ def start_state_turn(
     for filename, content in state_files:
         (turn_dir / filename).write_text(content, encoding="utf-8")
     request_files_path = state_session_dir / "request_files"
-    try:
-        with request_files_path.open("x", encoding="utf-8") as request_files:
-            request_files.write(context)
-    except FileExistsError:
-        pass
+    if not request_files_path.exists():
+        request_file_lines: list[str] = []
+        for path in file_paths:
+            resolved_path = Path(path).resolve()
+            request_file_lines.append(
+                f"{resolved_path} {file_checksum(resolved_path)}"
+            )
+        try:
+            with request_files_path.open("x", encoding="utf-8") as request_files:
+                request_files.write("\n".join(request_file_lines))
+        except FileExistsError:
+            pass
     return turn_dir
 
 def complete_state_turn(
@@ -1457,16 +1535,6 @@ def build_context(
 
     return "\n".join(sections)
 
-def file_paths_from_context(context: str) -> list[str]:
-    paths: list[str] = []
-    for match in re.finditer(
-        r"<file\s+path=(['\"])(.*?)\1(?:\s|>)",
-        context,
-    ):
-        path = match.group(2).strip()
-        if path and path not in paths:
-            paths.append(path)
-    return paths
 
 
 def load_json_schema(path: Path) -> dict[str, Any]:
@@ -2038,7 +2106,6 @@ def run_tree_mode(
     def start_tree_state_turn(
         system_prompt: str,
         task: str,
-        context: str,
     ) -> Path:
         nonlocal next_state_turn
         with state_turn_lock:
@@ -2049,7 +2116,7 @@ def run_tree_mode(
             turn,
             system_prompt,
             task,
-            context,
+            file_paths=file_paths,
         )
 
     state_db_path = str(tree_session_dir / f"{tree_session_stem}.dbm")
@@ -2156,7 +2223,6 @@ def run_tree_mode(
             state_turn_path = start_tree_state_turn(
                 system_prompt=full_system_prompt,
                 task=selected_task,
-                context=context,
             )
             if request_tokens > token_limit:
                 raise ValueError(
@@ -2482,8 +2548,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reuse-session",
-        metavar="SESSION_NAME",
-        help="Load context from the last completed turn of an existing session",
+        nargs="+",
+        metavar=("SESSION_NAME", "TURN"),
+        help=(
+            "Load context from the last completed turn of an existing "
+            "session (optionally at TURN)"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-session-skip-verify",
+        action="store_true",
+        help="Skip checksum verification when reusing a session",
     )
     tree_files_group = parser.add_mutually_exclusive_group()
     tree_files_group.add_argument(
@@ -2554,8 +2629,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tree-reuse-session",
+        dest="reuse_session",
         metavar="NAME",
-        help="Specify the session name for completion if unfinished",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
     )
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
@@ -2970,7 +3047,30 @@ def main() -> int:
     global DEBUG
 
     args = parse_args()
-
+    reuse_session_turn: int | None = None
+    if isinstance(args.reuse_session, list):
+        if len(args.reuse_session) > 2:
+            print(
+                "ERROR: --reuse-session accepts SESSION_NAME and optional TURN",
+                file=sys.stderr,
+            )
+            return 1
+        if len(args.reuse_session) == 2:
+            try:
+                reuse_session_turn = int(args.reuse_session[1])
+            except ValueError:
+                print(
+                    "ERROR: --reuse-session TURN must be an integer",
+                    file=sys.stderr,
+                )
+                return 1
+        args.reuse_session = args.reuse_session[0]
+    if reuse_session_turn is not None and reuse_session_turn < 0:
+        print(
+            "ERROR: --reuse-session TURN must be non-negative",
+            file=sys.stderr,
+        )
+        return 1
     if args.remove_expired_data is not None:
         return handle_remove_expired_data(args.remove_expired_data)
 
@@ -3177,14 +3277,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if tree_mode:
-            print(
-                "ERROR: --reuse-session cannot be combined with tree mode; "
-                "use --tree-reuse-session",
-                file=sys.stderr,
-            )
-            return 1
-        if args.task is None and args.task_file is None:
+        if not tree_mode and args.task is None and args.task_file is None:
             print(
                 "ERROR: --reuse-session requires --task or --task-file",
                 file=sys.stderr,
@@ -3597,16 +3690,14 @@ def main() -> int:
     session_rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
     session_stem = f"{base_profile}-{session_timestamp}-{session_rand_part}"
     reuse_session_name: str | None = None
-    reused_context: str | None = None
+    reused_patch_history: str | None = None
     if args.reuse_session is not None:
         try:
             reuse_session_name = validate_session_name(args.reuse_session)
         except ValueError as exc:
             print(f"ERROR: Invalid reuse session name: {exc}", file=sys.stderr)
             return 1
-    if tree_mode and args.tree_reuse_session:
-        state_session_dir = STATE_DIR / args.tree_reuse_session
-    elif reuse_session_name is not None:
+    if reuse_session_name is not None:
         state_session_dir = STATE_DIR / reuse_session_name
     else:
         state_session_dir = STATE_DIR / session_stem
@@ -3614,10 +3705,22 @@ def main() -> int:
     if state_enabled:
         if reuse_session_name is not None:
             try:
-                reused_context = load_reused_session_context(
-                    state_session_dir,
-                    include_patch_history=patch_mode,
+                reused_file_records = load_reused_session_files(
+                    state_session_dir
                 )
+                if not args.reuse_session_skip_verify:
+                    verify_reused_session_files(reused_file_records)
+                if not tree_mode:
+                    reused_file_names = [
+                        path for path, _ in reused_file_records
+                    ]
+                    if not file_names:
+                        file_names = reused_file_names
+                    if patch_mode:
+                        reused_patch_history = load_reused_session_patch_history(
+                            state_session_dir,
+                            turn=reuse_session_turn,
+                        )
             except ValueError as exc:
                 print(
                     f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
@@ -3691,8 +3794,9 @@ def main() -> int:
                 return 1
             used_relative_paths.add(relative_path)
             tree_relative_paths[tree_file_path] = relative_path
-        tree_reuse_session = getattr(args, "tree_reuse_session", None)
-        tree_session_stem = tree_reuse_session if tree_reuse_session else session_stem
+        tree_session_stem = (
+            reuse_session_name if reuse_session_name is not None else session_stem
+        )
         tree_session_dir = APP_DIR / "trees" / tree_session_stem
         tree_state_session_dir = STATE_DIR / tree_session_stem
         combined_tree_path = tree_session_dir / f"{tree_session_stem}.md"
@@ -3760,15 +3864,18 @@ def main() -> int:
             )
         full_system_prompt = system_prompt
     else:
-        if reused_context is not None:
-            context = reused_context
-        else:
-            max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
-            file_paths = [Path(f).resolve() for f in file_names]
-            context = build_context(
-                file_paths=file_paths,
-                max_file_size_kb=max_file_size_kb,
-                add_line_numbers=add_line_numbers
+        file_paths=[Path(f).resolve() for f in file_names]
+        max_file_size_kb=coerce_int(config.get("max_file_size_kb", 512), 512)
+        context = build_context(
+            file_paths=file_paths,
+            max_file_size_kb=max_file_size_kb,
+            add_line_numbers=add_line_numbers
+        )
+        if reused_patch_history:
+            context = (
+                f"{context.rstrip()}\n\n{reused_patch_history}"
+                if context
+                else reused_patch_history
             )
         if add_line_numbers or patch_mode:
             full_system_prompt = (linenum_system_prompt + "\n" + system_prompt)
@@ -3781,8 +3888,6 @@ def main() -> int:
             json_schema=json_schema,
         )
         if patch_mode:
-            if not file_names and reused_context is not None:
-                file_names = file_paths_from_context(context)
             if not file_names:
                 print("ERROR: Patch mode requires readable input files.", file=sys.stderr)
                 return 1
@@ -3837,7 +3942,7 @@ def main() -> int:
             state_turn,
             plan_full_system_prompt,
             task,
-            context,
+            file_paths=file_paths,
         )
         state_turn += 1
         if log_enabled:
@@ -3991,7 +4096,7 @@ def main() -> int:
             state_turn,
             full_system_prompt,
             state_task,
-            context,
+            file_paths=file_paths,
         )
         state_turn += 1
     start_time = time.perf_counter()
@@ -4129,7 +4234,7 @@ def main() -> int:
             state_turn,
             full_system_prompt,
             task,
-            revision_state_context,
+            file_paths=file_paths,
         )
         state_turn += 1
         if log_enabled:
