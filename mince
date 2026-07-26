@@ -2,7 +2,7 @@
 """
 mince
 
-A small, single-command assistant for turning local files into useful answers.
+An assistant for turning local files into useful answers.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ VERBOSE = 1
 DEBUG = 0
 
 APP_DIR = Path.home() / ".local/state/mince"
+STATE_DIR = APP_DIR / "state"
 DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
 CONFIG_FILE = DEFAULT_CONFIG_FILE
 
@@ -282,6 +283,121 @@ def validate_session_name(name: str) -> str:
     ):
         raise ValueError("invalid session name")
     return name
+
+def next_state_turn_index(state_session_dir: Path) -> int:
+    if not state_session_dir.is_dir():
+        return 0
+    turn_numbers: list[int] = []
+    for entry in state_session_dir.iterdir():
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            turn = int(entry.name)
+        except ValueError:
+            continue
+        if turn >= 0:
+            turn_numbers.append(turn)
+    return max(turn_numbers, default=-1) + 1
+
+def last_completed_state_turn(state_session_dir: Path) -> Path:
+    if not state_session_dir.is_dir():
+        raise ValueError(
+            f"state session does not exist: {state_session_dir}"
+        )
+    turn_dirs: list[tuple[int, Path]] = []
+    for entry in state_session_dir.iterdir():
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            turn = int(entry.name)
+        except ValueError:
+            continue
+        if turn >= 0:
+            turn_dirs.append((turn, entry))
+    for _, turn_dir in sorted(
+        turn_dirs, key=lambda item: item[0], reverse=True
+    ):
+        if (turn_dir / "response").is_file():
+            return turn_dir
+    raise ValueError(
+        f"state session has no completed turns: {state_session_dir}"
+    )
+
+def load_reused_session_context(
+    state_session_dir: Path,
+    include_patch_history: bool = False,
+ ) -> str:
+    turn_dir = last_completed_state_turn(state_session_dir)
+    context_path = state_session_dir / "request_files"
+    response_path = turn_dir / "response"
+    request_task_path = turn_dir / "request_task"
+    if not context_path.is_file():
+        raise ValueError(f"state session has no request_files: {state_session_dir}")
+    try:
+        context = context_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError(
+            f"cannot read reused session context {context_path} ({exc})"
+        ) from exc
+    if not include_patch_history:
+        return context
+    if not request_task_path.is_file():
+        raise ValueError(f"completed turn has no request_task: {turn_dir}")
+    try:
+        previous_task = request_task_path.read_text(encoding="utf-8")
+        previous_response = response_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError(
+            f"cannot read reused patch history from {turn_dir} ({exc})"
+        ) from exc
+    history = (
+        "<previous_turn>\n"
+        "<request_task>\n"
+        f"{previous_task}\n"
+        "</request_task>\n"
+        "<response>\n"
+        f"{previous_response}\n"
+        "</response>\n"
+        "</previous_turn>"
+    )
+    return f"{context.rstrip()}\n\n{history}" if context else history
+
+def start_state_turn(
+    state_session_dir: Path,
+    turn: int,
+    system_prompt: str,
+    task: str,
+    context: str,
+ ) -> Path:
+    turn_dir = state_session_dir / str(turn)
+    turn_dir.mkdir(parents=True, exist_ok=True)
+    state_files = (
+        ("request_system_prompt", system_prompt),
+        ("request_task", task),
+    )
+    for filename, content in state_files:
+        (turn_dir / filename).write_text(content, encoding="utf-8")
+    request_files_path = state_session_dir / "request_files"
+    try:
+        with request_files_path.open("x", encoding="utf-8") as request_files:
+            request_files.write(context)
+    except FileExistsError:
+        pass
+    return turn_dir
+
+def complete_state_turn(
+    turn_dir: Path,
+    reasoning: str,
+    response: str,
+ ) -> None:
+    (turn_dir / "response_reasoning").write_text(
+        reasoning,
+        encoding="utf-8",
+    )
+    (turn_dir / "response").write_text(
+        response,
+        encoding="utf-8",
+    )
 
 def prompt_file_path(name: str) -> Path:
     return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
@@ -865,7 +981,7 @@ def handle_remove_expired_data(keep_days: int) -> int:
     removed_count = 0
     errors: list[str] = []
 
-    for directory_name in ("logs", "patches", "trees"):
+    for directory_name in ("logs", "patches", "trees", "state"):
         data_directory = APP_DIR / directory_name
         if not data_directory.is_dir():
             continue
@@ -1341,6 +1457,17 @@ def build_context(
 
     return "\n".join(sections)
 
+def file_paths_from_context(context: str) -> list[str]:
+    paths: list[str] = []
+    for match in re.finditer(
+        r"<file\s+path=(['\"])(.*?)\1(?:\s|>)",
+        context,
+    ):
+        path = match.group(2).strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
 
 def load_json_schema(path: Path) -> dict[str, Any]:
     try:
@@ -1812,7 +1939,7 @@ def tree_result_relative_path(path: Path, roots: list[Path]) -> Path:
 
 
 
-def _tree_reasoning(response_obj: Any) -> str:
+def response_reasoning_text(response_obj: Any) -> str:
     reasoning = ""
     try:
         for item in getattr(response_obj, "output", []):
@@ -1829,6 +1956,9 @@ def _tree_reasoning(response_obj: Any) -> str:
     except Exception:
         return ""
     return str(reasoning or "")
+
+def _tree_reasoning(response_obj: Any) -> str:
+    return response_reasoning_text(response_obj)
 
 
 
@@ -1893,6 +2023,7 @@ def run_tree_mode(
     token_cost: tuple[float, float] | None,
     print_reasoning: bool,
     tree_session_dir: Path,
+    state_session_dir: Path,
     combined_tree_path: Path,
     log_enabled: bool,
     log_path: Path | None,
@@ -1901,6 +2032,26 @@ def run_tree_mode(
     log_lock = threading.Lock()
     db_lock = threading.Lock()
     records: list[dict[str, Any]] = []
+    state_turn_lock = threading.Lock()
+    next_state_turn = next_state_turn_index(state_session_dir)
+
+    def start_tree_state_turn(
+        system_prompt: str,
+        task: str,
+        context: str,
+    ) -> Path:
+        nonlocal next_state_turn
+        with state_turn_lock:
+            turn = next_state_turn
+            next_state_turn += 1
+        return start_state_turn(
+            state_session_dir,
+            turn,
+            system_prompt,
+            task,
+            context,
+        )
+
     state_db_path = str(tree_session_dir / f"{tree_session_stem}.dbm")
     rel_to_path: dict[str, Path] = {}
     for fp in file_paths:
@@ -1970,6 +2121,7 @@ def run_tree_mode(
         response_obj: Any = None
         error_text: str | None = None
         error_type: str = "none"
+        state_turn_path: Path | None = None
         start_time = time.perf_counter()
         try:
             context = build_context(
@@ -2001,6 +2153,11 @@ def run_tree_mode(
             request_characters = len(full_system_prompt + user_prompt)
             if token_cost is not None:
                 request_cost_log = f" request_cost_estimate={request_tokens * token_cost[0] / 1_000_000:.4f}"
+            state_turn_path = start_tree_state_turn(
+                system_prompt=full_system_prompt,
+                task=selected_task,
+                context=context,
+            )
             if request_tokens > token_limit:
                 raise ValueError(
                     f"Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})"
@@ -2053,6 +2210,9 @@ def run_tree_mode(
         stored_result = result
         if not stored_result:
             stored_result = f"ERROR: {error_text}" if error_text else ""
+        if state_turn_path is not None:
+            state_response = result if result else (f"ERROR: {error_text}" if error_text else "")
+            complete_state_turn(state_turn_path, reasoning, state_response)
         if print_reasoning:
             stored_result = f"<think>\n{reasoning}\n</think>\n\n{stored_result}"
         output_error: str | None = None
@@ -2274,6 +2434,57 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Read context file paths from a file (one file per line)",
     )
+    parser.add_argument(
+        "-p",
+        "--profile",
+        metavar="NAME",
+        help="Select configuration profile",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        metavar="FILE",
+        type=Path,
+        help="Write the response to the given file (overwrites if it exists)",
+    )
+    parser.add_argument(
+        "--patch",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Patch specified files and write changes to the filename + patch suffix",
+    )
+    parser.add_argument(
+        "--patch-review",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",
+    )
+    parser.add_argument(
+        "-S",
+        "--patch-suffix",
+        type=str,
+        help="Suffix for patched files (default: .mcepatched)",
+    )
+    parser.add_argument(
+        "--patch-save",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Save patch file to HOME/.local/state/mince/patches (default: on)",
+    )
+    parser.add_argument(
+        "--reuse-session",
+        metavar="SESSION_NAME",
+        help="Load context from the last completed turn of an existing session",
+    )
     tree_files_group = parser.add_mutually_exclusive_group()
     tree_files_group.add_argument(
         "--tree-files",
@@ -2345,86 +2556,6 @@ def parse_args() -> argparse.Namespace:
         "--tree-reuse-session",
         metavar="NAME",
         help="Specify the session name for completion if unfinished",
-    )
-    parser.add_argument(
-        "-p",
-        "--profile",
-        metavar="NAME",
-        help="Select configuration profile",
-    )
-    session_view_group = parser.add_mutually_exclusive_group()
-    session_view_group.add_argument(
-        "--log-view",
-        metavar="SESSION",
-        help="Display a saved log session",
-    )
-    session_view_group.add_argument(
-        "--patch-view",
-        metavar="SESSION",
-        help="Display a saved patch session",
-    )
-    session_view_group.add_argument(
-        "--tree-view",
-        metavar="SESSION",
-        help="Display a saved combined tree manifest",
-    )
-    session_view_group.add_argument(
-        "--remove-expired-data",
-        nargs="?",
-        const=60,
-        default=None,
-        type=int,
-        metavar="KEEP_DAYS",
-        help="Delete session data older than KEEP_DAYS days (default: 60)",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-file",
-        metavar="FILE",
-        type=Path,
-        help="Write the response to the given file (overwrites if it exists)",
-    )
-    parser.add_argument(
-        "--patch",
-        nargs="?",
-        const=True,
-        default=None,
-        type=parse_bool,
-        metavar="BOOL",
-        help="Patch specified files and write changes to the filename + patch suffix",
-    )
-    parser.add_argument(
-        "--patch-review",
-        nargs="?",
-        const=True,
-        default=None,
-        type=parse_bool,
-        metavar="BOOL",
-        help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",
-    )
-    parser.add_argument(
-        "-S",
-        "--patch-suffix",
-        type=str,
-        help="Suffix for patched files (default: .mcepatched)",
-    )
-    parser.add_argument(
-        "--patch-save",
-        nargs="?",
-        const=True,
-        default=None,
-        type=parse_bool,
-        metavar="BOOL",
-        help="Save patch file to HOME/.local/state/mince/patches (default: on)",
-    )
-    parser.add_argument(
-        "--prompt-expansion",
-        nargs="?",
-        const=True,
-        default=None,
-        type=parse_bool,
-        metavar="BOOL",
-        help="Expand ^^promptname^^ references using the prompt library (default: off)",
     )
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
@@ -2786,6 +2917,40 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME",
         help="Print stored prompt NAME",
     )
+    parser.add_argument(
+        "--prompt-expansion",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Expand ^^promptname^^ references using the prompt library (default: off)",
+    )
+    session_view_group = parser.add_mutually_exclusive_group()
+    session_view_group.add_argument(
+        "--log-view",
+        metavar="SESSION",
+        help="Display a saved log session",
+    )
+    session_view_group.add_argument(
+        "--patch-view",
+        metavar="SESSION",
+        help="Display a saved patch session",
+    )
+    session_view_group.add_argument(
+        "--tree-view",
+        metavar="SESSION",
+        help="Display a saved combined tree manifest",
+    )
+    session_view_group.add_argument(
+        "--remove-expired-data",
+        nargs="?",
+        const=60,
+        default=None,
+        type=int,
+        metavar="KEEP_DAYS",
+        help="Delete session data older than KEEP_DAYS days (default: 60)",
+    )
     return parser.parse_args()
 
 # -------------------------------------------------------------------
@@ -3003,7 +3168,28 @@ def main() -> int:
 
 
     ask_mode: bool = args.ask is not None or args.ask_file is not None
+    state_enabled = not ask_mode
     tree_mode = args.tree_files is not None or args.tree_files_list is not None
+    if args.reuse_session is not None:
+        if ask_mode:
+            print(
+                "ERROR: --reuse-session requires --task or --task-file",
+                file=sys.stderr,
+            )
+            return 1
+        if tree_mode:
+            print(
+                "ERROR: --reuse-session cannot be combined with tree mode; "
+                "use --tree-reuse-session",
+                file=sys.stderr,
+            )
+            return 1
+        if args.task is None and args.task_file is None:
+            print(
+                "ERROR: --reuse-session requires --task or --task-file",
+                file=sys.stderr,
+            )
+            return 1
     tree_exclude_git = (
         args.tree_exclude_git
         if args.tree_exclude_git is not None
@@ -3053,6 +3239,12 @@ def main() -> int:
         else:
             print("ERROR: --ask or --task required (--help for help)", file=sys.stderr)
             return 1
+        if args.reuse_session is not None and not task:
+            print(
+                "ERROR: --reuse-session requires a non-empty task",
+                file=sys.stderr,
+            )
+            return 1
 
         if args.files_list:
             try:
@@ -3063,7 +3255,7 @@ def main() -> int:
         elif args.files:
             file_names = args.files
 
-        if not file_names:
+        if not file_names and args.reuse_session is None:
             print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
             return 1
     else:
@@ -3404,6 +3596,43 @@ def main() -> int:
     session_timestamp = int(time.time())
     session_rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
     session_stem = f"{base_profile}-{session_timestamp}-{session_rand_part}"
+    reuse_session_name: str | None = None
+    reused_context: str | None = None
+    if args.reuse_session is not None:
+        try:
+            reuse_session_name = validate_session_name(args.reuse_session)
+        except ValueError as exc:
+            print(f"ERROR: Invalid reuse session name: {exc}", file=sys.stderr)
+            return 1
+    if tree_mode and args.tree_reuse_session:
+        state_session_dir = STATE_DIR / args.tree_reuse_session
+    elif reuse_session_name is not None:
+        state_session_dir = STATE_DIR / reuse_session_name
+    else:
+        state_session_dir = STATE_DIR / session_stem
+    state_turn = 0
+    if state_enabled:
+        if reuse_session_name is not None:
+            try:
+                reused_context = load_reused_session_context(
+                    state_session_dir,
+                    include_patch_history=patch_mode,
+                )
+            except ValueError as exc:
+                print(
+                    f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+        try:
+            state_session_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print(
+                f"ERROR: Failed to create state directory {state_session_dir}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        state_turn = next_state_turn_index(state_session_dir)
     if log_enabled:
         LOG_DIR = APP_DIR / "logs"
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -3465,11 +3694,13 @@ def main() -> int:
         tree_reuse_session = getattr(args, "tree_reuse_session", None)
         tree_session_stem = tree_reuse_session if tree_reuse_session else session_stem
         tree_session_dir = APP_DIR / "trees" / tree_session_stem
+        tree_state_session_dir = STATE_DIR / tree_session_stem
         combined_tree_path = tree_session_dir / f"{tree_session_stem}.md"
         try:
             tree_session_dir.mkdir(parents=True, exist_ok=True)
+            tree_state_session_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            print(f"ERROR: Failed to create tree output directory {tree_session_dir}: {exc}", file=sys.stderr)
+            print(f"ERROR: Failed to create tree output/state directory {tree_session_dir}: {exc}", file=sys.stderr)
             return 1
         max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
         if VERBOSE:
@@ -3508,6 +3739,7 @@ def main() -> int:
             token_cost=token_cost,
             print_reasoning=print_reasoning,
             tree_session_dir=tree_session_dir,
+            state_session_dir=tree_state_session_dir,
             combined_tree_path=combined_tree_path,
             log_enabled=log_enabled,
             log_path=log_path,
@@ -3528,13 +3760,16 @@ def main() -> int:
             )
         full_system_prompt = system_prompt
     else:
-        max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
-        file_paths = [Path(f).resolve() for f in file_names]
-        context = build_context(
-            file_paths=file_paths,
-            max_file_size_kb=max_file_size_kb,
-            add_line_numbers=add_line_numbers
-        )
+        if reused_context is not None:
+            context = reused_context
+        else:
+            max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
+            file_paths = [Path(f).resolve() for f in file_names]
+            context = build_context(
+                file_paths=file_paths,
+                max_file_size_kb=max_file_size_kb,
+                add_line_numbers=add_line_numbers
+            )
         if add_line_numbers or patch_mode:
             full_system_prompt = (linenum_system_prompt + "\n" + system_prompt)
         else:
@@ -3546,6 +3781,11 @@ def main() -> int:
             json_schema=json_schema,
         )
         if patch_mode:
+            if not file_names and reused_context is not None:
+                file_names = file_paths_from_context(context)
+            if not file_names:
+                print("ERROR: Patch mode requires readable input files.", file=sys.stderr)
+                return 1
             original_texts: dict[str, str] = {}
             for f in file_names:
                 try:
@@ -3592,6 +3832,14 @@ def main() -> int:
         if plan_request_tokens > token_limit:
             print(f"ERROR: Estimated plan input token count ({plan_request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
             return 1
+        plan_state_turn_path = start_state_turn(
+            state_session_dir,
+            state_turn,
+            plan_full_system_prompt,
+            task,
+            context,
+        )
+        state_turn += 1
         if log_enabled:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_request>\n")
@@ -3602,6 +3850,7 @@ def main() -> int:
         if VERBOSE:
             print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
         plan_start_time = time.perf_counter()
+        plan_response_obj: Any = None
         try:
             plan_response_obj, plan_usage = call_openai(
                 api_key=api_key,
@@ -3629,9 +3878,12 @@ def main() -> int:
             )
             plan_result = str(getattr(plan_response_obj, "output_text", "") or "").strip()
         except Exception as exc:
+            complete_state_turn(plan_state_turn_path, "", f"ERROR: {exc}")
             print(f"API error: {exc}", file=sys.stderr)
             return 1
         plan_elapsed = time.perf_counter() - plan_start_time
+        plan_reasoning = response_reasoning_text(plan_response_obj)
+        complete_state_turn(plan_state_turn_path, plan_reasoning, plan_result)
         if not plan_result:
             print("ERROR: LLM returned an empty AI prompt plan", file=sys.stderr)
             return 1
@@ -3731,6 +3983,17 @@ def main() -> int:
     if VERBOSE:
         print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
 
+    state_turn_path: Path | None = None
+    if state_enabled:
+        state_task = task
+        state_turn_path = start_state_turn(
+            state_session_dir,
+            state_turn,
+            full_system_prompt,
+            state_task,
+            context,
+        )
+        state_turn += 1
     start_time = time.perf_counter()
     stream_file = None
     stream_output_emitted = False
@@ -3786,6 +4049,8 @@ def main() -> int:
         else:
             result = getattr(response_obj, "output_text", "")
     except Exception as exc:
+        if state_turn_path is not None:
+            complete_state_turn(state_turn_path, "", f"ERROR: {exc}")
         print(f"API error: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -3795,20 +4060,13 @@ def main() -> int:
     elapsed = time.perf_counter() - start_time
     response_cost = response_cost_line(token_cost, usage)
 
-    try:
-        for item in getattr(response_obj, "output", []):
-            if getattr(item, "type", None) == "reasoning":
-                for content in getattr(item, "content", []):
-                    if getattr(content, "type", None) == "reasoning_text":
-                        reasoning = getattr(content, "text", "")
-        if not reasoning:
-            for item in getattr(response_obj, "output", []):
-                if getattr(item, "type", None) == "reasoning":
-                    for content in getattr(item, "summary", []):
-                        if getattr(content, "type", None) == "summary_text":
-                            reasoning = getattr(content, "text", "")
-    except:
-        reasoning = ""
+    reasoning = response_reasoning_text(response_obj)
+    if state_turn_path is not None:
+        complete_state_turn(
+            state_turn_path,
+            reasoning,
+            str(result or ""),
+        )
 
     statsline = print_stats(
         session_name=session_stem,
@@ -3831,6 +4089,7 @@ def main() -> int:
     def call_patch_revision_request(
         revision_user_prompt: str,
     ) -> tuple[str, str, Any, dict[str, Any] | None]:
+        nonlocal state_turn
         revision_request_tokens = (
             estimate_request_tokens(
                 model=model,
@@ -3853,6 +4112,26 @@ def main() -> int:
                 f'Estimated input token count ({revision_request_tokens}) exceeds '
                 f'token limit ({token_limit})'
             )
+        revision_state_context = context
+        if json_patch_responses:
+            revision_state_context += "\n"
+            if json_patch_task is not None:
+                revision_state_context += (
+                    f"<json_patch_task>\n{json_patch_task}\n"
+                    f"</json_patch_task>\n"
+                )
+            revision_state_context += (
+                f"<json_patch>\n{json_patch_responses[-1]}\n"
+                f"</json_patch>"
+            )
+        revision_state_turn_path = start_state_turn(
+            state_session_dir,
+            state_turn,
+            full_system_prompt,
+            task,
+            revision_state_context,
+        )
+        state_turn += 1
         if log_enabled:
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(
@@ -3914,6 +4193,12 @@ def main() -> int:
             getattr(revision_response_obj, 'output_text', '') or ''
         )
         revision_elapsed = time.perf_counter() - revision_start_time
+        revision_reasoning = response_reasoning_text(revision_response_obj)
+        complete_state_turn(
+            revision_state_turn_path,
+            revision_reasoning,
+            revision_result,
+        )
         revision_statsline = print_stats(
             session_name=session_stem,
             request_characters=revision_request_characters,

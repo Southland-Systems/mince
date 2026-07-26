@@ -159,6 +159,7 @@ Prepend the prompt-library entry to the default system prompt:
 ```bash
 mince --prompt-assign review config system
 mince --get-config system_prompt
+```
 
 Read an ask prompt from standard input:
 
@@ -408,7 +409,21 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make changelog` | Displays the changelog for the last two weeks or last 20 entries. |
 | `make help` | Prints this table and a short description of each target. |
 
-## Reporting Issues ⚠️
+## Known Issues and Reporting ⚠️
+
+**Command line arguments may clash**
+
+Mixing combinations of command line arguments may lead to unexpected behaviour.
+
+**Logging and stats**
+
+Logging and stats have minor issues and will be improved over time (missing multi-turn cost calculation).
+
+**Duplicate script logic, poor runtime state handling**
+
+Script requires a refactor to reduce duplication, global state to reduce complexity and more robust error handling.
+
+**Reporting Issues**
 
 Create an Issue on GitHub or fill out the contact form on https://southlandsys.com or email contact@southlandsys.com (no reply will be given). Include as much detail as possible to ensure the issue is resolved.
 
