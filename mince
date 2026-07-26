@@ -1113,7 +1113,15 @@ def edit_text(text: str, suffix: str = ".txt") -> str:
 
 def read_prompt_argument(value: str | list[str]) -> str:
     if isinstance(value, list):
-        value = " ".join(value)
+        if len(value) == 1:
+            value = value[0]
+        else:
+            value = " ".join(value)
+    if value == "e":
+        edited_text = edit_text("").strip()
+        if not edited_text:
+            raise ValueError("Aborted")
+        return edited_text
     if value == "-":
         return sys.stdin.read().strip()
     return value.strip()
@@ -2109,7 +2117,7 @@ def parse_args() -> argparse.Namespace:
         "--ask",
         metavar="TEXT",
         type=str,
-        help="Prompt without file context or the configured system prompt (use - to read from STDIN)",
+        help="Prompt without file context or the configured system prompt (use - for STDIN or e to edit)",
     )
     mode_group.add_argument(
         "--ask-file",
@@ -2121,7 +2129,7 @@ def parse_args() -> argparse.Namespace:
         "-t",
         "--task",
         metavar="TEXT",
-        help="Task/prompt for the model with file context (use - to read from STDIN)",
+        help="Task/prompt for the model with file context (use - for STDIN or e to edit)",
     )
     mode_group.add_argument(
         "--task-file",
@@ -2169,7 +2177,7 @@ def parse_args() -> argparse.Namespace:
         "--tree-task",
         nargs="+",
         metavar="TEXT",
-        help="Task/prompt for tree mode (use - to read from STDIN)",
+        help="Task/prompt for tree mode (use - for STDIN or e to edit)",
     )
     tree_task_group.add_argument(
         "--tree-task-file",
@@ -3449,7 +3457,7 @@ def main() -> int:
             )
             plan_result = str(getattr(plan_response_obj, "output_text", "") or "").strip()
         except Exception as exc:
-            print(f"OpenAI API error while creating plan: {exc}", file=sys.stderr)
+            print(f"API error: {exc}", file=sys.stderr)
             return 1
         plan_elapsed = time.perf_counter() - plan_start_time
         if not plan_result:
