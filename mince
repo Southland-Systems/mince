@@ -16,6 +16,7 @@ import time
 import re
 import shlex
 import subprocess
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -728,7 +729,7 @@ def init_config_interactive() -> None:
         f"Use DEFAULT to reset any value. "
         f"Use - to blank text values.\n"
         f"System prompt file include syntax:\n"
-        f"  ./prompt_name.md|/path/file|./prompt.md additional text\n"
+        f"./prompt_name.md|/path/file|./prompt.md additional text\n\n"
     )
 
     prompt_config_value(config, "model", "Model")
@@ -828,7 +829,11 @@ def handle_session_view(view_type: str, session_name: str) -> int:
     try:
         session_name = validate_session_name(session_name)
         directory, suffix = view_specs[view_type]
-        path = APP_DIR / directory / f"{session_name}{suffix}"
+        path = (
+            APP_DIR / "trees" / session_name / f"{session_name}.md"
+            if view_type == "tree"
+            else APP_DIR / directory / f"{session_name}{suffix}"
+        )
         if not path.is_file():
             raise ValueError(f"session file does not exist: {path}")
         pydoc.pager(path.read_text(encoding="utf-8"))
@@ -840,6 +845,56 @@ def handle_session_view(view_type: str, session_name: str) -> int:
         return 1
     return 0
 
+def session_timestamp_from_name(name: str) -> int | None:
+    name_parts = name.split("-")
+    if len(name_parts) < 3:
+        return None
+    try:
+        timestamp = int(name_parts[-2])
+    except ValueError:
+        return None
+    return timestamp
+
+
+def handle_remove_expired_data(keep_days: int) -> int:
+    if keep_days < 0:
+        print("ERROR: KEEP_DAYS must be non-negative.", file=sys.stderr)
+        return 1
+
+    cutoff_timestamp = time.time() - keep_days * 24 * 60 * 60
+    removed_count = 0
+    errors: list[str] = []
+
+    for directory_name in ("logs", "patches", "trees"):
+        data_directory = APP_DIR / directory_name
+        if not data_directory.is_dir():
+            continue
+        try:
+            entries = sorted(data_directory.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            errors.append(f"{data_directory}: {exc}")
+            continue
+
+        for entry in entries:
+            timestamp = session_timestamp_from_name(entry.name)
+            if timestamp is None or timestamp >= cutoff_timestamp:
+                continue
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                removed_count += 1
+            except OSError as exc:
+                errors.append(f"{entry}: {exc}")
+
+    if errors:
+        for error in errors:
+            print(f"ERROR: Failed to remove expired data {error}", file=sys.stderr)
+        return 1
+
+    print(f"expired_data_removed={removed_count} keep_days={keep_days}")
+    return 0
 
 # -------------------------------------------------------------------
 # Patch helpers
@@ -1846,7 +1901,7 @@ def run_tree_mode(
     log_lock = threading.Lock()
     db_lock = threading.Lock()
     records: list[dict[str, Any]] = []
-    state_db_path = str(tree_session_dir) + ".dbm"
+    state_db_path = str(tree_session_dir / f"{tree_session_stem}.dbm")
     rel_to_path: dict[str, Path] = {}
     for fp in file_paths:
         rel = relative_paths[fp].as_posix()
@@ -2313,6 +2368,15 @@ def parse_args() -> argparse.Namespace:
         metavar="SESSION",
         help="Display a saved combined tree manifest",
     )
+    session_view_group.add_argument(
+        "--remove-expired-data",
+        nargs="?",
+        const=60,
+        default=None,
+        type=int,
+        metavar="KEEP_DAYS",
+        help="Delete session data older than KEEP_DAYS days (default: 60)",
+    )
     parser.add_argument(
         "-o",
         "--output-file",
@@ -2741,6 +2805,9 @@ def main() -> int:
     global DEBUG
 
     args = parse_args()
+
+    if args.remove_expired_data is not None:
+        return handle_remove_expired_data(args.remove_expired_data)
 
     if args.log_view is not None:
         return handle_session_view("log", args.log_view)
@@ -3398,7 +3465,7 @@ def main() -> int:
         tree_reuse_session = getattr(args, "tree_reuse_session", None)
         tree_session_stem = tree_reuse_session if tree_reuse_session else session_stem
         tree_session_dir = APP_DIR / "trees" / tree_session_stem
-        combined_tree_path = APP_DIR / "trees" / f"{tree_session_stem}.md"
+        combined_tree_path = tree_session_dir / f"{tree_session_stem}.md"
         try:
             tree_session_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
