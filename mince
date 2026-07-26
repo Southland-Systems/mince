@@ -183,19 +183,20 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
 # Config
 # -------------------------------------------------------------------
 
-def merged_config() -> dict[str, Any]:
+def merged_config(config_path: Path | None = None) -> dict[str, Any]:
     config = DEFAULT_CONFIG.copy()
+    path = CONFIG_FILE if config_path is None else config_path
 
-    if CONFIG_FILE.exists():
+    if path.exists():
         try:
-            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 config.update(raw)
                 for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
                     if deprecated in raw and replacement not in raw:
                         config[replacement] = raw[deprecated]
         except Exception:
-            print(f"ERROR: Failed to parse config: {CONFIG_FILE}", file=sys.stderr)
+            print(f"ERROR: Failed to parse config: {path}", file=sys.stderr)
             raise SystemExit(1)
 
     return config
@@ -226,8 +227,11 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
+    migrated_config = config.copy()
+    migrate_deprecated_config(migrated_config)
+
     merged = DEFAULT_CONFIG.copy()
-    merged.update(config)
+    merged.update(migrated_config)
 
     CONFIG_FILE.write_text(
         json.dumps(merged, indent=2, ensure_ascii=False),
@@ -662,6 +666,20 @@ def mask_api_key(value: Any) -> str:
         return f"{key[:4]}{'*' * (len(key) - 8)}{key[-4:]}"
     return "*" * len(key)
 
+def format_config_line(config_name: str, value: Any) -> str:
+    output_value = (
+        mask_api_key(value)
+        if config_name == "api_key"
+        else format_config_value(value)
+    )
+    return f"{config_name}={output_value}"
+
+def format_config_lines(config: dict[str, Any]) -> list[str]:
+    return [
+        format_config_line(config_name, value)
+        for config_name, value in config.items()
+    ]
+
 
 def prompt_config_value(
     config: dict[str, Any],
@@ -757,6 +775,48 @@ def get_profile_path(name: str) -> Path:
     if name == "config":
         return DEFAULT_CONFIG_FILE
     return APP_DIR / f"{name}.json"
+
+def configuration_profile_names() -> list[str]:
+    ensure_config_exists()
+    profile_names = sorted(
+        path.stem
+        for path in APP_DIR.glob("*.json")
+        if path.is_file()
+    )
+    return ["config"] + [
+        name for name in profile_names if name != "config"
+    ]
+
+def handle_show_profiles(profile_names: list[str] | None = None) -> int:
+    try:
+        available_profiles = configuration_profile_names()
+        if profile_names:
+            selected_profiles: list[str] = []
+            for profile_name in profile_names:
+                if not profile_name.isidentifier():
+                    raise ValueError(
+                        f"invalid profile name '{profile_name}'"
+                    )
+                if profile_name not in available_profiles:
+                    raise ValueError(
+                        f"profile '{profile_name}' does not exist"
+                    )
+                if profile_name not in selected_profiles:
+                    selected_profiles.append(profile_name)
+        else:
+            selected_profiles = available_profiles
+
+        sections: list[str] = []
+        for profile_name in selected_profiles:
+            profile_config = merged_config(get_profile_path(profile_name))
+            profile_lines = [f"[{profile_name}]"]
+            profile_lines.extend(format_config_lines(profile_config))
+            sections.append("\n".join(profile_lines))
+        pydoc.pager("\n\n".join(sections) + "\n")
+    except Exception as exc:
+        print(f"ERROR: Failed to show profiles: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def handle_session_view(view_type: str, session_name: str) -> int:
@@ -2540,6 +2600,12 @@ def parse_args() -> argparse.Namespace:
         help="Set a configuration value (use DEFAULT to reset it; may be repeated)",
     )
     config_print_group.add_argument(
+        "--set-config-from",
+        nargs=2,
+        metavar=("NAME", "PROFILE"),
+        help="Set a configuration value for NAME from another profile",
+    )
+    config_print_group.add_argument(
         "--get-config",
         nargs="?",
         const="",
@@ -2604,6 +2670,12 @@ def parse_args() -> argparse.Namespace:
         "--list-profiles",
         action="store_true",
         help="List available configuration profiles",
+    )
+    profile_action_group.add_argument(
+        "--show-profiles",
+        nargs="*",
+        metavar="NAME",
+        help="Display all configuration profiles, or only the named profiles, via the pager",
     )
     profile_action_group.add_argument(
         "--prompt-list",
@@ -2718,6 +2790,9 @@ def main() -> int:
             print(name)
         return 0
 
+    if args.show_profiles is not None:
+        return handle_show_profiles(args.show_profiles)
+
     if args.init_profile:
         new_name = args.init_profile
         if not new_name.isidentifier():
@@ -2773,6 +2848,41 @@ def main() -> int:
 
     CONFIG_FILE = get_profile_path(base_profile)
 
+    if args.set_config_from:
+        name, source_profile = args.set_config_from
+        try:
+            name = name.strip()
+            if not name:
+                raise ValueError("configuration name cannot be empty")
+            source_profile = validate_prompt_profile_name(source_profile)
+            source_config = read_config_document(
+                get_profile_path(source_profile)
+            )
+            if name in source_config:
+                value = source_config[name]
+            else:
+                replacement = DEPRECATED_CONFIG_KEYS.get(name)
+                if replacement is None or replacement not in source_config:
+                    raise ValueError(
+                        f"configuration value '{name}' does not exist in "
+                        f"profile '{source_profile}'"
+                    )
+                value = source_config[replacement]
+
+            config = load_config()
+            config[name] = value
+            replacement = DEPRECATED_CONFIG_KEYS.get(name)
+            if replacement is not None:
+                config[replacement] = value
+            save_config(config)
+        except Exception as exc:
+            print(
+                f"ERROR: Failed to set configuration from profile: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
     if args.set_config:
         config = load_config()
         try:
@@ -2804,12 +2914,7 @@ def main() -> int:
             items = config.items()
 
         for config_name, value in items:
-            output_value = (
-                mask_api_key(value)
-                if config_name == "api_key"
-                else format_config_value(value)
-            )
-            print(f"{config_name}={output_value}")
+            print(format_config_line(config_name, value))
         return 0
 
     if args.print_default_config:

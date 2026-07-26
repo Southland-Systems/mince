@@ -176,9 +176,6 @@ mince --prompt-assign review config system
 mince --get-config system_prompt
 ```
 
-
-```
-
 ## Local model servers 🌐
 
 Use any OpenAI‑compatible base URL, including Ollama:
