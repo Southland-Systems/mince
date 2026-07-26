@@ -56,7 +56,7 @@ mince --init
 
 This creates `~/.local/state/mince/config.json`.
 
-## Basic usage 💡
+## Basic Usage 💡
 
 Ask a direct question without file context:
 
@@ -141,21 +141,6 @@ mince --init-profile a
 mince -p a -a 'How is a file read in Go lang?'
 ```
 
-Run MinCE in a restricted systemd user unit for testing:
-
-```bash
-# systemd core container for restricted testing
-
-systemd-run --user -qt -p ProtectSystem=strict \
-  -p ProtectHome=read-only -p PrivateTmp=yes \
-  mince --help
-
-# -p RestrictAddressFamilies=AF_UNIX
-
-# https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html
-# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
-```
-
 Preview the files selected by tree filters without making API requests:
 
 ```bash
@@ -174,7 +159,57 @@ Prepend the prompt-library entry to the default system prompt:
 ```bash
 mince --prompt-assign review config system
 mince --get-config system_prompt
+
+Read an ask prompt from standard input:
+
+```bash
+mince --ask - <file
 ```
+
+Compose an ask prompt in `$EDITOR`:
+
+```bash
+mince --ask e
+```
+
+Estimate input tokens without making an API request:
+
+```bash
+mince --estimate-only --task "Summarize the project" --files README.md mince
+```
+
+Stream a text response directly to the terminal:
+
+```bash
+mince --stream --task "Explain the project structure" --files README.md mince
+```
+
+Review saved session output using the printed session name:
+
+```bash
+mince --log-view SESSION
+mince --patch-view SESSION
+mince --tree-view SESSION
+```
+
+Copy a configuration option from another profile:
+
+```bash
+mince --profile aws_grok --set-config-from base_url aws
+```
+
+Run MinCE in a restricted systemd user unit for testing:
+
+```bash
+systemd-run --user -qt -p ProtectSystem=strict \
+  -p ProtectHome=read-only -p PrivateTmp=yes \
+  mince --help
+
+# -p RestrictAddressFamilies=AF_UNIX
+# https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
+```
+
 
 ## Local model servers 🌐
 
@@ -278,6 +313,7 @@ All `mince` CLI arguments for reference.
 | `--log-view SESSION` | Display a saved local log session. |
 | `--patch-view SESSION` | Display a saved patch session. |
 | `--tree-view SESSION` | Display a saved combined tree report. |
+| `--remove-expired-data [KEEP_DAYS]` | Delete session data older than `KEEP_DAYS` days; defaults to `60` when omitted. |
 | `-o FILE`, `--output-file FILE` | Write a regular-mode response to the given file, overwriting it if it exists. |
 | `--patch [BOOL]` | Generate a structured multi-file patch and write changed files using the patch suffix; requires a task and context files. |
 | `--patch-review [BOOL]` | Review the generated diff before writing; approved changes use original files by default, unless a patch suffix is explicitly provided. |
@@ -290,20 +326,20 @@ All `mince` CLI arguments for reference.
 | `--plan-system-prompt TEXT` | Set the system prompt used for plan mode. |
 | `--model MODEL` | Override the configured model. |
 | `--list-models` | List models available from the configured endpoint. |
-| `--base-url URL` | Set the OpenAI-compatible API base URL; the parenthesized option is a compatibility alias. |
-| `--proxy-server URL` | Set an HTTP(S) proxy URL; the parenthesized option is a compatibility alias. |
-| `--meta-organization TEXT` | Set an optional organization name or ID; the parenthesized option is a compatibility alias. |
-| `--meta-project TEXT` | Set an optional project name or ID; the parenthesized option is a compatibility alias. |
-| `--service-tier {off,auto,default,flex,scale,priority}` | Select the service tier; the parenthesized option is a compatibility alias. |
+| `--base-url URL` | Set the OpenAI-compatible API base URL. |
+| `--proxy-server URL` | Set an HTTP(S) proxy URL. |
+| `--meta-organization TEXT` | Set an optional organization name or ID. |
+| `--meta-project TEXT` | Set an optional project name or ID. |
+| `--service-tier {off,auto,default,flex,scale,priority}` | Select the service tier. |
 | `--response-format {text,json,schema}` | Select text, JSON object, or JSON Schema output. `schema` requires `--schema-file`. |
 | `--stream [BOOL]` | Stream generated responses; streaming is supported only for text output. |
 | `--schema-file FILE` | Load a JSON Schema for `--response-format schema`. |
 | `--response-verbosity {low,medium,high,off}` | Set the verbosity level for text responses; default is `off`. |
 | `--temperature FLOAT` | Set sampling temperature from `0.0` to `2.0`, or use `off` to disable it. |
 | `--top-p FLOAT` | Set top-p nucleus sampling from `0.0` to `1.0`, or use `off` to disable it. |
-| `--reasoning {off,none,minimal,low,medium,high,xhigh,max}` | Set reasoning effort, or use `off` to disable it; the parenthesized option is a compatibility alias. |
+| `--reasoning {off,none,minimal,low,medium,high,xhigh,max}` | Set reasoning effort, or use `off` to disable it. |
 | `--reasoning-mode {standard,pro}` | Select standard or pro reasoning mode. |
-| `--extra-body KEY=VALUE[,KEY=VALUE,...]` | Add custom model parameters; the parenthesized option is a compatibility alias. |
+| `--extra-body KEY=VALUE[,KEY=VALUE,...]` | Add custom model parameters. |
 | `--token-limit LIMIT` | Set the maximum estimated input-token count; the built-in default is `65534`. |
 | `--token-cost INPUT:OUTPUT` | Set input and output costs per million tokens, or use `off` to disable cost estimates. |
 | `--estimate-only` | Print only the estimated input-token count and exit without making an API request. |
@@ -315,6 +351,7 @@ All `mince` CLI arguments for reference.
 | `--print-default-config` | Print the built-in default configuration as JSON. |
 | `--print-current-config` | Print the stored configuration file, creating it if missing; the API key is masked. |
 | `--set-config NAME=VALUE` | Set a configuration value; may be repeated, and `DEFAULT` resets a value. |
+| `--set-config-from NAME PROFILE` | Set a configuration value in the selected profile from another profile. |
 | `--get-config [NAME]` | Print one configuration value, or all values when `NAME` is omitted. |
 | `--log [BOOL]` | Enable or disable local session logging under `~/.local/state/mince/logs`; the default is `on`, and tree mode always logs its work. |
 | `--no-api-log [BOOL]` | Disable storing requests and responses in the OpenAI-compatible API. |
@@ -325,6 +362,7 @@ All `mince` CLI arguments for reference.
 | `--copy-profile NEW_NAME` | Copy the selected configuration profile to a new profile. |
 | `--remove-profile NAME` | Remove a configuration profile. |
 | `--list-profiles` | List available configuration profiles. |
+| `--show-profiles [NAME...]` | Display all configuration profiles, or only the named profiles, through the pager. |
 | `--prompt-list` | List stored prompts and their profile assignments. |
 | `--prompt-edit NAME [TEXT...]` | Edit or create a prompt-library entry; additional text forms its content, otherwise `$EDITOR` is opened. |
 | `--prompt-assign NAME PROFILE TYPE` | Prepend a file-backed prompt reference to the selected profile prompt type, retaining existing text. |
