@@ -81,8 +81,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "patch": "off",
     "patch_save": "on",
     "patch_review": "off",
+    "patch_branch": "off",
     "patch_suffix": ".mcepatched",
-    "plan": "off",
     "quiet": "off",
     "temperature": "off",
     "top_p": "off",
@@ -176,8 +176,9 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
                     "required": ["document", "patches"],
                 },
             },
+            "commit_message": { "type": "string", "minLength": 1},
         },
-        "required": ["files"],
+        "required": ["files", "commit_message"],
     },
 }
 
@@ -635,12 +636,41 @@ def handle_prompt_edit(values: list[str]) -> int:
     print(f"prompt_file={prompt_path}")
     return 0
 
-def handle_prompt_print(name: str) -> int:
+def handle_prompt_print(
+    names: list[str] | str | None = None,
+ ) -> int:
+    if isinstance(names, str):
+        names = [names]
     try:
-        prompt_path = prompt_file_path(name)
-        if not prompt_path.is_file():
-            raise ValueError(f"prompt file does not exist: {prompt_path}")
-        sys.stdout.write(prompt_path.read_text(encoding="utf-8"))
+        if names:
+            prompt_paths = [prompt_file_path(name) for name in names]
+            for prompt_path in prompt_paths:
+                if not prompt_path.is_file():
+                    raise ValueError(
+                        f"prompt file does not exist: {prompt_path}"
+                    )
+            for prompt_path in prompt_paths:
+                sys.stdout.write(
+                    prompt_path.read_text(encoding="utf-8")
+                )
+        else:
+            prompt_dir = APP_DIR / "prompts"
+            prompt_paths = sorted(
+                (
+                    path
+                    for path in prompt_dir.glob("*.md")
+                    if path.is_file()
+                ),
+                key=lambda path: path.stem,
+            )
+            sections = [
+                f"[{path.stem}]\n{path.read_text(encoding='utf-8')}"
+                for path in prompt_paths
+            ]
+            prompt_text = "\n\n".join(sections)
+            pydoc.pager(
+                prompt_text + ("\n" if prompt_text else "")
+            )
     except Exception as exc:
         print(f"ERROR: Failed to print prompt: {exc}", file=sys.stderr)
         return 1
@@ -801,6 +831,30 @@ def get_default_config_value(name: str) -> Any:
     return DEFAULT_CONFIG[name]
 
 
+def parse_patch_branch_value(value: Any) -> bool | str:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        raw_value = value.strip()
+        normalized = raw_value.lower()
+        if normalized in ("true", "yes", "on", "1"):
+            return True
+        if normalized in ("false", "no", "off", "0"):
+            return False
+        if raw_value:
+            return raw_value
+    raise ValueError('patch_branch must be a boolean or branch name')
+
+
+def resolve_patch_branch_setting(value: Any) -> str | None:
+    if value == "":
+        return ""
+    parsed = parse_patch_branch_value(value)
+    if isinstance(parsed, bool):
+        return "" if parsed else None
+    return parsed
+
+
 def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, Any]:
     if "=" not in value:
         raise ValueError("expected NAME=VALUE")
@@ -820,6 +874,8 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
     if raw_value == "DEFAULT":
         return name, get_default_config_value(canonical_name)
 
+    if canonical_name == "patch_branch":
+        return name, parse_patch_branch_value(raw_value)
     expected = (
         DEFAULT_CONFIG[canonical_name]
         if canonical_name in DEFAULT_CONFIG
@@ -941,6 +997,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
+    prompt_config_value(config, "patch_branch", "Patch branch (off, on, or BRANCH_NAME)", parse_patch_branch_value)
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "patch_save", "Save patch file to HOME/.local/state/mince/patches (off, on)")
     prompt_config_value(config, "prompt_expansion", "Expand ^^promptname^^ references found in prompts (off, on)")
@@ -1097,6 +1154,263 @@ def handle_remove_expired_data(keep_days: int) -> int:
 
 def append_suffix_to_path(original_path: Path, suffix: str) -> Path:
     return original_path.with_name(original_path.name + suffix)
+
+def git_repository_root(cwd: Path | None = None) -> Path | None:
+    working_directory = cwd or Path.cwd()
+    try:
+        completed = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=working_directory,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError('git executable was not found') from exc
+    if completed.returncode != 0:
+        return None
+    output = completed.stdout.strip()
+    return Path(output).resolve() if output else None
+
+def run_git_command(
+    repo_root: Path,
+    arguments: list[str],
+    input_text: str | None = None,
+    check: bool = True,
+ ) -> Any:
+    try:
+        completed = subprocess.run(
+            ['git', *arguments],
+            cwd=repo_root,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError('git executable was not found') from exc
+    if check and completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        if not detail:
+            detail = f'exit status {completed.returncode}'
+        command = 'git ' + ' '.join(arguments)
+        raise ValueError(f'{command} failed: {detail}')
+    return completed
+
+def validate_git_branch_name(repo_root: Path, branch_name: str) -> str:
+    branch_name = branch_name.strip()
+    if not branch_name:
+        raise ValueError('git branch name cannot be empty')
+    if branch_name in ('.', '..', 'HEAD') or branch_name.startswith('-'):
+        raise ValueError(f'invalid git branch name: {branch_name}')
+    check = run_git_command(
+        repo_root,
+        ['check-ref-format', f'refs/heads/{branch_name}'],
+        check=False,
+    )
+    if check.returncode != 0:
+        detail = (check.stderr or check.stdout).strip()
+        raise ValueError(
+            f'invalid git branch name {branch_name!r}'
+            + (f': {detail}' if detail else '')
+        )
+    return branch_name
+
+PATCH_BRANCH_PREFIX = 'mce'
+PATCH_BRANCH_DIGEST_LENGTH = 12
+PATCH_BRANCH_NAME_LENGTH = len(PATCH_BRANCH_PREFIX) + PATCH_BRANCH_DIGEST_LENGTH
+
+def patch_branch_name_from_files(file_names: list[str]) -> str:
+    if not file_names:
+        raise ValueError(
+            'a patch branch name is required when no files are provided'
+        )
+    sorted_names = sorted(str(file_name) for file_name in file_names)
+    digest_source = chr(0).join(sorted_names)
+    return PATCH_BRANCH_PREFIX + hashlib.sha256(digest_source.encode('utf-8')).hexdigest()[:PATCH_BRANCH_DIGEST_LENGTH]
+
+def resolve_patch_branch_name(
+    branch_argument: str | None,
+    file_names: list[str],
+ ) -> str:
+    branch_name = str(branch_argument or '').strip()
+    return branch_name or patch_branch_name_from_files(file_names)
+
+def git_worktree_is_clean(repo_root: Path) -> None:
+    status = run_git_command(
+        repo_root,
+        ['status', '--porcelain=v1', '--untracked-files=all'],
+    ).stdout.strip()
+    if status:
+        raise ValueError(
+            'git worktree must be clean before using a patch branch; '
+            'commit or stash existing changes first'
+        )
+
+def git_branch_exists(repo_root: Path, branch_name: str) -> bool:
+    result = run_git_command(
+        repo_root,
+        ['show-ref', '--verify', '--quiet', f'refs/heads/{branch_name}'],
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        detail = (result.stderr or result.stdout).strip()
+        raise ValueError(f'git show-ref failed: {detail}')
+    return result.returncode == 0
+
+def git_current_branch(repo_root: Path) -> str | None:
+    result = run_git_command(
+        repo_root,
+        ['symbolic-ref', '--quiet', '--short', 'HEAD'],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    branch_name = result.stdout.strip()
+    return branch_name or None
+
+def git_local_branch_names(repo_root: Path) -> list[str]:
+    result = run_git_command(
+        repo_root,
+        ['for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+    )
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+
+def is_auto_patch_branch_name(branch_name: str) -> bool:
+    return (
+        branch_name.startswith(PATCH_BRANCH_PREFIX)
+        and len(branch_name) == PATCH_BRANCH_NAME_LENGTH
+    )
+
+def cleanup_patch_branches(repo_root: Path) -> list[str]:
+    branch_names = sorted(
+        branch_name
+        for branch_name in git_local_branch_names(repo_root)
+        if is_auto_patch_branch_name(branch_name)
+    )
+    current_branch = git_current_branch(repo_root)
+    if current_branch in branch_names:
+        raise ValueError(
+            f'cannot clean up the checked-out auto-generated patch branch: {current_branch}'
+        )
+    for branch_name in branch_names:
+        run_git_command(
+            repo_root,
+            ['branch', '-D', '--', branch_name],
+        )
+    return branch_names
+
+def git_relative_path(repo_root: Path, path: Path) -> str:
+    resolved_path = path.resolve()
+    try:
+        relative_path = resolved_path.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(
+            f'patch path is outside the git repository: {path}'
+        ) from exc
+    if not relative_path.parts or '.git' in relative_path.parts:
+        raise ValueError(f'patch path is not a worktree file: {path}')
+    return relative_path.as_posix()
+
+def prepare_patch_branch(repo_root: Path, branch_name: str) -> None:
+    branch_name = validate_git_branch_name(repo_root, branch_name)
+    git_worktree_is_clean(repo_root)
+    if git_branch_exists(repo_root, branch_name):
+        if git_current_branch(repo_root) != branch_name:
+            run_git_command(repo_root, ['switch', '--', branch_name])
+        return
+    run_git_command(repo_root, ['switch', '--create', branch_name])
+
+def git_commit_patch(
+    repo_root: Path,
+    paths: list[Path],
+    commit_message: str,
+ ) -> None:
+    if not commit_message.strip():
+        raise ValueError('patch commit message cannot be empty')
+    relative_paths: list[str] = []
+    for path in paths:
+        relative_path = git_relative_path(repo_root, path)
+        if relative_path not in relative_paths:
+            relative_paths.append(relative_path)
+    if not relative_paths:
+        raise ValueError('patch did not contain any files to commit')
+    run_git_command(repo_root, ['add', '--', *relative_paths])
+    staged = run_git_command(
+        repo_root,
+        ['diff', '--cached', '--name-only'],
+    ).stdout.strip()
+    if not staged:
+        raise ValueError(
+            'git did not stage any patch files; the files may be ignored'
+        )
+    run_git_command(
+        repo_root,
+        ['commit', '--file=-'],
+        input_text=commit_message.rstrip() + chr(10),
+    )
+
+def handle_patch_branch_cleanup() -> int:
+    try:
+        repo_root = git_repository_root()
+        if repo_root is None:
+            raise ValueError('not inside a git worktree')
+        removed = cleanup_patch_branches(repo_root)
+    except (OSError, ValueError) as exc:
+        print(f'ERROR: Failed to clean up patch branches: {exc}', file=sys.stderr)
+        return 1
+    for branch_name in removed:
+        print(f'patch_branch_removed={branch_name}')
+    print(f'patch_branch_cleanup={len(removed)}')
+    return 0
+
+def handle_patch_merge(branch_name: str, commit_message: str) -> int:
+    try:
+        repo_root = git_repository_root()
+        if repo_root is None:
+            raise ValueError('not inside a git worktree')
+        branch_name = validate_git_branch_name(repo_root, branch_name)
+        if not git_branch_exists(repo_root, branch_name):
+            raise ValueError(f'git branch does not exist: {branch_name}')
+        current_branch = git_current_branch(repo_root)
+        if current_branch is None:
+            raise ValueError('patch merge requires a checked-out branch')
+        if current_branch == branch_name:
+            raise ValueError('cannot merge a patch branch into itself')
+        git_worktree_is_clean(repo_root)
+        run_git_command(repo_root, ['merge', '--squash', branch_name])
+        staged_result = run_git_command(
+            repo_root,
+            ['diff', '--cached', '--quiet'],
+            check=False,
+        )
+        if staged_result.returncode == 0:
+            raise ValueError(
+                'squash merge produced no changes; the patch branch was not deleted'
+            )
+        if staged_result.returncode != 1:
+            detail = (staged_result.stderr or staged_result.stdout).strip()
+            raise ValueError(f'could not inspect squash merge: {detail}')
+        run_git_command(
+            repo_root,
+            ['commit', '--file=-'],
+            input_text=commit_message.rstrip() + chr(10),
+        )
+        run_git_command(
+            repo_root,
+            ['branch', '-D', '--', branch_name],
+        )
+    except (OSError, ValueError) as exc:
+        print(f'ERROR: Failed to merge patch branch: {exc}', file=sys.stderr)
+        return 1
+    print(f'patch_merged={branch_name}')
+    return 0
 
 def generate_unified_diff(original: str, updated: str, path: str) -> str:
     original_lines = original.splitlines(keepends=True)
@@ -2522,6 +2836,26 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Patch specified files and write changes to the filename + patch suffix",
     )
+
+    parser.add_argument(
+        '--patch-branch',
+        nargs='?',
+        const='',
+        default=None,
+        metavar='BOOL|BRANCH_NAME',
+        help='Use a git branch for patch changes (BOOL on uses an auto-generated name; default: off)',
+    )
+    parser.add_argument(
+        '--patch-branch-cleanup',
+        action='store_true',
+        help='Delete local auto-generated patch branches',
+    )
+    parser.add_argument(
+        '--patch-merge',
+        nargs='+',
+        metavar='TEXT',
+        help='Merge an existing patch branch with the supplied commit message',
+    )
     parser.add_argument(
         "--patch-review",
         nargs="?",
@@ -2944,10 +3278,18 @@ def parse_args() -> argparse.Namespace:
         help="List available configuration profiles",
     )
     profile_action_group.add_argument(
+        "--print-profiles",
+        nargs="*",
+        metavar="NAME",
+        help="Display all configuration profiles or only the named profiles",
+    )
+    profile_action_group.add_argument(
         "--show-profiles",
         nargs="*",
         metavar="NAME",
-        help="Display all configuration profiles, or only the named profiles, via the pager",
+        dest="print_profiles",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
     )
     profile_action_group.add_argument(
         "--prompt-list",
@@ -2991,8 +3333,9 @@ def parse_args() -> argparse.Namespace:
     )
     profile_action_group.add_argument(
         "--prompt-print",
+        nargs="*",
         metavar="NAME",
-        help="Print stored prompt NAME",
+        help="Print all stored prompts or specified prompts with NAMES",
     )
     parser.add_argument(
         "--prompt-expansion",
@@ -3047,6 +3390,56 @@ def main() -> int:
     global DEBUG
 
     args = parse_args()
+    if args.patch_branch_cleanup:
+        return handle_patch_branch_cleanup()
+    if args.patch_merge is not None:
+        try:
+            if git_repository_root() is None:
+                raise ValueError('not inside a git worktree')
+        except (OSError, ValueError) as exc:
+            print(f'ERROR: {exc}', file=sys.stderr)
+            return 1
+        if any(
+            value is not None
+            for value in (
+                args.ask,
+                args.ask_file,
+                args.task,
+                args.task_file,
+                args.patch,
+            )
+        ):
+            print(
+                'ERROR: --patch-merge cannot be combined with ask, task, or --patch',
+                file=sys.stderr,
+            )
+            return 1
+        merge_file_names: list[str] = []
+        needs_derived_name = (
+            args.patch_branch is None
+            or not str(args.patch_branch).strip()
+        )
+        if needs_derived_name:
+            try:
+                if args.files_list is not None:
+                    merge_file_names = read_files_list(args.files_list)
+                elif args.files is not None:
+                    merge_file_names = list(args.files)
+            except ValueError as exc:
+                print(f'ERROR: {exc}', file=sys.stderr)
+                return 1
+        try:
+            merge_branch_name = resolve_patch_branch_name(
+                args.patch_branch,
+                merge_file_names,
+            )
+            merge_commit_message = ' '.join(args.patch_merge).strip()
+            if not merge_commit_message:
+                raise ValueError('--patch-merge commit message cannot be empty')
+        except ValueError as exc:
+            print(f'ERROR: {exc}', file=sys.stderr)
+            return 1
+        return handle_patch_merge(merge_branch_name, merge_commit_message)
     reuse_session_turn: int | None = None
     if isinstance(args.reuse_session, list):
         if len(args.reuse_session) > 2:
@@ -3122,8 +3515,8 @@ def main() -> int:
             print(name)
         return 0
 
-    if args.show_profiles is not None:
-        return handle_show_profiles(args.show_profiles)
+    if args.print_profiles is not None:
+        return handle_show_profiles(args.print_profiles)
 
     if args.init_profile:
         new_name = args.init_profile
@@ -3409,6 +3802,16 @@ def main() -> int:
         if args.patch is not None
         else coerce_bool(config.get("patch", "off"))
     )
+    try:
+        patch_branch_setting = resolve_patch_branch_setting(
+            args.patch_branch
+            if args.patch_branch is not None
+            else config.get('patch_branch', DEFAULT_CONFIG['patch_branch'])
+        )
+    except ValueError as exc:
+        print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
+        return 1
+    patch_branch_mode = patch_branch_setting is not None
     patch_save_enabled = (
         args.patch_save
         if args.patch_save is not None
@@ -3439,6 +3842,9 @@ def main() -> int:
     else:
         patch_suffix = DEFAULT_CONFIG["patch_suffix"]
         suffix_provided = False
+    if patch_branch_mode:
+        patch_suffix = ''
+        suffix_provided = False
 
     if tree_mode and (plan_mode or patch_mode):
         print("ERROR: tree mode cannot be combined with --plan or --patch", file=sys.stderr)
@@ -3452,6 +3858,16 @@ def main() -> int:
     if patch_mode and (args.ask or args.ask_file):
         print("ERROR: --patch only supports --task or --task-file ", file=sys.stderr)
         return 1
+    if patch_branch_mode and not patch_mode:
+        print('ERROR: --patch-branch requires --patch', file=sys.stderr)
+        return 1
+    if patch_branch_mode:
+        try:
+            if git_repository_root() is None:
+                raise ValueError('not inside a git worktree')
+        except (OSError, ValueError) as exc:
+            print(f'ERROR: {exc}', file=sys.stderr)
+            return 1
 
     llm_timeout = (
         args.llm_timeout
@@ -3654,8 +4070,7 @@ def main() -> int:
         else coerce_bool(config.get("stream", "off"))
     )
     if stream_enabled and response_format != "text":
-        print("ERROR: --stream is only supported for text responses", file=sys.stderr)
-        return 1
+        stream_enabled = False
 
     json_schema: dict[str, Any] | None = json_schema
     if response_format == "schema" and json_schema is None:
@@ -3736,6 +4151,9 @@ def main() -> int:
             )
             return 1
         state_turn = next_state_turn_index(state_session_dir)
+
+    patch_branch_name: str | None = None
+    patch_repo_root: Path | None = None
     if log_enabled:
         LOG_DIR = APP_DIR / "logs"
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4362,9 +4780,22 @@ def main() -> int:
                 )
                 return 1
 
+            patch_commit_message = ''
+            if patch_branch_mode:
+                if not isinstance(manifest, dict):
+                    print('ERROR: Patch manifest must be a JSON object', file=sys.stderr)
+                    return 1
+                raw_commit_message = manifest.get('commit_message')
+                if not isinstance(raw_commit_message, str) or not raw_commit_message.strip():
+                    print('ERROR: Patch manifest commit_message cannot be empty', file=sys.stderr)
+                    return 1
+                patch_commit_message = raw_commit_message.strip()
+
             updated_texts = apply_combined_patch_manifest(
-                original_texts, manifest
+                original_texts,
+                manifest,
             )
+
             diffs = []
             for fp, ut in updated_texts.items():
                 ot = original_texts.get(fp, '')
@@ -4475,24 +4906,68 @@ def main() -> int:
                         return 1
                     continue
 
-            for fp, ut in updated_texts.items():
-                if ut == original_texts.get(fp, ''):
-                    continue
-                if patch_review:
-                    tgt = (
-                        append_suffix_to_path(Path(fp), patch_suffix)
-                        if suffix_provided
-                        else Path(fp)
+            changed_items = [
+                (fp, ut)
+                for fp, ut in updated_texts.items()
+                if ut != original_texts.get(fp, '')
+            ]
+            if patch_branch_mode:
+                try:
+                    patch_branch_name = resolve_patch_branch_name(
+                        patch_branch_setting,
+                        file_names,
                     )
-                    tgt.write_text(ut, encoding='utf-8')
-                    print(
-                        f'file_written='
-                        f'{str(tgt) if suffix_provided else fp}'
+                    patch_repo_root = git_repository_root()
+                    if patch_repo_root is None:
+                        raise ValueError('not inside a git worktree')
+                    current_branch = git_current_branch(patch_repo_root)
+                    if current_branch is None:
+                        raise ValueError(
+                            'patch branch mode requires a checked-out branch'
+                        )
+                    patch_branch_name = validate_git_branch_name(
+                        patch_repo_root,
+                        patch_branch_name,
                     )
-                else:
-                    outp = append_suffix_to_path(Path(fp), patch_suffix)
-                    outp.write_text(ut, encoding='utf-8')
-                    print(f'file_written={outp}')
+                    for file_name in file_names:
+                        git_relative_path(patch_repo_root, Path(file_name))
+                    for fp, _ in changed_items:
+                        git_relative_path(patch_repo_root, Path(fp))
+                    prepare_patch_branch(patch_repo_root, patch_branch_name)
+                    for fp, ut in changed_items:
+                        Path(fp).write_text(ut, encoding='utf-8')
+                    git_commit_patch(
+                        patch_repo_root,
+                        [Path(fp) for fp, _ in changed_items],
+                        patch_commit_message,
+                    )
+                    run_git_command(
+                        patch_repo_root,
+                        ['switch', '--', current_branch],
+                    )
+                except Exception as exc:
+                    print(f'ERROR: Failed to write and commit patch branch: {exc}', file=sys.stderr)
+                    return 1
+                for fp, _ in changed_items:
+                    print(f'file_written={fp}')
+                print(f'patch_branch={patch_branch_name}')
+            else:
+                for fp, ut in changed_items:
+                    if patch_review:
+                        tgt = (
+                            append_suffix_to_path(Path(fp), patch_suffix)
+                            if suffix_provided
+                            else Path(fp)
+                        )
+                        tgt.write_text(ut, encoding='utf-8')
+                        print(
+                            f'file_written='
+                            f'{str(tgt) if suffix_provided else fp}'
+                        )
+                    else:
+                        outp = append_suffix_to_path(Path(fp), patch_suffix)
+                        outp.write_text(ut, encoding='utf-8')
+                        print(f'file_written={outp}')
 
             if VERBOSE:
                 print(statsline, file=sys.stderr)

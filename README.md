@@ -124,6 +124,20 @@ mince --patch --patch-review -f passwd -t "Remove lines 1-5 from 'passwd' \
 and create a new file called 'passwd-new' with those lines."
 ```
 
+Manage patched changes with a named git branch (use a named branch when file context will change):
+
+```bash
+mince --patch --patch-review --patch-branch mce-readme -f mince README.md \
+  -t 'Refresh the command line arguments in `README.md` from `mince`.'
+
+mince --patch --patch-review --patch-branch mce-readme -f README.md \
+  -t 'Rewrite the language to be professional.'
+
+git diff mce-readme
+
+mince --patch-branch mce-readme --patch-merge Updated README.
+```
+
 Plan mode asks the model to create prompt for the next step using the supplied context:
 
 ```bash
