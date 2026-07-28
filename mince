@@ -997,7 +997,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
-    prompt_config_value(config, "patch_branch", "Patch branch (off, on, or BRANCH_NAME)", parse_patch_branch_value)
+    prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)", parse_patch_branch_value)
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "patch_save", "Save patch file to HOME/.local/state/mince/patches (off, on)")
     prompt_config_value(config, "prompt_expansion", "Expand ^^promptname^^ references found in prompts (off, on)")
@@ -1218,25 +1218,11 @@ def validate_git_branch_name(repo_root: Path, branch_name: str) -> str:
         )
     return branch_name
 
-PATCH_BRANCH_PREFIX = 'mce'
-PATCH_BRANCH_DIGEST_LENGTH = 12
-PATCH_BRANCH_NAME_LENGTH = len(PATCH_BRANCH_PREFIX) + PATCH_BRANCH_DIGEST_LENGTH
+PATCH_BRANCH_DEFAULT_NAME = 'mcebranch'
 
-def patch_branch_name_from_files(file_names: list[str]) -> str:
-    if not file_names:
-        raise ValueError(
-            'a patch branch name is required when no files are provided'
-        )
-    sorted_names = sorted(str(file_name) for file_name in file_names)
-    digest_source = chr(0).join(sorted_names)
-    return PATCH_BRANCH_PREFIX + hashlib.sha256(digest_source.encode('utf-8')).hexdigest()[:PATCH_BRANCH_DIGEST_LENGTH]
-
-def resolve_patch_branch_name(
-    branch_argument: str | None,
-    file_names: list[str],
- ) -> str:
+def resolve_patch_branch_name(branch_argument: str | None) -> str:
     branch_name = str(branch_argument or '').strip()
-    return branch_name or patch_branch_name_from_files(file_names)
+    return branch_name or PATCH_BRANCH_DEFAULT_NAME
 
 def git_worktree_is_clean(repo_root: Path) -> None:
     status = run_git_command(
@@ -1271,40 +1257,6 @@ def git_current_branch(repo_root: Path) -> str | None:
     branch_name = result.stdout.strip()
     return branch_name or None
 
-def git_local_branch_names(repo_root: Path) -> list[str]:
-    result = run_git_command(
-        repo_root,
-        ['for-each-ref', '--format=%(refname:short)', 'refs/heads'],
-    )
-    return [
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip()
-    ]
-
-def is_auto_patch_branch_name(branch_name: str) -> bool:
-    return (
-        branch_name.startswith(PATCH_BRANCH_PREFIX)
-        and len(branch_name) == PATCH_BRANCH_NAME_LENGTH
-    )
-
-def cleanup_patch_branches(repo_root: Path) -> list[str]:
-    branch_names = sorted(
-        branch_name
-        for branch_name in git_local_branch_names(repo_root)
-        if is_auto_patch_branch_name(branch_name)
-    )
-    current_branch = git_current_branch(repo_root)
-    if current_branch in branch_names:
-        raise ValueError(
-            f'cannot clean up the checked-out auto-generated patch branch: {current_branch}'
-        )
-    for branch_name in branch_names:
-        run_git_command(
-            repo_root,
-            ['branch', '-D', '--', branch_name],
-        )
-    return branch_names
 
 def git_relative_path(repo_root: Path, path: Path) -> str:
     resolved_path = path.resolve()
@@ -1356,19 +1308,6 @@ def git_commit_patch(
         input_text=commit_message.rstrip() + chr(10),
     )
 
-def handle_patch_branch_cleanup() -> int:
-    try:
-        repo_root = git_repository_root()
-        if repo_root is None:
-            raise ValueError('not inside a git worktree')
-        removed = cleanup_patch_branches(repo_root)
-    except (OSError, ValueError) as exc:
-        print(f'ERROR: Failed to clean up patch branches: {exc}', file=sys.stderr)
-        return 1
-    for branch_name in removed:
-        print(f'patch_branch_removed={branch_name}')
-    print(f'patch_branch_cleanup={len(removed)}')
-    return 0
 
 def handle_patch_merge(branch_name: str, commit_message: str) -> int:
     try:
@@ -1381,9 +1320,18 @@ def handle_patch_merge(branch_name: str, commit_message: str) -> int:
         current_branch = git_current_branch(repo_root)
         if current_branch is None:
             raise ValueError('patch merge requires a checked-out branch')
-        if current_branch == branch_name:
-            raise ValueError('cannot merge a patch branch into itself')
         git_worktree_is_clean(repo_root)
+        if current_branch == branch_name:
+            run_git_command(repo_root, ['switch', '-'])
+            current_branch = git_current_branch(repo_root)
+            if current_branch is None:
+                raise ValueError(
+                    'git switch - did not leave a checked-out branch'
+                )
+            if current_branch == branch_name:
+                raise ValueError(
+                    'git switch - did not switch away from patch branch'
+                )
         run_git_command(repo_root, ['merge', '--squash', branch_name])
         staged_result = run_git_command(
             repo_root,
@@ -1409,7 +1357,7 @@ def handle_patch_merge(branch_name: str, commit_message: str) -> int:
     except (OSError, ValueError) as exc:
         print(f'ERROR: Failed to merge patch branch: {exc}', file=sys.stderr)
         return 1
-    print(f'patch_merged={branch_name}')
+    print(f'patch_branch_merged={branch_name}')
     return 0
 
 def generate_unified_diff(original: str, updated: str, path: str) -> str:
@@ -2836,21 +2784,16 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Patch specified files and write changes to the filename + patch suffix",
     )
-
     parser.add_argument(
         '--patch-branch',
         nargs='?',
-        const='',
+        const=PATCH_BRANCH_DEFAULT_NAME,
         default=None,
-        metavar='BOOL|BRANCH_NAME',
-        help='Use a git branch for patch changes (BOOL on uses an auto-generated name; default: off)',
+        metavar='BOOL|NAME',
+        help='Use a git branch for patch changes (default: mcebranch)',
     )
     parser.add_argument(
-        '--patch-branch-cleanup',
-        action='store_true',
-        help='Delete local auto-generated patch branches',
-    )
-    parser.add_argument(
+        '-M',
         '--patch-merge',
         nargs='+',
         metavar='TEXT',
@@ -3390,8 +3333,6 @@ def main() -> int:
     global DEBUG
 
     args = parse_args()
-    if args.patch_branch_cleanup:
-        return handle_patch_branch_cleanup()
     if args.patch_merge is not None:
         try:
             if git_repository_root() is None:
@@ -3414,25 +3355,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        merge_file_names: list[str] = []
-        needs_derived_name = (
-            args.patch_branch is None
-            or not str(args.patch_branch).strip()
-        )
-        if needs_derived_name:
-            try:
-                if args.files_list is not None:
-                    merge_file_names = read_files_list(args.files_list)
-                elif args.files is not None:
-                    merge_file_names = list(args.files)
-            except ValueError as exc:
-                print(f'ERROR: {exc}', file=sys.stderr)
-                return 1
         try:
-            merge_branch_name = resolve_patch_branch_name(
-                args.patch_branch,
-                merge_file_names,
-            )
+            merge_branch_name = resolve_patch_branch_name(args.patch_branch)
             merge_commit_message = ' '.join(args.patch_merge).strip()
             if not merge_commit_message:
                 raise ValueError('--patch-merge commit message cannot be empty')
@@ -4183,10 +4107,7 @@ def main() -> int:
         patch_save_path = APP_DIR / "patches" / f"{patch_stem}.patch"
     if patch_branch_mode:
         try:
-            patch_branch_name = resolve_patch_branch_name(
-                patch_branch_setting,
-                file_names,
-            )
+            patch_branch_name = resolve_patch_branch_name(patch_branch_setting)
             patch_repo_root = git_repository_root()
             if patch_repo_root is None:
                 raise ValueError('not inside a git worktree')
@@ -5023,10 +4944,7 @@ def main() -> int:
             ]
             if patch_branch_mode:
                 try:
-                    patch_branch_name = resolve_patch_branch_name(
-                        patch_branch_setting,
-                        file_names,
-                    )
+                    patch_branch_name = resolve_patch_branch_name(patch_branch_setting)
                     patch_repo_root = git_repository_root()
                     if patch_repo_root is None:
                         raise ValueError('not inside a git worktree')
