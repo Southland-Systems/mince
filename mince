@@ -4106,6 +4106,7 @@ def main() -> int:
     session_stem = f"{base_profile}-{session_timestamp}-{session_rand_part}"
     reuse_session_name: str | None = None
     reused_patch_history: str | None = None
+    reused_file_records: list[tuple[str, str]] = []
     if args.reuse_session is not None:
         try:
             reuse_session_name = validate_session_name(args.reuse_session)
@@ -4123,8 +4124,6 @@ def main() -> int:
                 reused_file_records = load_reused_session_files(
                     state_session_dir
                 )
-                if not args.reuse_session_skip_verify:
-                    verify_reused_session_files(reused_file_records)
                 if not tree_mode:
                     reused_file_names = [
                         path for path, _ in reused_file_records
@@ -4154,6 +4153,21 @@ def main() -> int:
 
     patch_branch_name: str | None = None
     patch_repo_root: Path | None = None
+    patch_original_branch: str | None = None
+
+    def restore_patch_branch() -> None:
+        if (
+            not patch_branch_mode
+            or patch_repo_root is None
+            or patch_original_branch is None
+        ):
+            return
+        if git_current_branch(patch_repo_root) != patch_original_branch:
+            run_git_command(
+                patch_repo_root,
+                ['switch', '--', patch_original_branch],
+            )
+
     if log_enabled:
         LOG_DIR = APP_DIR / "logs"
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4167,6 +4181,54 @@ def main() -> int:
     if patch_save_enabled and patch_mode:
         patch_stem = log_path.stem if log_path is not None else session_stem
         patch_save_path = APP_DIR / "patches" / f"{patch_stem}.patch"
+    if patch_branch_mode:
+        try:
+            patch_branch_name = resolve_patch_branch_name(
+                patch_branch_setting,
+                file_names,
+            )
+            patch_repo_root = git_repository_root()
+            if patch_repo_root is None:
+                raise ValueError('not inside a git worktree')
+            patch_original_branch = git_current_branch(patch_repo_root)
+            if patch_original_branch is None:
+                raise ValueError(
+                    'patch branch mode requires a checked-out branch'
+                )
+            patch_branch_name = validate_git_branch_name(
+                patch_repo_root,
+                patch_branch_name,
+            )
+            for file_name in file_names:
+                git_relative_path(patch_repo_root, Path(file_name))
+            prepare_patch_branch(patch_repo_root, patch_branch_name)
+        except Exception as exc:
+            try:
+                restore_patch_branch()
+            except Exception:
+                pass
+            print(
+                f'ERROR: Failed to prepare patch branch: {exc}',
+                file=sys.stderr,
+            )
+            return 1
+
+    if (
+        reuse_session_name is not None
+        and not args.reuse_session_skip_verify
+    ):
+        try:
+            verify_reused_session_files(reused_file_records)
+        except ValueError as exc:
+            try:
+                restore_patch_branch()
+            except Exception:
+                pass
+            print(
+                f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
 
     if tree_mode:
         try:
@@ -4284,11 +4346,22 @@ def main() -> int:
     else:
         file_paths=[Path(f).resolve() for f in file_names]
         max_file_size_kb=coerce_int(config.get("max_file_size_kb", 512), 512)
-        context = build_context(
-            file_paths=file_paths,
-            max_file_size_kb=max_file_size_kb,
-            add_line_numbers=add_line_numbers
-        )
+        try:
+            context = build_context(
+                file_paths=file_paths,
+                max_file_size_kb=max_file_size_kb,
+                add_line_numbers=add_line_numbers,
+            )
+        except Exception as exc:
+            try:
+                restore_patch_branch()
+            except Exception:
+                pass
+            print(
+                f"ERROR: Could not build file context: {exc}",
+                file=sys.stderr,
+            )
+            return 1
         if reused_patch_history:
             context = (
                 f"{context.rstrip()}\n\n{reused_patch_history}"
@@ -4315,10 +4388,26 @@ def main() -> int:
                     abs_path = Path(f).resolve()
                     original_texts[str(abs_path)] = abs_path.read_text(encoding="utf-8")
                 except Exception as exc:
+                    try:
+                        restore_patch_branch()
+                    except Exception:
+                        pass
                     print(f"ERROR: Could not read '{f}': {exc}", file=sys.stderr)
                     return 1
             if not original_texts:
+                try:
+                    restore_patch_branch()
+                except Exception:
+                    pass
                 print("ERROR: No readable input files.", file=sys.stderr)
+                return 1
+            try:
+                restore_patch_branch()
+            except Exception as exc:
+                print(
+                    f"ERROR: Failed to restore original branch: {exc}",
+                    file=sys.stderr,
+                )
                 return 1
             user_prompt = user_prompt + "\n" + patch_system_prompt
 

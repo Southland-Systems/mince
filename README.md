@@ -133,7 +133,7 @@ mince --patch --patch-review --patch-branch mce-readme -f mince README.md \
 mince --patch --patch-review --patch-branch mce-readme -f README.md \
   -t 'Rewrite the language to be professional.'
 
-git diff mce-readme
+git diff main mce-readme
 
 mince --patch-branch mce-readme --patch-merge Updated README.
 ```
