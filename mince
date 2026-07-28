@@ -4844,6 +4844,10 @@ def main() -> int:
         )
 
     if patch_mode:
+        patch_turn_history: list[tuple[str, str, str]] = [
+            (task, str(result or ""), statsline)
+        ]
+        patch_turn_index = 0
         while True:
             try:
                 if not result or not result.strip():
@@ -4916,14 +4920,31 @@ def main() -> int:
                 print(diff_text)
 
             revision_task: str | None = None
+            navigate_patch_turn = False
             if patch_review:
                 while True:
                     patch_input = input(
-                        'Apply these changes? [y/n/p/e/E <prompt>]: '
+                        'Apply these changes? [y/n/p/</>/e/E <prompt>]: '
                     ).strip()
                     if not patch_input:
-                        print('Usage: y, n, p, e, or E <prompt>')
+                        print('Usage: [y]es, [n]o, [p]ager, [<]prevturn, [>]nextturn, [e]dit, E <prompt>')
                         continue
+                    if patch_input == '<':
+                        if patch_turn_index == 0:
+                            print('Already at the first patch turn.')
+                            continue
+                        patch_turn_index -= 1
+                        task, result, statsline = patch_turn_history[patch_turn_index]
+                        navigate_patch_turn = True
+                        break
+                    if patch_input == '>':
+                        if patch_turn_index + 1 >= len(patch_turn_history):
+                            print('No later patch turn is available.')
+                            continue
+                        patch_turn_index += 1
+                        task, result, statsline = patch_turn_history[patch_turn_index]
+                        navigate_patch_turn = True
+                        break
                     patch_choice = patch_input.lower()
                     if patch_choice in ('y', 'yes', 'n', 'no'):
                         break
@@ -4960,7 +4981,9 @@ def main() -> int:
                             print('Revision task cannot be empty.')
                             continue
                         break
-                    print('Please answer y, n, p, e, or E followed by a prompt.')
+                    print('Please answer y, n, p, <, >, e, E followed by a prompt')
+                if navigate_patch_turn:
+                    continue
                 if patch_choice in ('n', 'no'):
                     if VERBOSE:
                         print('Aborted.', file=sys.stderr)
@@ -4984,15 +5007,13 @@ def main() -> int:
                     )
                     user_prompt = user_prompt + '\n' + patch_system_prompt
                     try:
-                        (
-                            result,
-                            statsline,
-                            response_obj,
-                            usage,
-                        ) = call_patch_revision_request(user_prompt)
+                        (result, statsline, response_obj, usage) = call_patch_revision_request(user_prompt)
                     except Exception as exc:
                         print(f'API error: {exc}', file=sys.stderr)
                         return 1
+                    patch_turn_history = patch_turn_history[:patch_turn_index + 1]
+                    patch_turn_history.append((task, str(result or ""), statsline))
+                    patch_turn_index += 1
                     continue
 
             changed_items = [
