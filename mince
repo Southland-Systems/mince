@@ -1218,11 +1218,16 @@ def validate_git_branch_name(repo_root: Path, branch_name: str) -> str:
         )
     return branch_name
 
-PATCH_BRANCH_DEFAULT_NAME = 'mcebranch'
+PATCH_BRANCH_PREFIX = 'mce'
+PATCH_BRANCH_DEFAULT_NAME = f'{PATCH_BRANCH_PREFIX}branch'
 
 def resolve_patch_branch_name(branch_argument: str | None) -> str:
     branch_name = str(branch_argument or '').strip()
-    return branch_name or PATCH_BRANCH_DEFAULT_NAME
+    if not branch_name:
+        return PATCH_BRANCH_DEFAULT_NAME
+    if not branch_name.startswith(PATCH_BRANCH_PREFIX):
+        branch_name = f'{PATCH_BRANCH_PREFIX}{branch_name}'
+    return branch_name
 
 def git_worktree_is_clean(repo_root: Path) -> None:
     status = run_git_command(
@@ -1271,6 +1276,7 @@ def git_relative_path(repo_root: Path, path: Path) -> str:
     return relative_path.as_posix()
 
 def prepare_patch_branch(repo_root: Path, branch_name: str) -> None:
+    branch_name = resolve_patch_branch_name(branch_name)
     branch_name = validate_git_branch_name(repo_root, branch_name)
     git_worktree_is_clean(repo_root)
     if git_branch_exists(repo_root, branch_name):
@@ -1311,6 +1317,7 @@ def git_commit_patch(
 
 def handle_patch_merge(branch_name: str, commit_message: str) -> int:
     try:
+        branch_name = resolve_patch_branch_name(branch_name)
         repo_root = git_repository_root()
         if repo_root is None:
             raise ValueError('not inside a git worktree')
@@ -1358,6 +1365,33 @@ def handle_patch_merge(branch_name: str, commit_message: str) -> int:
         print(f'ERROR: Failed to merge patch branch: {exc}', file=sys.stderr)
         return 1
     print(f'patch_branch_merged={branch_name}')
+    return 0
+
+def handle_patch_branch_remove(branch_name: str) -> int:
+    try:
+        repo_root = git_repository_root()
+        if repo_root is None:
+            raise ValueError('not inside a git worktree')
+        branch_name = resolve_patch_branch_name(branch_name)
+        branch_name = validate_git_branch_name(repo_root, branch_name)
+        if not git_branch_exists(repo_root, branch_name):
+            raise ValueError(f'git branch does not exist: {branch_name}')
+        current_branch = git_current_branch(repo_root)
+        if current_branch == branch_name:
+            git_worktree_is_clean(repo_root)
+            run_git_command(repo_root, ['switch', '-'])
+            if git_current_branch(repo_root) == branch_name:
+                raise ValueError(
+                    'git switch - did not switch away from patch branch'
+                )
+        run_git_command(
+            repo_root,
+            ['branch', '-D', '--', branch_name],
+        )
+    except (OSError, ValueError) as exc:
+        print(f'ERROR: Failed to remove patch branch: {exc}', file=sys.stderr)
+        return 1
+    print(f'patch_branch_removed={branch_name}')
     return 0
 
 def generate_unified_diff(original: str, updated: str, path: str) -> str:
@@ -1409,10 +1443,6 @@ def extract_patch_revision_task(edited_text: str) -> str:
     task_text, separator, _ = edited_text.partition(PATCH_REVISION_HEADING)
     return (task_text if separator else edited_text).strip()
 
-def normalize_line_for_write(text: str) -> str:
-    if "\n" in text or "\r" in text:
-        raise ValueError("content_line_array entries must be single logical lines without embedded newlines.")
-    return text
 
 def prefix_line_numbers(text: str) -> str:
     lines = text.splitlines(keepends=True)
@@ -1463,7 +1493,10 @@ def apply_combined_patch_manifest(
 
     for file_entry in manifest.get("files", []):
         document = file_entry["document"]
-        path = document["path"]
+        path = Path(document["path"])
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = str(path)
         if path not in original_texts:
             original = ""
         else:
@@ -1504,10 +1537,7 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
 
         removed = lines[start_line - 1 : end_line]
 
-        replacement = [
-            normalize_line_for_write(line)
-            for line in patch["content_line_array"]
-        ]
+        replacement = patch["content_line_array"]
 
         # Perform the slice replacement
         lines[start_line - 1 : end_line] = replacement
@@ -2465,7 +2495,7 @@ def run_tree_mode(
                 file_path, tree_system_prompts, system_prompt
             )
             if add_line_numbers:
-                full_system_prompt = linenum_system_prompt + "\n" + selected_system_prompt
+                full_system_prompt = selected_system_prompt + "\n" + linenum_system_prompt
             else:
                 full_system_prompt = selected_system_prompt
             user_prompt = build_user_prompt(
@@ -2791,6 +2821,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar='BOOL|NAME',
         help='Use a git branch for patch changes (default: mcebranch)',
+    )
+    parser.add_argument(
+        '-D',
+        '--patch-branch-remove',
+        nargs='?',
+        const=PATCH_BRANCH_DEFAULT_NAME,
+        default=None,
+        metavar='NAME',
+        help='Remove a patch branch (default: mcebranch)',
     )
     parser.add_argument(
         '-M',
@@ -3333,6 +3372,33 @@ def main() -> int:
     global DEBUG
 
     args = parse_args()
+    if args.patch_branch_remove is not None:
+        if any(
+            value is not None
+            for value in (
+                args.patch_merge,
+                args.patch_branch,
+                args.ask,
+                args.ask_file,
+                args.task,
+                args.task_file,
+                args.patch,
+            )
+        ):
+            print(
+                'ERROR: --patch-branch-remove cannot be combined with '
+                'patch, ask, task, or another patch branch option',
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            remove_branch_name = resolve_patch_branch_name(
+                args.patch_branch_remove
+            )
+        except ValueError as exc:
+            print(f'ERROR: {exc}', file=sys.stderr)
+            return 1
+        return handle_patch_branch_remove(remove_branch_name)
     if args.patch_merge is not None:
         try:
             if git_repository_root() is None:
@@ -4290,7 +4356,7 @@ def main() -> int:
                 else reused_patch_history
             )
         if add_line_numbers or patch_mode:
-            full_system_prompt = (linenum_system_prompt + "\n" + system_prompt)
+            full_system_prompt = (system_prompt + "\n" + linenum_system_prompt)
         else:
             full_system_prompt = system_prompt
         user_prompt = build_user_prompt(
@@ -4341,7 +4407,7 @@ def main() -> int:
         )
         plan_full_system_prompt = system_prompt + "\n" + plan_system_prompt
         if add_line_numbers or patch_mode:
-            plan_full_system_prompt = (linenum_system_prompt + "\n" + system_prompt + "\n" + plan_system_prompt)
+            plan_full_system_prompt = (system_prompt + "\n" + linenum_system_prompt + "\n" + plan_system_prompt)
         if patch_mode:
             plan_full_system_prompt = (plan_full_system_prompt + "\n" +
                 "Design the prompt with the understanding that a patch will be generated but do not include language to indicate this explicitly.")
@@ -4968,10 +5034,6 @@ def main() -> int:
                         patch_repo_root,
                         [Path(fp) for fp, _ in changed_items],
                         patch_commit_message,
-                    )
-                    run_git_command(
-                        patch_repo_root,
-                        ['switch', '--', current_branch],
                     )
                 except Exception as exc:
                     print(f'ERROR: Failed to write and commit patch branch: {exc}', file=sys.stderr)
