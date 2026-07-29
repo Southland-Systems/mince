@@ -4910,7 +4910,7 @@ def main() -> int:
                         print('Aborted.', file=sys.stderr)
                         print(statsline, file=sys.stderr)
                     return 0
-                if revision_task is not None:
+                if revision_task is not None and patch_choice not in ('y', 'yes'):
                     if VERBOSE:
                         print(statsline, file=sys.stderr)
                     json_patch_task = task
