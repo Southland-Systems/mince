@@ -52,6 +52,15 @@ import httpx
 
 VERBOSE = 1
 DEBUG = 0
+NONINTERACTIVE = False
+
+
+def page_or_print(text: str) -> None:
+    if NONINTERACTIVE:
+        print(text, end="")
+    else:
+        pydoc.pager(text)
+
 
 APP_DIR = Path.home() / ".local/state/mince"
 STATE_DIR = APP_DIR / "state"
@@ -101,6 +110,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log": "on",
     "api_log": "on",
 }
+
 DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "openai_base_url": "base_url",
     "openai_proxy": "proxy_server",
@@ -110,6 +120,7 @@ DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "openai_reasoning": "reasoning",
     "openai_extra_body": "extra_body",
 }
+
 PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "name": "line_replace_manifest",
@@ -638,6 +649,7 @@ def handle_prompt_edit(values: list[str]) -> int:
 
 def handle_prompt_print(
     names: list[str] | str | None = None,
+    json_output: bool = False,
  ) -> int:
     if isinstance(names, str):
         names = [names]
@@ -649,10 +661,6 @@ def handle_prompt_print(
                     raise ValueError(
                         f"prompt file does not exist: {prompt_path}"
                     )
-            for prompt_path in prompt_paths:
-                sys.stdout.write(
-                    prompt_path.read_text(encoding="utf-8")
-                )
         else:
             prompt_dir = APP_DIR / "prompts"
             prompt_paths = sorted(
@@ -663,12 +671,24 @@ def handle_prompt_print(
                 ),
                 key=lambda path: path.stem,
             )
+        if json_output:
+            prompt_structure = {
+                path.stem: path.read_text(encoding="utf-8")
+                for path in prompt_paths
+            }
+            print(json.dumps(prompt_structure, indent=2, ensure_ascii=False))
+        elif names:
+            for prompt_path in prompt_paths:
+                sys.stdout.write(
+                    prompt_path.read_text(encoding="utf-8")
+                )
+        else:
             sections = [
                 f"[{path.stem}]\n{path.read_text(encoding='utf-8')}"
                 for path in prompt_paths
             ]
             prompt_text = "\n\n".join(sections)
-            pydoc.pager(
+            page_or_print(
                 prompt_text + ("\n" if prompt_text else "")
             )
     except Exception as exc:
@@ -967,7 +987,6 @@ def prompt_config_value(
 
 
 def init_config_interactive() -> None:
-    ensure_config_exists()
     config = load_config()
     config_document = read_config_document(CONFIG_FILE)
     if migrate_deprecated_config(config_document):
@@ -1039,7 +1058,10 @@ def configuration_profile_names() -> list[str]:
         name for name in profile_names if name != "config"
     ]
 
-def handle_show_profiles(profile_names: list[str] | None = None) -> int:
+def handle_show_profiles(
+    profile_names: list[str] | None = None,
+    json_output: bool = False,
+ ) -> int:
     try:
         available_profiles = configuration_profile_names()
         if profile_names:
@@ -1058,13 +1080,23 @@ def handle_show_profiles(profile_names: list[str] | None = None) -> int:
         else:
             selected_profiles = available_profiles
 
+        profile_configs: dict[str, dict[str, Any]] = {}
         sections: list[str] = []
         for profile_name in selected_profiles:
             profile_config = merged_config(get_profile_path(profile_name))
+            if json_output:
+                profile_config["api_key"] = mask_api_key(
+                    profile_config.get("api_key", "")
+                )
+                profile_configs[profile_name] = profile_config
+                continue
             profile_lines = [f"[{profile_name}]"]
             profile_lines.extend(format_config_lines(profile_config))
             sections.append("\n".join(profile_lines))
-        pydoc.pager("\n\n".join(sections) + "\n")
+        if json_output:
+            print(json.dumps(profile_configs, indent=2, ensure_ascii=False))
+        else:
+            page_or_print("\n\n".join(sections) + "\n")
     except Exception as exc:
         print(f"ERROR: Failed to show profiles: {exc}", file=sys.stderr)
         return 1
@@ -1087,7 +1119,7 @@ def handle_session_view(view_type: str, session_name: str) -> int:
         )
         if not path.is_file():
             raise ValueError(f"session file does not exist: {path}")
-        pydoc.pager(path.read_text(encoding="utf-8"))
+        page_or_print(path.read_text(encoding="utf-8"))
     except Exception as exc:
         print(
             f"ERROR: Failed to view {view_type} session: {exc}",
@@ -1278,11 +1310,27 @@ def git_relative_path(repo_root: Path, path: Path) -> str:
 def prepare_patch_branch(repo_root: Path, branch_name: str) -> None:
     branch_name = resolve_patch_branch_name(branch_name)
     branch_name = validate_git_branch_name(repo_root, branch_name)
-    git_worktree_is_clean(repo_root)
     if git_branch_exists(repo_root, branch_name):
-        if git_current_branch(repo_root) != branch_name:
+        if git_current_branch(repo_root) == branch_name:
+            uncommitted_status = run_git_command(
+                repo_root,
+                ['status', '--porcelain=v1', '--untracked-files=no'],
+            ).stdout.strip()
+            if uncommitted_status:
+                run_git_command(
+                    repo_root,
+                    [
+                        'commit',
+                        '-a',
+                        '-m',
+                        f'Uncommitted {branch_name} changes.',
+                    ],
+                )
+        else:
+            git_worktree_is_clean(repo_root)
             run_git_command(repo_root, ['switch', '--', branch_name])
         return
+    git_worktree_is_clean(repo_root)
     run_git_command(repo_root, ['switch', '--create', branch_name])
 
 def git_commit_patch(
@@ -1327,8 +1375,21 @@ def handle_patch_merge(branch_name: str, commit_message: str) -> int:
         current_branch = git_current_branch(repo_root)
         if current_branch is None:
             raise ValueError('patch merge requires a checked-out branch')
-        git_worktree_is_clean(repo_root)
         if current_branch == branch_name:
+            uncommitted_status = run_git_command(
+                repo_root,
+                ['status', '--porcelain=v1', '--untracked-files=no'],
+            ).stdout.strip()
+            if uncommitted_status:
+                run_git_command(
+                    repo_root,
+                    [
+                        'commit',
+                        '-a',
+                        '-m',
+                        f"Uncommitted {branch_name} changes.",
+                    ],
+                )
             run_git_command(repo_root, ['switch', '-'])
             current_branch = git_current_branch(repo_root)
             if current_branch is None:
@@ -1339,6 +1400,8 @@ def handle_patch_merge(branch_name: str, commit_message: str) -> int:
                 raise ValueError(
                     'git switch - did not switch away from patch branch'
                 )
+        else:
+            git_worktree_is_clean(repo_root)
         run_git_command(repo_root, ['merge', '--squash', branch_name])
         staged_result = run_git_command(
             repo_root,
@@ -1492,11 +1555,7 @@ def apply_combined_patch_manifest(
     updated_texts: dict[str, str] = {}
 
     for file_entry in manifest.get("files", []):
-        document = file_entry["document"]
-        path = Path(document["path"])
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        path = str(path)
+        path = str(patch_manifest_document_path(file_entry))
         if path not in original_texts:
             original = ""
         else:
@@ -1546,7 +1605,240 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
     if original_text.endswith(eol):
         result += eol
     return result
+def patch_manifest_document_path(file_entry: dict[str, Any]) -> Path:
+    document = file_entry["document"]
+    path = Path(str(document["path"])).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
 
+
+def build_patch_changes(
+    original_texts: dict[str, str],
+    manifest: dict[str, Any],
+ ) -> tuple[dict[str, str], str, list[tuple[str, str]]]:
+    updated_texts = apply_combined_patch_manifest(
+        original_texts,
+        manifest,
+    )
+    diffs: list[str] = []
+    changed_items: list[tuple[str, str]] = []
+    for path, updated_text in updated_texts.items():
+        original_text = original_texts.get(path, "")
+        if updated_text == original_text:
+            continue
+        changed_items.append((path, updated_text))
+        diff = generate_unified_diff(original_text, updated_text, path)
+        if diff:
+            diffs.append(diff)
+    return updated_texts, "\n".join(diffs), changed_items
+
+
+def load_patch_manifest(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError(f"patch JSON file does not exist: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot read patch JSON file {path} ({exc})") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("patch manifest must contain a JSON object")
+    files = raw.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("patch manifest must contain a non-empty files array")
+    commit_message = raw.get("commit_message")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise ValueError("patch manifest commit_message cannot be empty")
+    return raw
+
+
+def resolve_patch_file_argument(value: str) -> Path:
+    raw_value = value.strip()
+    if not raw_value:
+        raise ValueError("patch session or file path cannot be empty")
+    try:
+        session_name = validate_session_name(raw_value)
+    except ValueError:
+        return Path(raw_value).expanduser()
+    session_path = APP_DIR / "patches" / f"{session_name}.json"
+    if session_path.is_file():
+        return session_path
+    return Path(raw_value).expanduser()
+
+
+def load_patch_original_texts(
+    manifest: dict[str, Any],
+ ) -> dict[str, str]:
+    original_texts: dict[str, str] = {}
+    for file_entry in manifest["files"]:
+        path = patch_manifest_document_path(file_entry)
+        path_text = str(path)
+        if path_text in original_texts:
+            raise ValueError(f"patch contains duplicate document path: {path}")
+        if not path.exists():
+            original_texts[path_text] = ""
+            continue
+        if not path.is_file():
+            raise ValueError(f"patch document path is not a file: {path}")
+        try:
+            original_texts[path_text] = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            raise ValueError(f"cannot read patch document {path} ({exc})") from exc
+    return original_texts
+
+
+def write_patch_changes(
+    changed_items: list[tuple[str, str]],
+    all_paths: list[Path],
+    patch_review: bool,
+    patch_suffix: str,
+    suffix_provided: bool,
+    patch_branch_setting: str | None,
+    patch_commit_message: str,
+ ) -> None:
+    if patch_branch_setting is not None:
+        branch_name = resolve_patch_branch_name(patch_branch_setting)
+        repo_root = git_repository_root()
+        if repo_root is None:
+            raise ValueError("not inside a git worktree")
+        current_branch = git_current_branch(repo_root)
+        if current_branch is None:
+            raise ValueError("patch branch mode requires a checked-out branch")
+        branch_name = validate_git_branch_name(repo_root, branch_name)
+        for path in all_paths:
+            git_relative_path(repo_root, path)
+        for path_text, _ in changed_items:
+            git_relative_path(repo_root, Path(path_text))
+        prepare_patch_branch(repo_root, branch_name)
+        for path_text, updated_text in changed_items:
+            Path(path_text).write_text(updated_text, encoding="utf-8")
+        git_commit_patch(
+            repo_root,
+            [Path(path_text) for path_text, _ in changed_items],
+            patch_commit_message,
+        )
+        for path_text, _ in changed_items:
+            print(f"file_written={path_text}")
+        print(f"patch_branch={branch_name}")
+        return
+
+    for path_text, updated_text in changed_items:
+        original_path = Path(path_text)
+        if patch_review:
+            target_path = (
+                append_suffix_to_path(original_path, patch_suffix)
+                if suffix_provided
+                else original_path
+            )
+            target_path.write_text(updated_text, encoding="utf-8")
+            print(
+                f"file_written="
+                f"{str(target_path) if suffix_provided else path_text}"
+            )
+        else:
+            target_path = append_suffix_to_path(original_path, patch_suffix)
+            target_path.write_text(updated_text, encoding="utf-8")
+            print(f"file_written={target_path}")
+
+
+def handle_patch_file_apply(
+    patch_file_argument: str,
+    config: dict[str, Any],
+    patch_review_argument: bool | None,
+    patch_suffix_argument: str | None,
+    patch_branch_argument: str | None,
+ ) -> int:
+    try:
+        patch_path = resolve_patch_file_argument(patch_file_argument)
+        manifest = load_patch_manifest(patch_path)
+        original_texts = load_patch_original_texts(manifest)
+    except Exception as exc:
+        print(f"ERROR: Failed to load patch file: {exc}", file=sys.stderr)
+        return 1
+
+    patch_review = (
+        patch_review_argument
+        if patch_review_argument is not None
+        else coerce_bool(config.get("patch_review", "off"))
+    )
+    configured_patch_suffix = str(
+        config.get("patch_suffix", DEFAULT_CONFIG["patch_suffix"]) or ""
+    ).strip()
+    if patch_suffix_argument is not None:
+        patch_suffix = patch_suffix_argument
+        suffix_provided = True
+    elif configured_patch_suffix and configured_patch_suffix.lower() != "off":
+        patch_suffix = configured_patch_suffix
+        suffix_provided = configured_patch_suffix != DEFAULT_CONFIG["patch_suffix"]
+    else:
+        patch_suffix = DEFAULT_CONFIG["patch_suffix"]
+        suffix_provided = False
+
+    try:
+        patch_branch_setting = resolve_patch_branch_setting(
+            patch_branch_argument
+            if patch_branch_argument is not None
+            else config.get("patch_branch", DEFAULT_CONFIG["patch_branch"])
+        )
+    except ValueError as exc:
+        print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
+        return 1
+    if patch_branch_setting is not None:
+        patch_suffix = ""
+        suffix_provided = False
+
+    patch_commit_message = str(manifest["commit_message"]).strip()
+    try:
+        _, diff_text, changed_items = build_patch_changes(
+            original_texts,
+            manifest,
+        )
+    except Exception as exc:
+        print(f"ERROR: Failed to apply patch manifest: {exc}", file=sys.stderr)
+        return 1
+
+    if not changed_items:
+        if VERBOSE:
+            print("No changes.", file=sys.stderr)
+        return 0
+
+    if VERBOSE or patch_review:
+        print()
+        print(diff_text)
+
+    if patch_review:
+        while True:
+            patch_choice = input("Apply these changes? [y/n/p]: ").strip().lower()
+            if patch_choice == "p":
+                page_or_print(diff_text)
+                continue
+            if patch_choice in ("y", "yes"):
+                break
+            if patch_choice in ("n", "no"):
+                if VERBOSE:
+                    print("Aborted.", file=sys.stderr)
+                return 0
+            print("Please answer y, n, or p.")
+
+    try:
+        write_patch_changes(
+            changed_items=changed_items,
+            all_paths=[Path(path) for path in original_texts],
+            patch_review=patch_review,
+            patch_suffix=patch_suffix,
+            suffix_provided=suffix_provided,
+            patch_branch_setting=patch_branch_setting,
+            patch_commit_message=patch_commit_message,
+        )
+    except Exception as exc:
+        action = (
+            "write and commit patch branch"
+            if patch_branch_setting is not None
+            else "write patch files"
+        )
+        print(f"ERROR: Failed to {action}: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 # -------------------------------------------------------------------
 # Helpers
@@ -2744,6 +3036,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="MinCE: minimal AI assistant for text files"
     )
+
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "-a",
@@ -2752,24 +3045,28 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Prompt without file context or the configured system prompt (use - for STDIN or e to edit)",
     )
+
     mode_group.add_argument(
         "--ask-file",
         metavar="FILE",
         type=Path,
         help="Read the ask prompt from the given file",
     )
+
     mode_group.add_argument(
         "-t",
         "--task",
         metavar="TEXT",
         help="Task/prompt for the model with file context (use - for STDIN or e to edit)",
     )
+
     mode_group.add_argument(
         "--task-file",
         metavar="FILE",
         type=Path,
         help="Read the task/prompt from the given file",
     )
+
     parser.add_argument(
         "--plan",
         nargs="?",
@@ -2779,6 +3076,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Create an AI prompt for review before using it as the task",
     )
+
     files_group = parser.add_mutually_exclusive_group()
     files_group.add_argument(
         "-f",
@@ -2786,18 +3084,21 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help="Files to include as context",
     )
+
     files_group.add_argument(
         "--files-list",
         metavar="FILE",
         type=Path,
         help="Read context file paths from a file (one file per line)",
     )
+
     parser.add_argument(
         "-p",
         "--profile",
         metavar="NAME",
         help="Select configuration profile",
     )
+
     parser.add_argument(
         "-o",
         "--output-file",
@@ -2805,6 +3106,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Write the response to the given file (overwrites if it exists)",
     )
+
     parser.add_argument(
         "--patch",
         nargs="?",
@@ -2814,6 +3116,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Patch specified files and write changes to the filename + patch suffix",
     )
+
     parser.add_argument(
         '--patch-branch',
         nargs='?',
@@ -2822,6 +3125,7 @@ def parse_args() -> argparse.Namespace:
         metavar='BOOL|NAME',
         help='Use a git branch for patch changes (default: mcebranch)',
     )
+
     parser.add_argument(
         '-D',
         '--patch-branch-remove',
@@ -2831,6 +3135,7 @@ def parse_args() -> argparse.Namespace:
         metavar='NAME',
         help='Remove a patch branch (default: mcebranch)',
     )
+
     parser.add_argument(
         '-M',
         '--patch-merge',
@@ -2838,6 +3143,7 @@ def parse_args() -> argparse.Namespace:
         metavar='TEXT',
         help='Merge an existing patch branch with the supplied commit message',
     )
+
     parser.add_argument(
         "--patch-review",
         nargs="?",
@@ -2847,12 +3153,14 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Confirm the changes before writing to filenames *without* the suffix (override with --patch-suffix)",
     )
+
     parser.add_argument(
         "-S",
         "--patch-suffix",
         type=str,
         help="Suffix for patched files (default: .mcepatched)",
     )
+
     parser.add_argument(
         "--patch-save",
         nargs="?",
@@ -2862,6 +3170,19 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Save patch file to HOME/.local/state/mince/patches (default: on)",
     )
+
+    parser.add_argument(
+        "--noninteractive",
+        action="store_true",
+        help="Disables review and saves the response or patches and exits",
+    )
+
+    parser.add_argument(
+        "--patch-file-apply",
+        metavar="SESSION|PATH",
+        help="Load a saved JSON patch session or JSON patch file and apply it",
+    )
+
     parser.add_argument(
         "--reuse-session",
         nargs="+",
@@ -2871,11 +3192,13 @@ def parse_args() -> argparse.Namespace:
             "session (optionally at TURN)"
         ),
     )
+
     parser.add_argument(
         "--reuse-session-skip-verify",
         action="store_true",
         help="Skip checksum verification when reusing a session",
     )
+
     tree_files_group = parser.add_mutually_exclusive_group()
     tree_files_group.add_argument(
         "--tree-files",
@@ -2883,12 +3206,14 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Files or directories to process recursively in tree mode",
     )
+
     tree_files_group.add_argument(
         "--tree-files-list",
         metavar="FILE",
         type=Path,
         help="Read tree-mode files or directories from a file",
     )
+
     tree_task_group = parser.add_mutually_exclusive_group()
     tree_task_group.add_argument(
         "--tree-task",
@@ -2896,24 +3221,28 @@ def parse_args() -> argparse.Namespace:
         metavar="TEXT",
         help="Task/prompt for tree mode (use - for STDIN or e to edit)",
     )
+
     tree_task_group.add_argument(
         "--tree-task-file",
         metavar="FILE",
         type=Path,
         help="Read tree-mode tasks from this file (.ext:task, *:task, or an overall task; can be repeated)",
     )
+
     parser.add_argument(
         "--tree-system-prompt-file",
         metavar="FILE",
         type=Path,
         help="Per-extension system prompts (.ext:prompt, *:prompt, or an overall prompt; can be repeated)",
     )
+
     parser.add_argument(
         "--tree-exclude",
         nargs="+",
         metavar="PATTERN",
         help="Exclude tree files matching any of the supplied patterns",
     )
+
     parser.add_argument(
         "--tree-exclude-git",
         nargs="?",
@@ -2923,17 +3252,20 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Exclude .git directories from tree search (default: on)",
     )
+
     parser.add_argument(
         "--tree-include",
         nargs="+",
         metavar="PATTERN",
         help="Include only tree files matching any the supplied patterns",
     )
+
     parser.add_argument(
         "--tree-show-only",
         action="store_true",
         help="Only output the filtered tree file list and exit",
     )
+
     parser.add_argument(
         "--tree-parallel",
         nargs="?",
@@ -2943,6 +3275,7 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Maximum parallel tree calls (default: 16)",
     )
+
     parser.add_argument(
         "--tree-reuse-session",
         dest="reuse_session",
@@ -2950,44 +3283,52 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     sys_prompt_group = parser.add_mutually_exclusive_group()
     sys_prompt_group.add_argument(
         "--system-prompt",
         metavar="TEXT",
         help="System prompt override",
     )
+
     sys_prompt_group.add_argument(
         "--system-prompt-file",
         metavar="FILE",
         type=Path,
         help="Read the system prompt from the given file",
     )
+
     parser.add_argument(
         "--patch-system-prompt",
         metavar="TEXT",
         help="System prompt for patch mode",
     )
+
     parser.add_argument(
         "--plan-system-prompt",
         metavar="TEXT",
         help="System prompt for plan mode",
     )
+
     parser.add_argument(
         "--model",
         metavar="MODEL",
         help="Override configured model",
     )
+
     parser.add_argument(
         "--list-models",
         action="store_true",
         help="List available models",
     )
+
     parser.add_argument(
         "--base-url",
         dest="base_url",
         metavar="URL",
         help="OpenAI-compatible API base URL",
     )
+
     parser.add_argument(
         "--openai-base-url",
         dest="base_url",
@@ -2995,12 +3336,14 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--proxy-server",
         dest="proxy_server",
         metavar="URL",
         help="HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)",
     )
+
     parser.add_argument(
         "--openai-proxy",
         dest="proxy_server",
@@ -3008,12 +3351,14 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--meta-organization",
         dest="meta_organization",
         metavar="TEXT",
         help="Optional organization ID",
     )
+
     parser.add_argument(
         "--openai-organization",
         dest="meta_organization",
@@ -3021,12 +3366,14 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--meta-project",
         dest="meta_project",
         metavar="TEXT",
         help="Optional project name or ID",
     )
+
     parser.add_argument(
         "--openai-project",
         dest="meta_project",
@@ -3034,12 +3381,14 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--service-tier",
         dest="service_tier",
         choices=("off", "auto", "default", "flex", "scale", "priority"),
         help="Service tier",
     )
+
     parser.add_argument(
         "--openai-service-tier",
         dest="service_tier",
@@ -3047,12 +3396,14 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--response-format",
         choices=("text", "json", "schema"),
         default="text",
         help="LLM response format in text, JSON or JSON-Schema",
     )
+
     parser.add_argument(
         "--stream",
         nargs="?",
@@ -3062,36 +3413,42 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Stream text responses as they are generated",
     )
+
     parser.add_argument(
         "--schema-file",
         metavar="FILE",
         type=Path,
         help="Path to a JSON Schema file (required for --response-format schema)",
     )
+
     parser.add_argument(
         "--response-verbosity",
         choices=("low", "medium", "high", "off"),
         default="off",
         help="Verbosity level for text responses (default: off)",
     )
+
     parser.add_argument(
         "--temperature",
         metavar="FLOAT",
         type=str,
         help="Sampling temperature (0.0-2.0) or 'off' to disable",
     )
+
     parser.add_argument(
         "--top-p",
         metavar="FLOAT",
         type=str,
         help="Top-p nucleus sampling (0.0-1.0) or 'off' to disable",
     )
+
     parser.add_argument(
         "--reasoning",
         dest="reasoning",
         choices=("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"),
         help="Reasoning effort level (off to disable)",
     )
+
     parser.add_argument(
         "--openai-reasoning",
         dest="reasoning",
@@ -3099,18 +3456,21 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--reasoning-mode",
         choices=("standard", "pro"),
         type=str,
         help="Reasoning mode (standard or pro)",
     )
+
     parser.add_argument(
         "--extra-body",
         dest="extra_body",
         metavar="KEY=VALUE[,KEY=VALUE,...]",
         help="Custom model parameters",
     )
+
     parser.add_argument(
         "--openai-extra-body",
         dest="extra_body",
@@ -3118,40 +3478,47 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     parser.add_argument(
         "--token-limit",
         metavar="LIMIT",
         type=int,
         help="Maximum allowed input token count (65534)",
     )
+
     parser.add_argument(
         "--token-cost",
         metavar="INPUT:OUTPUT",
         type=str,
         help="Token cost per million tokens ('off' to disable)",
     )
+
     parser.add_argument(
         "--estimate-only",
         action="store_true",
         help="Print only the estimated input token count",
     )
+
     parser.add_argument(
         "--max-output-tokens",
         metavar="LIMIT",
         type=int,
         help="Maximum output tokens the LLM will use (65534)",
     )
+
     parser.add_argument(
         "--llm-timeout",
         metavar="SECONDS",
         type=int,
         help="Timeout for the API request (300)",
     )
+
     parser.add_argument(
         "--linenum-system-prompt",
         metavar="TEXT",
         help="System prompt for handling context file line numbers",
     )
+
     parser.add_argument(
         "--no-line-numbers",
         nargs="?",
@@ -3161,6 +3528,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Do not prefix line numbers to context files",
     )
+
     parser.add_argument(
         "--print-reasoning",
         nargs="?",
@@ -3170,29 +3538,34 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Include the reasoning output in <think> tags",
     )
+
     config_print_group = parser.add_mutually_exclusive_group()
     config_print_group.add_argument(
         "--print-default-config",
         action="store_true",
         help="Print the built-in default configuration as JSON",
     )
+
     config_print_group.add_argument(
         "--print-current-config",
         action="store_true",
         help="Print the stored configuration file (creates it if missing)",
     )
+
     config_print_group.add_argument(
         "--set-config",
         metavar="NAME=VALUE",
         action="append",
         help="Set a configuration value (use DEFAULT to reset it; may be repeated)",
     )
+
     config_print_group.add_argument(
         "--set-config-from",
         nargs=2,
         metavar=("NAME", "PROFILE"),
         help="Set a configuration value for NAME from another profile",
     )
+
     config_print_group.add_argument(
         "--get-config",
         nargs="?",
@@ -3201,6 +3574,7 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME",
         help="Get a configuration value, or all values if NAME is omitted",
     )
+
     parser.add_argument(
         "--log",
         nargs="?",
@@ -3210,6 +3584,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Log session to HOME/.local/state/mince/logs",
     )
+
     parser.add_argument(
         "--no-api-log",
         nargs="?",
@@ -3219,6 +3594,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Do not store requests and responses in the OpenAI API",
     )
+
     parser.add_argument(
         "--quiet",
         nargs="?",
@@ -3228,43 +3604,58 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Suppress printing of extra output (stats, information)",
     )
+
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Output the request and response objects within tags",
     )
+
     profile_action_group = parser.add_mutually_exclusive_group()
     profile_action_group.add_argument(
         "--init",
         action="store_true",
         help="Initialize and interactively change the configuration file",
     )
+
     profile_action_group.add_argument(
         "--init-profile",
         metavar="NAME",
         help="Interactively initialise a new configuration profile",
     )
+
     profile_action_group.add_argument(
         "--copy-profile",
         metavar="NEW_NAME",
         help="Copy the current configuration profile to a new profile",
     )
+
     profile_action_group.add_argument(
         "--remove-profile",
         metavar="NAME",
         help="Remove a configuration profile",
     )
+
     profile_action_group.add_argument(
         "--list-profiles",
         action="store_true",
         help="List available configuration profiles",
     )
+
     profile_action_group.add_argument(
         "--print-profiles",
         nargs="*",
         metavar="NAME",
         help="Display all configuration profiles or only the named profiles",
     )
+
+    profile_action_group.add_argument(
+        "--print-profiles-json",
+        nargs="*",
+        metavar="NAME",
+        help="Display all configuration profiles or only the named profiles as a JSON object keyed by name",
+    )
+
     profile_action_group.add_argument(
         "--show-profiles",
         nargs="*",
@@ -3273,52 +3664,69 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
+
     profile_action_group.add_argument(
         "--prompt-list",
         action="store_true",
         help="List stored prompts and their profile assignments",
     )
+
     profile_action_group.add_argument(
         "--prompt-edit",
         nargs="+",
         metavar=("NAME", "TEXT"),
         help="Edit or create the prompt NAME or form it from additional TEXT arguments",
     )
+
     profile_action_group.add_argument(
         "--prompt-assign",
         nargs=3,
         metavar=("NAME", "PROFILE", "TYPE"),
         help="Add prompt NAME to PROFILE prompt TYPE (types: system, linenum, patch, plan)",
     )
+
     profile_action_group.add_argument(
         "--prompt-assign-text",
         nargs=3,
         metavar=("NAME", "PROFILE", "TYPE"),
         help="Replace PROFILE prompt TYPE with text content of prompt NAME",
     )
+
     profile_action_group.add_argument(
         "--prompt-assign-replace",
         nargs=3,
         metavar=("NAME", "PROFILE", "TYPE"),
         help="Replace PROFILE prompt TYPE with prompt NAME",
     )
+
     profile_action_group.add_argument(
         "--prompt-unassign",
         nargs="+",
         metavar=("NAME PROFILE", "TYPE"),
         help="Remove prompt NAME from PROFILE with optional prompt TYPE",
+
     )
+
     profile_action_group.add_argument(
         "--prompt-remove",
         metavar="NAME",
         help="Remove prompt NAME from all profiles and delete it",
     )
+
     profile_action_group.add_argument(
         "--prompt-print",
         nargs="*",
         metavar="NAME",
         help="Print all stored prompts or specified prompts with NAMES",
     )
+
+    profile_action_group.add_argument(
+        "--prompt-print-json",
+        nargs="*",
+        metavar="NAME",
+        help="Print all stored prompts or specified prompts as a JSON object keyed by name",
+    )
+
     parser.add_argument(
         "--prompt-expansion",
         nargs="?",
@@ -3328,22 +3736,26 @@ def parse_args() -> argparse.Namespace:
         metavar="BOOL",
         help="Expand ^^promptname^^ references using the prompt library (default: off)",
     )
+
     session_view_group = parser.add_mutually_exclusive_group()
     session_view_group.add_argument(
         "--log-view",
         metavar="SESSION",
         help="Display a saved log session",
     )
+
     session_view_group.add_argument(
         "--patch-view",
         metavar="SESSION",
         help="Display a saved patch session",
     )
+
     session_view_group.add_argument(
         "--tree-view",
         metavar="SESSION",
         help="Display a saved combined tree manifest",
     )
+
     session_view_group.add_argument(
         "--remove-expired-data",
         nargs="?",
@@ -3353,6 +3765,7 @@ def parse_args() -> argparse.Namespace:
         metavar="KEEP_DAYS",
         help="Delete session data older than KEEP_DAYS days (default: 60)",
     )
+
     return parser.parse_args()
 
 # -------------------------------------------------------------------
@@ -3370,8 +3783,79 @@ def main() -> int:
     global CONFIG_FILE
     global VERBOSE
     global DEBUG
+    global NONINTERACTIVE
+
+    ensure_config_exists()
 
     args = parse_args()
+    NONINTERACTIVE = args.noninteractive
+    if args.noninteractive and (args.init or args.init_profile is not None):
+        print(
+            "ERROR: --init and --init-profile cannot be used with "
+            "--noninteractive",
+            file=sys.stderr,
+        )
+        return 1
+    if args.patch_file_apply is not None:
+        patch_apply_conflicts = (
+            ("--ask", args.ask is not None),
+            ("--ask-file", args.ask_file is not None),
+            ("--task", args.task is not None),
+            ("--task-file", args.task_file is not None),
+            ("--files", args.files is not None),
+            ("--files-list", args.files_list is not None),
+            ("--patch", args.patch is not None),
+            ("--plan", args.plan is not None),
+            ("--output-file", args.output_file is not None),
+            ("--patch-save", args.patch_save is not None),
+            ("--noninteractive", args.noninteractive),
+            ("--reuse-session", args.reuse_session is not None),
+            ("--tree-files", args.tree_files is not None),
+            ("--tree-files-list", args.tree_files_list is not None),
+            ("--tree-task", args.tree_task is not None),
+            ("--tree-task-file", args.tree_task_file is not None),
+            ("--tree-show-only", args.tree_show_only),
+            ("--list-models", args.list_models),
+            ("--estimate-only", args.estimate_only),
+            ("--patch-branch-remove", args.patch_branch_remove is not None),
+            ("--patch-merge", args.patch_merge is not None),
+            ("--remove-expired-data", args.remove_expired_data is not None),
+            ("--log-view", args.log_view is not None),
+            ("--patch-view", args.patch_view is not None),
+            ("--tree-view", args.tree_view is not None),
+            ("--init", args.init),
+            ("--init-profile", args.init_profile is not None),
+            ("--copy-profile", args.copy_profile is not None),
+            ("--remove-profile", args.remove_profile is not None),
+            ("--list-profiles", args.list_profiles),
+            ("--print-profiles", args.print_profiles is not None),
+            ("--print-profiles-json", args.print_profiles_json is not None),
+            ("--prompt-list", args.prompt_list),
+            ("--prompt-edit", args.prompt_edit is not None),
+            ("--prompt-assign", args.prompt_assign is not None),
+            ("--prompt-assign-text", args.prompt_assign_text is not None),
+            ("--prompt-assign-replace", args.prompt_assign_replace is not None),
+            ("--prompt-unassign", args.prompt_unassign is not None),
+            ("--prompt-remove", args.prompt_remove is not None),
+            ("--prompt-print", args.prompt_print is not None),
+            ("--prompt-print-json", args.prompt_print_json is not None),
+            ("--set-config", args.set_config is not None),
+            ("--set-config-from", args.set_config_from is not None),
+            ("--get-config", args.get_config is not None),
+            ("--print-default-config", args.print_default_config),
+            ("--print-current-config", args.print_current_config),
+        )
+        conflict = next(
+            (name for name, used in patch_apply_conflicts if used),
+            None,
+        )
+        if conflict is not None:
+            print(
+                f"ERROR: --patch-file-apply cannot be combined with {conflict}",
+                file=sys.stderr,
+            )
+            return 1
+
     if args.patch_branch_remove is not None:
         if any(
             value is not None
@@ -3399,6 +3883,7 @@ def main() -> int:
             print(f'ERROR: {exc}', file=sys.stderr)
             return 1
         return handle_patch_branch_remove(remove_branch_name)
+
     if args.patch_merge is not None:
         try:
             if git_repository_root() is None:
@@ -3430,6 +3915,7 @@ def main() -> int:
             print(f'ERROR: {exc}', file=sys.stderr)
             return 1
         return handle_patch_merge(merge_branch_name, merge_commit_message)
+
     reuse_session_turn: int | None = None
     if isinstance(args.reuse_session, list):
         if len(args.reuse_session) > 2:
@@ -3448,12 +3934,14 @@ def main() -> int:
                 )
                 return 1
         args.reuse_session = args.reuse_session[0]
+
     if reuse_session_turn is not None and reuse_session_turn < 0:
         print(
             "ERROR: --reuse-session TURN must be non-negative",
             file=sys.stderr,
         )
         return 1
+
     if args.remove_expired_data is not None:
         return handle_remove_expired_data(args.remove_expired_data)
 
@@ -3476,6 +3964,8 @@ def main() -> int:
 
     if args.prompt_list:
         return handle_prompt_list()
+    if args.prompt_print_json is not None:
+        return handle_prompt_print(args.prompt_print_json, json_output=True)
     if args.prompt_print is not None:
         return handle_prompt_print(args.prompt_print)
     if args.prompt_edit is not None:
@@ -3507,6 +3997,11 @@ def main() -> int:
 
     if args.print_profiles is not None:
         return handle_show_profiles(args.print_profiles)
+    if args.print_profiles_json is not None:
+        return handle_show_profiles(
+            args.print_profiles_json,
+            json_output=True,
+        )
 
     if args.init_profile:
         new_name = args.init_profile
@@ -3562,7 +4057,15 @@ def main() -> int:
         return 0
 
     CONFIG_FILE = get_profile_path(base_profile)
-
+    if args.patch_file_apply is not None:
+        patch_config = load_config()
+        return handle_patch_file_apply(
+            args.patch_file_apply,
+            patch_config,
+            patch_review_argument=args.patch_review,
+            patch_suffix_argument=args.patch_suffix,
+            patch_branch_argument=args.patch_branch,
+        )
     if args.set_config_from:
         name, source_profile = args.set_config_from
         try:
@@ -3802,7 +4305,7 @@ def main() -> int:
         print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
         return 1
     patch_branch_mode = patch_branch_setting is not None
-    patch_save_enabled = (
+    patch_save_enabled = args.noninteractive or (
         args.patch_save
         if args.patch_save is not None
         else coerce_bool(config.get("patch_save", "on"), True)
@@ -4168,9 +4671,11 @@ def main() -> int:
             print(f"log_file={log_path}", file=sys.stderr)
 
     patch_save_path = None
+    patch_json_save_path = None
     if patch_save_enabled and patch_mode:
         patch_stem = log_path.stem if log_path is not None else session_stem
         patch_save_path = APP_DIR / "patches" / f"{patch_stem}.patch"
+        patch_json_save_path = APP_DIR / "patches" / f"{patch_stem}.json"
     if patch_branch_mode:
         try:
             patch_branch_name = resolve_patch_branch_name(patch_branch_setting)
@@ -4500,13 +5005,18 @@ def main() -> int:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"<plan_response>\n{plan_result}\n</plan_response>\n")
                 f.write(f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n")
+        if args.noninteractive:
+            if VERBOSE:
+                print(plan_statsline, file=sys.stderr)
+            print(f"state_session_name={state_session_dir.name}")
+            return 0
         while True:
             print()
             print(plan_result)
             print()
             plan_choice = input("Use this plan? [y/n/p/e]: ").strip().lower()
             if plan_choice == "p":
-                pydoc.pager(plan_result)
+                page_or_print(plan_result)
                 continue
             if plan_choice in ("e", "edit"):
                 try:
@@ -4851,7 +5361,9 @@ def main() -> int:
                 ).strip()
                 manifest = json.loads(result)
             except json.JSONDecodeError as exc:
+                print('<invalid_json_patch>')
                 print(result)
+                print('</invalid_json_patch>')
                 if VERBOSE:
                     print(statsline, file=sys.stderr)
                 print(
@@ -4871,37 +5383,44 @@ def main() -> int:
                     return 1
                 patch_commit_message = raw_commit_message.strip()
 
-            updated_texts = apply_combined_patch_manifest(
-                original_texts,
-                manifest,
-            )
+            try:
+                updated_texts, diff_text, changed_items = build_patch_changes(
+                    original_texts,
+                    manifest,
+                )
+            except Exception as exc:
+                print(
+                    f'ERROR: Failed to apply patch manifest: {exc}',
+                    file=sys.stderr,
+                )
+                return 1
 
-            diffs = []
-            for fp, ut in updated_texts.items():
-                ot = original_texts.get(fp, '')
-                if ut != ot:
-                    d = generate_unified_diff(ot, ut, fp)
-                    if d:
-                        diffs.append(d)
-            if not diffs:
+            if not changed_items:
                 if VERBOSE:
                     print('No changes.', file=sys.stderr)
                     print(statsline, file=sys.stderr)
+                if args.noninteractive:
+                    print(f'state_session_name={state_session_dir.name}')
                 return 0
-            diff_text = '\n'.join(diffs)
             if patch_save_path is not None:
                 try:
                     patch_save_path.parent.mkdir(parents=True, exist_ok=True)
                     patch_save_path.write_text(diff_text, encoding='utf-8')
+                    patch_json_save_path.write_text(result, encoding='utf-8')
                 except Exception as exc:
                     print(
-                        f'ERROR: Failed to save patch file to '
-                        f'{patch_save_path}: {exc}',
+                        f'ERROR: Failed to save patch files to '
+                        f'{patch_save_path} and {patch_json_save_path}: {exc}',
                         file=sys.stderr,
                     )
                     return 1
                 if VERBOSE:
-                    print(f'patch_file={patch_save_path}', file=sys.stderr)
+                    print(f'patch_file={patch_save_path} patch_json_file={patch_json_save_path}', file=sys.stderr)
+                if args.noninteractive:
+                    if VERBOSE:
+                        print(statsline, file=sys.stderr)
+                    print(f'state_session_name={state_session_dir.name}')
+                    return 0
             if VERBOSE or patch_review:
                 print()
                 print(diff_text)
@@ -4936,7 +5455,7 @@ def main() -> int:
                     if patch_choice in ('y', 'yes', 'n', 'no'):
                         break
                     if patch_choice == 'p':
-                        pydoc.pager(diff_text)
+                        page_or_print(diff_text)
                         continue
                     if patch_choice == 'e':
                         try:
@@ -5003,61 +5522,24 @@ def main() -> int:
                     patch_turn_index += 1
                     continue
 
-            changed_items = [
-                (fp, ut)
-                for fp, ut in updated_texts.items()
-                if ut != original_texts.get(fp, '')
-            ]
-            if patch_branch_mode:
-                try:
-                    patch_branch_name = resolve_patch_branch_name(patch_branch_setting)
-                    patch_repo_root = git_repository_root()
-                    if patch_repo_root is None:
-                        raise ValueError('not inside a git worktree')
-                    current_branch = git_current_branch(patch_repo_root)
-                    if current_branch is None:
-                        raise ValueError(
-                            'patch branch mode requires a checked-out branch'
-                        )
-                    patch_branch_name = validate_git_branch_name(
-                        patch_repo_root,
-                        patch_branch_name,
-                    )
-                    for file_name in file_names:
-                        git_relative_path(patch_repo_root, Path(file_name))
-                    for fp, _ in changed_items:
-                        git_relative_path(patch_repo_root, Path(fp))
-                    prepare_patch_branch(patch_repo_root, patch_branch_name)
-                    for fp, ut in changed_items:
-                        Path(fp).write_text(ut, encoding='utf-8')
-                    git_commit_patch(
-                        patch_repo_root,
-                        [Path(fp) for fp, _ in changed_items],
-                        patch_commit_message,
-                    )
-                except Exception as exc:
-                    print(f'ERROR: Failed to write and commit patch branch: {exc}', file=sys.stderr)
-                    return 1
-                for fp, _ in changed_items:
-                    print(f'file_written={fp}')
-                print(f'patch_branch={patch_branch_name}')
-            else:
-                for fp, ut in changed_items:
-                    if patch_review:
-                        tgt = (
-                            append_suffix_to_path(Path(fp), patch_suffix)
-                            if suffix_provided
-                            else Path(fp)
-                        )
-                        tgt.write_text(ut, encoding='utf-8')
-                        print(
-                            f'file_written='
-                            f'{str(tgt) if suffix_provided else fp}'
-                        )
-                    else:
-                        outp = append_suffix_to_path(Path(fp), patch_suffix)
-                        outp.write_text(ut, encoding='utf-8')
-                        print(f'file_written={outp}')
+            try:
+                write_patch_changes(
+                    changed_items=changed_items,
+                    all_paths=[Path(path) for path in updated_texts],
+                    patch_review=patch_review,
+                    patch_suffix=patch_suffix,
+                    suffix_provided=suffix_provided,
+                    patch_branch_setting=patch_branch_setting,
+                    patch_commit_message=patch_commit_message,
+                )
+            except Exception as exc:
+                action = (
+                    'write and commit patch branch'
+                    if patch_branch_mode
+                    else 'write patch files'
+                )
+                print(f'ERROR: Failed to {action}: {exc}', file=sys.stderr)
+                return 1
 
             if VERBOSE:
                 print(statsline, file=sys.stderr)
