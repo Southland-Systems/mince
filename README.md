@@ -133,7 +133,12 @@ mince --patch --patch-review --patch-branch -f mince README.md \
 mince --patch --patch-review --patch-branch -f README.md \
   -t 'Rewrite the language to be professional.'
 
-git diff main mcebranch
+# revert last commit
+git reset --hard HEAD~1
+git diff HEAD~1
+
+mince --patch --patch-review --patch-branch -f README.md \
+  -t 'Rewrite the language to use a professional tone.'
 
 mince -M Updated README with improved language.
 ```

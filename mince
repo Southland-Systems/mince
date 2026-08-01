@@ -111,6 +111,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_log": "on",
 }
 
+INHERIT_PROFILE_CONFIG_KEY = "_inherit_profile"
+
 DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "openai_base_url": "base_url",
     "openai_proxy": "proxy_server",
@@ -198,23 +200,75 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
 # Config
 # -------------------------------------------------------------------
 
+def _validate_inherit_profile_name(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or not value.strip().isidentifier():
+        raise ValueError(f"invalid inherited profile name: {value!r}")
+    return value.strip()
+
+
+def _inherit_profile_name(
+    document: dict[str, Any],
+    path: Path,
+ ) -> str | None:
+    if INHERIT_PROFILE_CONFIG_KEY not in document:
+        return None
+    try:
+        return _validate_inherit_profile_name(
+            document[INHERIT_PROFILE_CONFIG_KEY]
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid {INHERIT_PROFILE_CONFIG_KEY} in {path}: {exc}"
+        ) from exc
+
+
+def _read_config_document_for_merge(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot read configuration file {path} ({exc})") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"configuration file {path} must contain a JSON object")
+    return raw
+
+
+def _merged_config_from_path(
+    path: Path,
+    active_paths: set[Path],
+ ) -> dict[str, Any]:
+    resolved_path = path.resolve()
+    if resolved_path in active_paths:
+        raise ValueError(f"configuration inheritance cycle detected at {path}")
+    active_paths.add(resolved_path)
+    try:
+        config = DEFAULT_CONFIG.copy()
+        raw = _read_config_document_for_merge(path)
+        parent_name = _inherit_profile_name(raw, path)
+        if parent_name is not None:
+            parent_path = get_profile_path(parent_name)
+            if not parent_path.exists():
+                raise ValueError(
+                    f"inherited profile '{parent_name}' does not exist"
+                )
+            config.update(_merged_config_from_path(parent_path, active_paths))
+        config.update(raw)
+        for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
+            if deprecated in raw and replacement not in raw:
+                config[replacement] = raw[deprecated]
+        return config
+    finally:
+        active_paths.remove(resolved_path)
+
+
 def merged_config(config_path: Path | None = None) -> dict[str, Any]:
-    config = DEFAULT_CONFIG.copy()
     path = CONFIG_FILE if config_path is None else config_path
-
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                config.update(raw)
-                for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
-                    if deprecated in raw and replacement not in raw:
-                        config[replacement] = raw[deprecated]
-        except Exception:
-            print(f"ERROR: Failed to parse config: {path}", file=sys.stderr)
-            raise SystemExit(1)
-
-    return config
+    try:
+        return _merged_config_from_path(path, set())
+    except Exception as exc:
+        print(f"ERROR: Failed to parse config: {path} ({exc})", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def migrate_deprecated_config(config: dict[str, Any]) -> bool:
@@ -241,15 +295,45 @@ def load_config() -> dict[str, Any]:
     return merged_config()
 
 
+def _prune_inherited_config(
+    config: dict[str, Any],
+    parent_name: str,
+ ) -> dict[str, Any]:
+    parent_config = merged_config(get_profile_path(parent_name))
+    pruned: dict[str, Any] = {
+        INHERIT_PROFILE_CONFIG_KEY: parent_name
+    }
+    for config_name, value in config.items():
+        if config_name == INHERIT_PROFILE_CONFIG_KEY:
+            continue
+        if config_name not in parent_config or value != parent_config[config_name]:
+            pruned[config_name] = value
+    return pruned
+
+
 def save_config(config: dict[str, Any]) -> None:
     migrated_config = config.copy()
     migrate_deprecated_config(migrated_config)
 
-    merged = DEFAULT_CONFIG.copy()
-    merged.update(migrated_config)
+    raw_document = read_config_document(CONFIG_FILE, missing_ok=True)
+    parent_name = _inherit_profile_name(raw_document, CONFIG_FILE)
+    if parent_name is not None:
+        migrated_config[INHERIT_PROFILE_CONFIG_KEY] = parent_name
+        output_config = _prune_inherited_config(
+            migrated_config, parent_name
+        )
+    else:
+        if INHERIT_PROFILE_CONFIG_KEY in raw_document:
+            migrated_config[INHERIT_PROFILE_CONFIG_KEY] = raw_document[
+                INHERIT_PROFILE_CONFIG_KEY
+            ]
+        else:
+            migrated_config.pop(INHERIT_PROFILE_CONFIG_KEY, None)
+        output_config = DEFAULT_CONFIG.copy()
+        output_config.update(migrated_config)
 
     CONFIG_FILE.write_text(
-        json.dumps(merged, indent=2, ensure_ascii=False),
+        json.dumps(output_config, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -617,11 +701,13 @@ def unassign_prompt_from_config(
         new_value, removed = remove_prompt_reference(config[key], prompt_path)
         if not removed:
             continue
-        config[key] = (
-            get_default_config_value(key)
-            if new_value is None
-            else new_value
-        )
+        if new_value is None:
+            if INHERIT_PROFILE_CONFIG_KEY in config:
+                config.pop(key, None)
+            else:
+                config[key] = get_default_config_value(key)
+        else:
+            config[key] = new_value
         changed = True
     return changed
 
@@ -891,6 +977,10 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
         )
 
     canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+    if canonical_name == INHERIT_PROFILE_CONFIG_KEY:
+        raise ValueError(
+            f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
+        )
     if raw_value == "DEFAULT":
         return name, get_default_config_value(canonical_name)
 
@@ -977,7 +1067,15 @@ def prompt_config_value(
 
     try:
         if value == "DEFAULT":
-            config[key] = get_default_config_value(key)
+            parent_name = _inherit_profile_name(config, CONFIG_FILE)
+            if parent_name is None:
+                config[key] = get_default_config_value(key)
+            else:
+                inherited_config = merged_config(get_profile_path(parent_name))
+                if key in inherited_config:
+                    config[key] = inherited_config[key]
+                else:
+                    config.pop(key, None)
         elif value == "-" and key in PROMPT_CONFIG_KEYS:
             config[key] = ""
         else:
@@ -1046,6 +1144,40 @@ def get_profile_path(name: str) -> Path:
     if name == "config":
         return DEFAULT_CONFIG_FILE
     return APP_DIR / f"{name}.json"
+
+
+def handle_inherit_profile(current_name: str, new_name: str) -> int:
+    try:
+        current_name = validate_prompt_profile_name(current_name)
+        new_name = validate_prompt_profile_name(new_name)
+        if new_name == "config":
+            raise ValueError("cannot create a child profile named 'config'")
+        if current_name == new_name:
+            raise ValueError("a profile cannot inherit itself")
+
+        source_path = get_profile_path(current_name)
+        destination_path = get_profile_path(new_name)
+        if not source_path.exists():
+            raise ValueError(
+                f"source profile '{current_name}' does not exist"
+            )
+        if destination_path.exists():
+            raise ValueError(
+                f"destination profile '{new_name}' already exists"
+            )
+
+        # Validate the source profile and its inheritance chain.
+        merged_config(source_path)
+        write_config_document(
+            destination_path,
+            {INHERIT_PROFILE_CONFIG_KEY: current_name},
+        )
+    except Exception as exc:
+        print(f"ERROR: Failed to inherit profile: {exc}", file=sys.stderr)
+        return 1
+    print(f"Profile '{new_name}' inherited from '{current_name}'.")
+    return 0
+
 
 def configuration_profile_names() -> list[str]:
     ensure_config_exists()
@@ -3643,6 +3775,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     profile_action_group.add_argument(
+        "--inherit-profile",
+        metavar="NEW_NAME",
+        help="Create a new configuration profile inheriting the current profile",
+    )
+
+    profile_action_group.add_argument(
         "--print-profiles",
         nargs="*",
         metavar="NAME",
@@ -3768,6 +3906,41 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+
+def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
+    """Disable options that require task/file context or patch mode in ask mode."""
+    disabled_options: dict[str, Any] = {
+        "files": None,
+        "files_list": None,
+        "plan": False,
+        "plan_system_prompt": None,
+        "patch": False,
+        "patch_review": False,
+        "patch_branch": False,
+        "patch_branch_remove": None,
+        "patch_merge": None,
+        "patch_suffix": None,
+        "patch_save": False,
+        "patch_file_apply": None,
+        "patch_system_prompt": None,
+        "reuse_session": None,
+        "reuse_session_skip_verify": False,
+        "tree_files": None,
+        "tree_files_list": None,
+        "tree_task": None,
+        "tree_task_file": None,
+        "tree_system_prompt_file": None,
+        "tree_exclude": None,
+        "tree_exclude_git": None,
+        "tree_include": None,
+        "tree_show_only": False,
+        "tree_parallel": None,
+        "linenum_system_prompt": None,
+        "no_line_numbers": None,
+    }
+    for option_name, value in disabled_options.items():
+        setattr(args, option_name, value)
+
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
@@ -3788,6 +3961,9 @@ def main() -> int:
     ensure_config_exists()
 
     args = parse_args()
+    ask_mode = args.ask is not None or args.ask_file is not None
+    if ask_mode:
+        disable_ask_conflicting_options(args)
     NONINTERACTIVE = args.noninteractive
     if args.noninteractive and (args.init or args.init_profile is not None):
         print(
@@ -3826,6 +4002,7 @@ def main() -> int:
             ("--init", args.init),
             ("--init-profile", args.init_profile is not None),
             ("--copy-profile", args.copy_profile is not None),
+            ("--inherit-profile", args.inherit_profile is not None),
             ("--remove-profile", args.remove_profile is not None),
             ("--list-profiles", args.list_profiles),
             ("--print-profiles", args.print_profiles is not None),
@@ -4012,6 +4189,9 @@ def main() -> int:
         init_config_interactive()
         return 0
 
+    if args.inherit_profile:
+        return handle_inherit_profile(base_profile, args.inherit_profile)
+
     if args.copy_profile:
         new_name = args.copy_profile
         if new_name == "config":
@@ -4072,6 +4252,10 @@ def main() -> int:
             name = name.strip()
             if not name:
                 raise ValueError("configuration name cannot be empty")
+            if name == INHERIT_PROFILE_CONFIG_KEY:
+                raise ValueError(
+                    f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
+                )
             source_profile = validate_prompt_profile_name(source_profile)
             source_config = read_config_document(
                 get_profile_path(source_profile)
@@ -4104,20 +4288,69 @@ def main() -> int:
     if args.set_config:
         config = load_config()
         try:
-            updates = [
-                parse_config_assignment(value, config)
-                for value in args.set_config
-            ]
+            raw_config = read_config_document(CONFIG_FILE, missing_ok=True)
+            inherited_parent = _inherit_profile_name(raw_config, CONFIG_FILE)
+            updates: list[tuple[str, Any, bool]] = []
+            for assignment in args.set_config:
+                if inherited_parent is not None and "=" in assignment:
+                    raw_name, raw_value = assignment.split("=", 1)
+                    name = raw_name.strip()
+                    if raw_value.strip() == "DEFAULT":
+                        if not name:
+                            raise ValueError(
+                                "configuration name cannot be empty"
+                            )
+                        canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+                        if canonical_name == INHERIT_PROFILE_CONFIG_KEY:
+                            raise ValueError(
+                                f"{INHERIT_PROFILE_CONFIG_KEY} is managed by "
+                                "--inherit-profile"
+                            )
+                        if name in DEPRECATED_CONFIG_KEYS and name not in config:
+                            raise ValueError(
+                                f"{name} is deprecated and is not present in the config"
+                            )
+                        if (
+                            name not in config
+                            and canonical_name not in config
+                        ):
+                            raise ValueError(
+                                f"{name} has no built-in default value"
+                            )
+                        updates.append((name, None, True))
+                        continue
+                name, value = parse_config_assignment(assignment, config)
+                updates.append((name, value, False))
         except ValueError as exc:
             print(f"ERROR: Invalid config assignment: {exc}", file=sys.stderr)
             return 1
 
-        for name, value in updates:
-            config[name] = value
-            replacement = DEPRECATED_CONFIG_KEYS.get(name)
-            if replacement is not None:
-                config[replacement] = value
-        save_config(config)
+        if inherited_parent is not None:
+            for name, value, remove_from_child in updates:
+                canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+                if remove_from_child:
+                    raw_config.pop(name, None)
+                    raw_config.pop(canonical_name, None)
+                    for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
+                        if replacement == canonical_name:
+                            raw_config.pop(deprecated, None)
+                    continue
+                raw_config[name] = value
+                replacement = DEPRECATED_CONFIG_KEYS.get(name)
+                if replacement is not None:
+                    raw_config[replacement] = value
+            migrate_deprecated_config(raw_config)
+            raw_config = _prune_inherited_config(
+                raw_config, inherited_parent
+            )
+            write_config_document(CONFIG_FILE, raw_config)
+        else:
+            for name, value, _ in updates:
+                config[name] = value
+                replacement = DEPRECATED_CONFIG_KEYS.get(name)
+                if replacement is not None:
+                    config[replacement] = value
+            save_config(config)
         return 0
 
     if args.get_config is not None:
