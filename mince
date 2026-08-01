@@ -583,6 +583,15 @@ def write_state_schema_patch(
         encoding="utf-8",
     )
 
+def write_state_schema_patch_applied(
+    turn_dir: Path,
+    paths: list[str],
+ ) -> None:
+    (turn_dir / "response_schema_patch_applied").write_text(
+        "\n".join(paths),
+        encoding="utf-8",
+    )
+
 def prompt_file_path(name: str) -> Path:
     return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
 
@@ -1812,6 +1821,22 @@ def resolve_patch_file_argument(
         return Path(raw_value).expanduser()
     state_session_dir = STATE_DIR / session_name
     if turn is not None or state_session_dir.is_dir():
+        if option_name == "--patch-file-apply" and state_session_dir.is_dir():
+            for entry in state_session_dir.iterdir():
+                if not entry.is_dir() or entry.is_symlink():
+                    continue
+                try:
+                    applied_turn = int(entry.name)
+                except ValueError:
+                    continue
+                if applied_turn >= 0 and (
+                    entry / "response_schema_patch_applied"
+                ).is_file():
+                    raise ValueError(
+                        "response_schema_patch_applied already exists in "
+                        f"patch session {state_session_dir} "
+                        f"(turn {applied_turn})"
+                    )
         turn_dir = last_completed_state_turn(
             state_session_dir,
             turn,
@@ -1850,7 +1875,8 @@ def write_patch_changes(
     suffix_provided: bool,
     patch_branch_setting: str | None,
     patch_commit_message: str,
- ) -> None:
+ ) -> list[str]:
+    written_paths: list[str] = []
     if patch_branch_setting is not None:
         branch_name = resolve_patch_branch_name(patch_branch_setting)
         repo_root = git_repository_root()
@@ -1866,7 +1892,9 @@ def write_patch_changes(
             git_relative_path(repo_root, Path(path_text))
         prepare_patch_branch(repo_root, branch_name)
         for path_text, updated_text in changed_items:
-            Path(path_text).write_text(updated_text, encoding="utf-8")
+            target_path = Path(path_text)
+            target_path.write_text(updated_text, encoding="utf-8")
+            written_paths.append(str(target_path))
         git_commit_patch(
             repo_root,
             [Path(path_text) for path_text, _ in changed_items],
@@ -1875,7 +1903,7 @@ def write_patch_changes(
         for path_text, _ in changed_items:
             print(f"file_written={path_text}")
         print(f"patch_branch={branch_name}")
-        return
+        return written_paths
 
     for path_text, updated_text in changed_items:
         original_path = Path(path_text)
@@ -1886,6 +1914,7 @@ def write_patch_changes(
                 else original_path
             )
             target_path.write_text(updated_text, encoding="utf-8")
+            written_paths.append(str(target_path))
             print(
                 f"file_written="
                 f"{str(target_path) if suffix_provided else path_text}"
@@ -1893,7 +1922,9 @@ def write_patch_changes(
         else:
             target_path = append_suffix_to_path(original_path, patch_suffix)
             target_path.write_text(updated_text, encoding="utf-8")
+            written_paths.append(str(target_path))
             print(f"file_written={target_path}")
+    return written_paths
 
 
 def handle_patch_file_apply(
@@ -1980,7 +2011,7 @@ def handle_patch_file_apply(
             print("Please answer y, n, or p.")
 
     try:
-        write_patch_changes(
+        written_patch_paths = write_patch_changes(
             changed_items=changed_items,
             all_paths=[Path(path) for path in original_texts],
             patch_review=patch_review,
@@ -1989,6 +2020,11 @@ def handle_patch_file_apply(
             patch_branch_setting=patch_branch_setting,
             patch_commit_message=patch_commit_message,
         )
+        if patch_path.name == "response_schema_patch":
+            write_state_schema_patch_applied(
+                patch_path.parent,
+                written_patch_paths,
+            )
     except Exception as exc:
         action = (
             "write and commit patch branch"
@@ -5890,7 +5926,7 @@ def main() -> int:
                     continue
 
             try:
-                write_patch_changes(
+                written_patch_paths = write_patch_changes(
                     changed_items=changed_items,
                     all_paths=[Path(path) for path in updated_texts],
                     patch_review=patch_review,
@@ -5899,6 +5935,11 @@ def main() -> int:
                     patch_branch_setting=patch_branch_setting,
                     patch_commit_message=patch_commit_message,
                 )
+                if state_turn_path is not None:
+                    write_state_schema_patch_applied(
+                        state_turn_path,
+                        written_patch_paths,
+                    )
             except Exception as exc:
                 action = (
                     'write and commit patch branch'
