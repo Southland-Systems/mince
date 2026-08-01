@@ -399,6 +399,7 @@ def next_state_turn_index(state_session_dir: Path) -> int:
 def last_completed_state_turn(
     state_session_dir: Path,
     turn: int | None = None,
+    required_file: str = "response",
  ) -> Path:
     if not state_session_dir.is_dir():
         raise ValueError(
@@ -411,7 +412,7 @@ def last_completed_state_turn(
         if (
             not turn_dir.is_dir()
             or turn_dir.is_symlink()
-            or not (turn_dir / "response").is_file()
+            or not (turn_dir / required_file).is_file()
         ):
             raise ValueError(
                 f"state session has no completed turn {turn}: "
@@ -431,7 +432,7 @@ def last_completed_state_turn(
     for _, turn_dir in sorted(
         turn_dirs, key=lambda item: item[0], reverse=True
     ):
-        if (turn_dir / "response").is_file():
+        if (turn_dir / required_file).is_file():
             return turn_dir
     raise ValueError(
         f"state session has no completed turns: {state_session_dir}"
@@ -569,6 +570,15 @@ def complete_state_turn(
         encoding="utf-8",
     )
     (turn_dir / "response").write_text(
+        response,
+        encoding="utf-8",
+    )
+
+def write_state_schema_patch(
+    turn_dir: Path,
+    response: str,
+ ) -> None:
+    (turn_dir / "response_schema_patch").write_text(
         response,
         encoding="utf-8",
     )
@@ -1784,17 +1794,30 @@ def load_patch_manifest(path: Path) -> dict[str, Any]:
     return raw
 
 
-def resolve_patch_file_argument(value: str) -> Path:
+def resolve_patch_file_argument(
+    value: str,
+    turn: int | None = None,
+    option_name: str = "--patch-file-apply",
+ ) -> Path:
     raw_value = value.strip()
     if not raw_value:
         raise ValueError("patch session or file path cannot be empty")
     try:
         session_name = validate_session_name(raw_value)
-    except ValueError:
+    except ValueError as exc:
+        if turn is not None:
+            raise ValueError(
+                f"{option_name} TURN requires a session name"
+            ) from exc
         return Path(raw_value).expanduser()
-    session_path = APP_DIR / "patches" / f"{session_name}.json"
-    if session_path.is_file():
-        return session_path
+    state_session_dir = STATE_DIR / session_name
+    if turn is not None or state_session_dir.is_dir():
+        turn_dir = last_completed_state_turn(
+            state_session_dir,
+            turn,
+            required_file="response_schema_patch",
+        )
+        return turn_dir / "response_schema_patch"
     return Path(raw_value).expanduser()
 
 
@@ -1879,9 +1902,13 @@ def handle_patch_file_apply(
     patch_review_argument: bool | None,
     patch_suffix_argument: str | None,
     patch_branch_argument: str | None,
+    patch_turn: int | None = None,
  ) -> int:
     try:
-        patch_path = resolve_patch_file_argument(patch_file_argument)
+        patch_path = resolve_patch_file_argument(
+            patch_file_argument,
+            turn=patch_turn,
+        )
         manifest = load_patch_manifest(patch_path)
         original_texts = load_patch_original_texts(manifest)
     except Exception as exc:
@@ -1971,8 +1998,33 @@ def handle_patch_file_apply(
         print(f"ERROR: Failed to {action}: {exc}", file=sys.stderr)
         return 1
     return 0
+    return 0
 
-# -------------------------------------------------------------------
+def handle_patch_file_print(
+    patch_file_argument: str,
+    patch_turn: int | None = None,
+ ) -> int:
+    try:
+        patch_path = resolve_patch_file_argument(
+            patch_file_argument,
+            turn=patch_turn,
+            option_name="--patch-file-print",
+        )
+        manifest = load_patch_manifest(patch_path)
+        original_texts = load_patch_original_texts(manifest)
+        _, diff_text, _ = build_patch_changes(
+            original_texts,
+            manifest,
+        )
+    except Exception as exc:
+        print(
+            f"ERROR: Failed to print patch file: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    sys.stdout.write(diff_text)
+    return 0
+
 # Helpers
 # -------------------------------------------------------------------
 
@@ -3311,8 +3363,16 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--patch-file-apply",
-        metavar="SESSION|PATH",
-        help="Load a saved JSON patch session or JSON patch file and apply it",
+        nargs="+",
+        metavar=("SESSION|PATH", "TURN"),
+        help="Apply a saved patch file from a session (with optional TURN) or JSON patch file",
+    )
+
+    parser.add_argument(
+        "--patch-file-print",
+        nargs="+",
+        metavar=("SESSION|PATH", "TURN"),
+        help="Print the diff from a session (with optional TURN) or JSON patch file",
     )
 
     parser.add_argument(
@@ -3922,6 +3982,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "patch_suffix": None,
         "patch_save": False,
         "patch_file_apply": None,
+        "patch_file_print": None,
         "patch_system_prompt": None,
         "reuse_session": None,
         "reuse_session_skip_verify": False,
@@ -3964,6 +4025,40 @@ def main() -> int:
     ask_mode = args.ask is not None or args.ask_file is not None
     if ask_mode:
         disable_ask_conflicting_options(args)
+    patch_file_turn: int | None = None
+    patch_file_print_turn: int | None = None
+    for option_name in ("patch_file_apply", "patch_file_print"):
+        option_values = getattr(args, option_name)
+        if not isinstance(option_values, list):
+            continue
+        option_flag = f"--{option_name.replace('_', '-')}"
+        if len(option_values) > 2:
+            print(
+                f"ERROR: {option_flag} accepts SESSION|PATH and optional TURN",
+                file=sys.stderr,
+            )
+            return 1
+        parsed_turn: int | None = None
+        if len(option_values) == 2:
+            try:
+                parsed_turn = int(option_values[1])
+            except ValueError:
+                print(
+                    f"ERROR: {option_flag} TURN must be an integer",
+                    file=sys.stderr,
+                )
+                return 1
+            if parsed_turn < 0:
+                print(
+                    f"ERROR: {option_flag} TURN must be non-negative",
+                    file=sys.stderr,
+                )
+                return 1
+        setattr(args, option_name, option_values[0])
+        if option_name == "patch_file_apply":
+            patch_file_turn = parsed_turn
+        else:
+            patch_file_print_turn = parsed_turn
     NONINTERACTIVE = args.noninteractive
     if args.noninteractive and (args.init or args.init_profile is not None):
         print(
@@ -3972,8 +4067,21 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    patch_file_option_name: str | None = None
     if args.patch_file_apply is not None:
-        patch_apply_conflicts = (
+        patch_file_option_name = "--patch-file-apply"
+    if args.patch_file_print is not None:
+        if patch_file_option_name is not None:
+            print(
+                "ERROR: --patch-file-apply cannot be combined with "
+                "--patch-file-print",
+                file=sys.stderr,
+            )
+            return 1
+        patch_file_option_name = "--patch-file-print"
+
+    if patch_file_option_name is not None:
+        patch_file_conflicts = (
             ("--ask", args.ask is not None),
             ("--ask-file", args.ask_file is not None),
             ("--task", args.task is not None),
@@ -4023,12 +4131,12 @@ def main() -> int:
             ("--print-current-config", args.print_current_config),
         )
         conflict = next(
-            (name for name, used in patch_apply_conflicts if used),
+            (name for name, used in patch_file_conflicts if used),
             None,
         )
         if conflict is not None:
             print(
-                f"ERROR: --patch-file-apply cannot be combined with {conflict}",
+                f"ERROR: {patch_file_option_name} cannot be combined with {conflict}",
                 file=sys.stderr,
             )
             return 1
@@ -4237,11 +4345,17 @@ def main() -> int:
         return 0
 
     CONFIG_FILE = get_profile_path(base_profile)
+    if args.patch_file_print is not None:
+        return handle_patch_file_print(
+            args.patch_file_print,
+            patch_turn=patch_file_print_turn,
+        )
     if args.patch_file_apply is not None:
         patch_config = load_config()
         return handle_patch_file_apply(
             args.patch_file_apply,
             patch_config,
+            patch_turn=patch_file_turn,
             patch_review_argument=args.patch_review,
             patch_suffix_argument=args.patch_suffix,
             patch_branch_argument=args.patch_branch,
@@ -5431,7 +5545,7 @@ def main() -> int:
     def call_patch_revision_request(
         revision_user_prompt: str,
     ) -> tuple[str, str, Any, dict[str, Any] | None]:
-        nonlocal state_turn
+        nonlocal state_turn, state_turn_path
         revision_request_tokens = (
             estimate_request_tokens(
                 model=model,
@@ -5541,6 +5655,7 @@ def main() -> int:
             revision_reasoning,
             revision_result,
         )
+        state_turn_path = revision_state_turn_path
         revision_statsline = print_stats(
             session_name=session_stem,
             request_characters=revision_request_characters,
@@ -5577,6 +5692,7 @@ def main() -> int:
         patch_turn_history: list[tuple[str, str, str]] = [
             (task, str(result or ""), statsline)
         ]
+        patch_state_turn_history: list[Path | None] = [state_turn_path]
         patch_turn_index = 0
         while True:
             try:
@@ -5628,6 +5744,20 @@ def main() -> int:
                 )
                 return 1
 
+            if state_turn_path is not None:
+                try:
+                    write_state_schema_patch(
+                        state_turn_path,
+                        result,
+                    )
+                except Exception as exc:
+                    print(
+                        f'ERROR: Failed to save validated patch response to '
+                        f'{state_turn_path / "response_schema_patch"}: {exc}',
+                        file=sys.stderr,
+                    )
+                    return 1
+
             if not changed_items:
                 if VERBOSE:
                     print('No changes.', file=sys.stderr)
@@ -5674,6 +5804,7 @@ def main() -> int:
                             continue
                         patch_turn_index -= 1
                         task, result, statsline = patch_turn_history[patch_turn_index]
+                        state_turn_path = patch_state_turn_history[patch_turn_index]
                         navigate_patch_turn = True
                         break
                     if patch_input == '>':
@@ -5682,6 +5813,7 @@ def main() -> int:
                             continue
                         patch_turn_index += 1
                         task, result, statsline = patch_turn_history[patch_turn_index]
+                        state_turn_path = patch_state_turn_history[patch_turn_index]
                         navigate_patch_turn = True
                         break
                     patch_choice = patch_input.lower()
@@ -5751,7 +5883,9 @@ def main() -> int:
                         print(f'API error: {exc}', file=sys.stderr)
                         return 1
                     patch_turn_history = patch_turn_history[:patch_turn_index + 1]
+                    patch_state_turn_history = patch_state_turn_history[:patch_turn_index + 1]
                     patch_turn_history.append((task, str(result or ""), statsline))
+                    patch_state_turn_history.append(state_turn_path)
                     patch_turn_index += 1
                     continue
 

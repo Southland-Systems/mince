@@ -143,6 +143,12 @@ mince --patch --patch-review --patch-branch -f README.md \
 mince -M Updated README with improved language.
 ```
 
+Apply a suffixed patch from a --patch-review declined session at turn two:
+
+```bash
+mince -S .patched --patch-file-apply mince-1785553265-lfaUfaDq 1
+```
+
 Plan mode asks the model to create prompt for the next step using the supplied context:
 
 ```bash
