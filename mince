@@ -85,6 +85,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
     "patch_system_prompt": DEFAULT_PATCH_SYSTEM_PROMPT,
     "plan_system_prompt": DEFAULT_PLAN_SYSTEM_PROMPT,
+    "system_prompt_with_task": "off",
     "line_numbers": "on",
     "prompt_expansion": "off",
     "patch": "off",
@@ -438,6 +439,124 @@ def last_completed_state_turn(
         f"state session has no completed turns: {state_session_dir}"
     )
 
+STATE_SESSION_ARTIFACT = "request_files"
+STATE_TURN_ARTIFACTS = (
+    "request_system_prompt",
+    "request_task",
+    "response_reasoning",
+    "response",
+    "response_schema_patch",
+    "response_diff_patch",
+    "response_schema_patch_applied",
+)
+STATE_ARTIFACT_TYPES = (
+    STATE_SESSION_ARTIFACT,
+    *STATE_TURN_ARTIFACTS,
+)
+
+def normalize_state_artifact_type(value: str) -> str:
+    artifact_type = value.strip()
+    if artifact_type not in STATE_ARTIFACT_TYPES:
+        choices = ", ".join(STATE_ARTIFACT_TYPES)
+        raise ValueError(
+            f"unknown state artifact type '{value}'; choose {choices}"
+        )
+    return artifact_type
+
+def read_state_artifact(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"state artifact does not exist: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError(f"cannot read state artifact {path} ({exc})") from exc
+
+def state_turn_directory(
+    state_session_dir: Path,
+    turn: int | None,
+ ) -> Path:
+    if turn is None:
+        return last_completed_state_turn(state_session_dir)
+    turn_dir = state_session_dir / str(turn)
+    if not turn_dir.is_dir() or turn_dir.is_symlink():
+        raise ValueError(
+            f"state session has no turn {turn}: {state_session_dir}"
+        )
+    return turn_dir
+
+def handle_state_print_json(values: list[str]) -> int:
+    try:
+        if not values:
+            print(json.dumps(list(STATE_ARTIFACT_TYPES), indent=2, ensure_ascii=False))
+            return 0
+        session_name = validate_session_name(values[0])
+        state_session_dir = STATE_DIR / session_name
+        if not state_session_dir.is_dir() or state_session_dir.is_symlink():
+            raise ValueError(f"state session does not exist: {state_session_dir}")
+
+        remaining = list(values[1:])
+        requested_turn: int | None = None
+        if remaining:
+            try:
+                requested_turn = int(remaining[0])
+            except ValueError:
+                pass
+            else:
+                remaining.pop(0)
+                if requested_turn < 0:
+                    raise ValueError("session turn must be non-negative")
+
+        artifact_types = [
+            normalize_state_artifact_type(value)
+            for value in remaining
+        ]
+        if len(set(artifact_types)) != len(artifact_types):
+            raise ValueError("state artifact types must be unique")
+
+        turn_artifact_types = [
+            artifact_type
+            for artifact_type in artifact_types
+            if artifact_type != STATE_SESSION_ARTIFACT
+        ]
+        turn_dir: Path | None = None
+        if not artifact_types or turn_artifact_types:
+            turn_dir = state_turn_directory(
+                state_session_dir, requested_turn
+            )
+
+        artifacts: dict[str, str] = {}
+        if not artifact_types:
+            request_files_path = state_session_dir / STATE_SESSION_ARTIFACT
+            if request_files_path.is_file() and not request_files_path.is_symlink():
+                artifacts[STATE_SESSION_ARTIFACT] = read_state_artifact(
+                    request_files_path
+                )
+            if turn_dir is not None:
+                for artifact_path in sorted(
+                    turn_dir.iterdir(), key=lambda path: path.name
+                ):
+                    if artifact_path.is_file() and not artifact_path.is_symlink():
+                        artifacts[artifact_path.name] = read_state_artifact(
+                            artifact_path
+                        )
+        else:
+            for artifact_type in artifact_types:
+                if artifact_type == STATE_SESSION_ARTIFACT:
+                    artifact_path = state_session_dir / artifact_type
+                else:
+                    if turn_dir is None:
+                        raise ValueError(
+                            f"state turn is required for artifact {artifact_type}"
+                        )
+                    artifact_path = turn_dir / artifact_type
+                artifacts[artifact_type] = read_state_artifact(artifact_path)
+
+        print(json.dumps(artifacts, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        print(f"ERROR: Failed to print state JSON: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
 def file_checksum(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -580,6 +699,15 @@ def write_state_schema_patch(
  ) -> None:
     (turn_dir / "response_schema_patch").write_text(
         response,
+        encoding="utf-8",
+    )
+
+def write_state_diff_patch(
+    turn_dir: Path,
+    diff_text: str,
+ ) -> None:
+    (turn_dir / "response_diff_patch").write_text(
+        diff_text,
         encoding="utf-8",
     )
 
@@ -1113,7 +1241,7 @@ def init_config_interactive() -> None:
     print(
         f"Config file: {CONFIG_FILE}\n"
         f"Use DEFAULT to reset any value. "
-        f"Use - to blank text values.\n"
+        f"Use - or \"\" to blank text values.\n"
         f"System prompt file include syntax:\n"
         f"./prompt_name.md|/path/file|./prompt.md additional text\n\n"
     )
@@ -1127,6 +1255,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "service_tier", "Service tier (off, auto, default, flex, scale, priority)")
     prompt_config_value(config, "system_prompt", "System prompt")
+    prompt_config_value(config, "system_prompt_with_task", "Append task to system prompt instead of user prompt (off, on)")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
@@ -2240,6 +2369,20 @@ def read_prompt_argument(value: str | list[str]) -> str:
     return value.strip()
 
 
+
+def read_prompt_files(
+    paths: Path | list[Path],
+) -> str:
+    prompt_paths = paths if isinstance(paths, list) else [paths]
+    prompt_parts = [
+        read_file(prompt_path).strip()
+        for prompt_path in prompt_paths
+    ]
+    return "\n\n".join(
+        part for part in prompt_parts if part
+    ).strip()
+
+
 PROMPT_EXPANSION_PATTERN = re.compile(r"\^\^([^^\r\n\s]+?)\^\^")
 
 
@@ -2294,18 +2437,24 @@ def resolve_configured_prompt(value: Any, default: str) -> str:
         raise ValueError(f"cannot read configured system prompt file {value} ({exc})") from exc
 
 
-def read_files_list(path: Path) -> list[str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception as exc:
-        raise ValueError(f"cannot read files list {path} ({exc})") from exc
-
+def read_files_list(
+    paths: Path | list[Path],
+) -> list[str]:
+    list_paths = paths if isinstance(paths, list) else [paths]
     files: list[str] = []
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        files.append(line)
+    for list_path in list_paths:
+        try:
+            lines = list_path.read_text(encoding="utf-8").splitlines()
+        except Exception as exc:
+            raise ValueError(
+                f"cannot read files list {list_path} ({exc})"
+            ) from exc
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            files.append(line)
     return files
 
 def build_context(
@@ -2391,6 +2540,15 @@ def parse_extra_body(s: str) -> dict[str, Any]:
 # Prompting
 # -------------------------------------------------------------------
 
+def append_task_to_system_prompt(
+    system_prompt: str,
+    task: str,
+    enabled: bool,
+ ) -> str:
+    if not enabled or not task:
+        return system_prompt
+    return f"{system_prompt}\n{task}"
+
 def build_user_prompt(
     task: str,
     context: str,
@@ -2398,6 +2556,7 @@ def build_user_prompt(
     json_schema: dict[str, Any] | None = None,
     json_patch_responses: list[str] | None = None,
     json_patch_task: str | None = None,
+    include_task: bool = True,
  ) -> str:
     schema_block = ""
     json_patch_block = ""
@@ -2421,9 +2580,8 @@ def build_user_prompt(
         )
 
     return f"""
-<task>
-{task}
-</task>
+{task if include_task else ""}
+
 <files current_working_directory='{os.getcwd()}'>
 {context}
 </files>
@@ -2451,11 +2609,11 @@ def _handle_openai_error(exc: Exception) -> None:
     elif isinstance(exc, APIConnectionError):
         msg = f"Network error: {exc}"
     elif isinstance(exc, APIError):
-        msg = f"OpenAI API error: {exc}"
+        msg = f"API error: {exc}"
     elif isinstance(exc, UnprocessableEntityError):
         msg = f"Cannot process request despite it being correct: {exc}"
     elif isinstance(exc, InternalServerError):
-        msg = f"OpenAI API internal server error: {exc}"
+        msg = f"API internal server error: {exc}"
     else:
         msg = f"Unexpected error: {exc}"
     raise exc
@@ -2596,12 +2754,20 @@ def consume_response_stream(
 
 
 
-def read_tree_prompt_file(path: Path) -> tuple[dict[str, str], str | None, str | None]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception as exc:
-        raise ValueError(f"cannot read tree prompt file {path} ({exc})") from exc
-
+def read_tree_prompt_file(
+    path: Path | list[Path],
+) -> tuple[dict[str, str], str | None, str | None]:
+    prompt_paths = path if isinstance(path, list) else [path]
+    lines: list[str] = []
+    for prompt_path in prompt_paths:
+        try:
+            lines.extend(
+                prompt_path.read_text(encoding="utf-8").splitlines()
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"cannot read tree prompt file {prompt_path} ({exc})"
+            ) from exc
     default_key = "__default__"
     prompt_lines: dict[str, list[str]] = {}
 
@@ -2899,7 +3065,7 @@ def run_tree_mode(
     combined_tree_path: Path,
     log_enabled: bool,
     log_path: Path | None,
-    tree_session_stem: str,
+    system_prompt_with_task: bool = False,
 ) -> int:
     log_lock = threading.Lock()
     db_lock = threading.Lock()
@@ -3010,11 +3176,17 @@ def run_tree_mode(
                 full_system_prompt = selected_system_prompt + "\n" + linenum_system_prompt
             else:
                 full_system_prompt = selected_system_prompt
+            full_system_prompt = append_task_to_system_prompt(
+                full_system_prompt,
+                selected_task,
+                system_prompt_with_task,
+            )
             user_prompt = build_user_prompt(
                 task=selected_task,
                 context=context,
                 response_format=response_format,
                 json_schema=json_schema,
+                include_task=not system_prompt_with_task,
             )
             request_tokens = estimate_request_tokens(
                 model=model,
@@ -3269,8 +3441,10 @@ def parse_args() -> argparse.Namespace:
     mode_group.add_argument(
         "--ask-file",
         metavar="FILE",
+        nargs="+",
+        action="extend",
         type=Path,
-        help="Read the ask prompt from the given file",
+        help="Read and combine ask prompts from one or more files",
     )
 
     mode_group.add_argument(
@@ -3283,8 +3457,10 @@ def parse_args() -> argparse.Namespace:
     mode_group.add_argument(
         "--task-file",
         metavar="FILE",
+        nargs="+",
+        action="extend",
         type=Path,
-        help="Read the task/prompt from the given file",
+        help="Read and combine task prompts from one or more files",
     )
 
     parser.add_argument(
@@ -3308,8 +3484,10 @@ def parse_args() -> argparse.Namespace:
     files_group.add_argument(
         "--files-list",
         metavar="FILE",
+        nargs="+",
+        action="extend",
         type=Path,
-        help="Read context file paths from a file (one file per line)",
+        help="Read context file paths from one or more list files",
     )
 
     parser.add_argument(
@@ -3438,8 +3616,10 @@ def parse_args() -> argparse.Namespace:
     tree_files_group.add_argument(
         "--tree-files-list",
         metavar="FILE",
+        nargs="+",
+        action="extend",
         type=Path,
-        help="Read tree-mode files or directories from a file",
+        help="Read tree-mode paths from one or more list files",
     )
 
     tree_task_group = parser.add_mutually_exclusive_group()
@@ -3453,8 +3633,10 @@ def parse_args() -> argparse.Namespace:
     tree_task_group.add_argument(
         "--tree-task-file",
         metavar="FILE",
+        nargs="+",
+        action="extend",
         type=Path,
-        help="Read tree-mode tasks from this file (.ext:task, *:task, or an overall task; can be repeated)",
+        help="Read and combine tree-mode tasks from one or more files (.ext:task, *:task, or an overall task)",
     )
 
     parser.add_argument(
@@ -3524,6 +3706,16 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         type=Path,
         help="Read the system prompt from the given file",
+    )
+
+    parser.add_argument(
+        "--system-prompt-with-task",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Append the task to the system prompt instead of the user prompt",
     )
 
     parser.add_argument(
@@ -3990,6 +4182,17 @@ def parse_args() -> argparse.Namespace:
         help="Display a saved combined tree manifest",
     )
 
+    parser.add_argument(
+        "--state-print-json",
+        nargs="*",
+        metavar=("SESSION", "TURN|TYPE"),
+        help=(
+            "Print selected state artifacts as a JSON object; with no arguments, "
+            "print artifact types; otherwise accepts a session, optional turn, "
+            "and optional artifact TYPE names"
+        ),
+    )
+
     session_view_group.add_argument(
         "--remove-expired-data",
         nargs="?",
@@ -4058,6 +4261,8 @@ def main() -> int:
     ensure_config_exists()
 
     args = parse_args()
+    if args.state_print_json is not None:
+        return handle_state_print_json(args.state_print_json)
     ask_mode = args.ask is not None or args.ask_file is not None
     if ask_mode:
         disable_ask_conflicting_options(args)
@@ -4301,7 +4506,6 @@ def main() -> int:
         return handle_prompt_unassign(args.prompt_unassign)
     if args.prompt_remove is not None:
         return handle_prompt_remove(args.prompt_remove)
-
 
     base_profile = args.profile or "config"
 
@@ -4597,7 +4801,7 @@ def main() -> int:
         if args.task:
             task = read_prompt_argument(args.task)
         elif args.task_file:
-            task = read_file(args.task_file).strip()
+            task = read_prompt_files(args.task_file).strip()
         else:
             print("ERROR: --ask or --task required (--help for help)", file=sys.stderr)
             return 1
@@ -4658,7 +4862,16 @@ def main() -> int:
     tree_task_prompts = expand_tree_prompt_values(
         tree_task_prompts, prompt_expansion_enabled
     )
-
+    system_prompt_with_task = (
+        args.system_prompt_with_task
+        if args.system_prompt_with_task is not None
+        else coerce_bool(
+            config.get(
+                "system_prompt_with_task",
+                DEFAULT_CONFIG["system_prompt_with_task"],
+            )
+        )
+    )
     add_line_numbers = (
         args.no_line_numbers
         if args.no_line_numbers is not None
@@ -5171,6 +5384,7 @@ def main() -> int:
             tree_task_prompts=tree_task_prompts,
             tree_system_prompts=tree_system_prompts,
             system_prompt=system_prompt,
+            system_prompt_with_task=system_prompt_with_task,
             linenum_system_prompt=linenum_system_prompt,
             add_line_numbers=add_line_numbers,
             max_file_size_kb=max_file_size_kb,
@@ -5214,7 +5428,7 @@ def main() -> int:
             )
         else:
             user_prompt = expand_prompt_names(
-                read_file(args.ask_file).strip(),
+                read_prompt_files(args.ask_file).strip(),
                 prompt_expansion_enabled,
             )
         full_system_prompt = system_prompt
@@ -5244,14 +5458,22 @@ def main() -> int:
                 else reused_patch_history
             )
         if add_line_numbers or patch_mode:
-            full_system_prompt = (system_prompt + "\n" + linenum_system_prompt)
+            base_full_system_prompt = (
+                system_prompt + "\n" + linenum_system_prompt
+            )
         else:
-            full_system_prompt = system_prompt
+            base_full_system_prompt = system_prompt
+        full_system_prompt = append_task_to_system_prompt(
+            base_full_system_prompt,
+            task,
+            system_prompt_with_task,
+        )
         user_prompt = build_user_prompt(
             task=task,
             context=context,
             response_format=response_format,
             json_schema=json_schema,
+            include_task=not system_prompt_with_task,
         )
         if patch_mode:
             if not file_names:
@@ -5284,7 +5506,6 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
-            user_prompt = user_prompt + "\n" + patch_system_prompt
 
     if plan_mode:
         plan_user_prompt = build_user_prompt(
@@ -5292,6 +5513,7 @@ def main() -> int:
             context=context,
             response_format="text",
             json_schema=None,
+            include_task=not system_prompt_with_task,
         )
         plan_full_system_prompt = system_prompt + "\n" + plan_system_prompt
         if add_line_numbers or patch_mode:
@@ -5299,6 +5521,11 @@ def main() -> int:
         if patch_mode:
             plan_full_system_prompt = (plan_full_system_prompt + "\n" +
                 "Design the prompt with the understanding that a patch will be generated but do not include language to indicate this explicitly.")
+        plan_full_system_prompt = append_task_to_system_prompt(
+            plan_full_system_prompt,
+            task,
+            system_prompt_with_task,
+        )
         plan_request_tokens = estimate_request_tokens(
             model=model,
             system_prompt=plan_full_system_prompt,
@@ -5423,11 +5650,17 @@ def main() -> int:
             print(plan_statsline, file=sys.stderr)
         print()
         task = expand_prompt_names(plan_result, prompt_expansion_enabled)
+        full_system_prompt = append_task_to_system_prompt(
+            base_full_system_prompt,
+            task,
+            system_prompt_with_task,
+        )
         user_prompt = build_user_prompt(
             task=task,
             context=context,
             response_format=response_format,
             json_schema=json_schema,
+            include_task=not system_prompt_with_task,
         )
         if patch_mode:
             user_prompt = user_prompt + "\n" + patch_system_prompt
@@ -5581,7 +5814,12 @@ def main() -> int:
     def call_patch_revision_request(
         revision_user_prompt: str,
     ) -> tuple[str, str, Any, dict[str, Any] | None]:
-        nonlocal state_turn, state_turn_path
+        nonlocal state_turn, state_turn_path, full_system_prompt
+        full_system_prompt = append_task_to_system_prompt(
+            base_full_system_prompt,
+            task,
+            system_prompt_with_task,
+        )
         revision_request_tokens = (
             estimate_request_tokens(
                 model=model,
@@ -5786,10 +6024,14 @@ def main() -> int:
                         state_turn_path,
                         result,
                     )
+                    write_state_diff_patch(
+                        state_turn_path,
+                        diff_text,
+                    )
                 except Exception as exc:
                     print(
-                        f'ERROR: Failed to save validated patch response to '
-                        f'{state_turn_path / "response_schema_patch"}: {exc}',
+                        f'ERROR: Failed to save validated patch artifacts to '
+                        f'{state_turn_path}: {exc}',
                         file=sys.stderr,
                     )
                     return 1
@@ -5911,6 +6153,7 @@ def main() -> int:
                         json_schema=json_schema,
                         json_patch_responses=json_patch_responses,
                         json_patch_task=json_patch_task,
+                        include_task=not system_prompt_with_task,
                     )
                     user_prompt = user_prompt + '\n' + patch_system_prompt
                     try:
