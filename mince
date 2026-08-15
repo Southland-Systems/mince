@@ -103,6 +103,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_output_tokens": 65534,
     "token_cost": "1.00:6.00",
     "max_file_size_kb": 512,
+    "files": "",
     "response_format": "text",
     "stream": "off",
     "response_verbosity": "off",
@@ -668,6 +669,8 @@ def start_state_turn(
     if not request_files_path.exists():
         request_file_lines: list[str] = []
         for path in file_paths:
+            if path == Path("-"):
+                continue
             resolved_path = Path(path).resolve()
             request_file_lines.append(
                 f"{resolved_path} {file_checksum(resolved_path)}"
@@ -1254,8 +1257,9 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "meta_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "service_tier", "Service tier (off, auto, default, flex, scale, priority)")
+    prompt_config_value(config, "files", "Context files (eg: /path/file1|file2)")
+    prompt_config_value(config, "system_prompt_with_task", "Append task to system prompt (off, on)")
     prompt_config_value(config, "system_prompt", "System prompt")
-    prompt_config_value(config, "system_prompt_with_task", "Append task to system prompt instead of user prompt (off, on)")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
@@ -1458,6 +1462,7 @@ def handle_remove_expired_data(keep_days: int) -> int:
 
     print(f"expired_data_removed={removed_count} keep_days={keep_days}")
     return 0
+
 
 # -------------------------------------------------------------------
 # Patch helpers
@@ -1769,10 +1774,43 @@ PATCH_REVISION_HEADING = (
 )
 
 
+def patch_review_usage(allow_navigation: bool = False) -> str:
+    options = (
+        "[y]es, [n]o, [p]ager, [h]elp, "
+        "[R]emove patch suffix, [S] re-add patch suffix"
+    )
+    if allow_navigation:
+        options += ", [<]prevturn, [>]nextturn, [e]dit, E <prompt>"
+    return f"Usage: {options}"
+
+
+def process_patch_review_input(
+    patch_input: str,
+    diff_text: str,
+    suffix_provided: bool,
+    allow_navigation: bool = False,
+ ) -> tuple[str | None, bool]:
+    choice = patch_input.strip()
+    normalized_choice = choice.lower()
+    if not choice or normalized_choice == "h":
+        print(patch_review_usage(allow_navigation))
+        return None, suffix_provided
+    if normalized_choice == "p":
+        page_or_print(diff_text)
+        return None, suffix_provided
+    if normalized_choice == "r":
+        print("Patch suffix removed.")
+        return None, False
+    if normalized_choice == "s":
+        print("Patch suffix re-added.")
+        return None, True
+    return choice, suffix_provided
+
+
 def build_patch_revision_editor_text(
     diff_text: str,
     previous_task: str = "",
-) -> str:
+ ) -> str:
     previous_task = previous_task.strip()
     return (
         ("\n" * 2)
@@ -1798,7 +1836,10 @@ class PatchRange:
     end_line: int
 
 
-def validate_patch_ranges(patches: list[dict[str, Any]], total_lines: int) -> list[PatchRange]:
+def validate_patch_ranges(
+    patches: list[dict[str, Any]],
+    total_lines: int,
+ ) -> list[PatchRange]:
     ranges: list[PatchRange] = []
 
     for patch in patches:
@@ -1807,24 +1848,31 @@ def validate_patch_ranges(patches: list[dict[str, Any]], total_lines: int) -> li
         end_line = int(patch["end_line"])
 
         if start_line < 1:
-            raise ValueError(f"{patch_id}: start_line must be >= 1")
+            raise ValueError(f'{patch_id}: start_line must be >= 1')
         if end_line < 1:
-            raise ValueError(f"{patch_id}: end_line must be >= 1")
+            raise ValueError(f'{patch_id}: end_line must be >= 1')
         if start_line > end_line:
-            raise ValueError(f"{patch_id}: start_line cannot be greater than end_line")
+            raise ValueError(f'{patch_id}: start_line cannot be greater than end_line')
 
-        ranges.append(PatchRange(patch_id=patch_id, start_line=start_line, end_line=end_line))
-
-    ranges_sorted = sorted(ranges, key=lambda r: (r.start_line, r.end_line, r.patch_id))
-    prev = ranges_sorted[0]
-    for current in ranges_sorted[1:]:
-        if current.start_line <= prev.end_line:
-            raise ValueError(
-                f"Overlapping or nested blocks detected: "
-                f"{prev.patch_id} [{prev.start_line}, {prev.end_line}] and "
-                f"{current.patch_id} [{current.start_line}, {current.end_line}]"
+        ranges.append(
+            PatchRange(
+                patch_id=patch_id,
+                start_line=start_line,
+                end_line=end_line,
             )
-        prev = current
+        )
+
+    ranges_sorted = sorted(
+        ranges,
+        key=lambda item: (item.start_line, item.end_line, item.patch_id),
+    )
+    for previous, current in zip(ranges_sorted, ranges_sorted[1:]):
+        if current.start_line <= previous.end_line:
+            raise ValueError(
+                'Overlapping or nested blocks detected: '
+                f'{previous.patch_id} [{previous.start_line}, {previous.end_line}] '
+                f'and {current.patch_id} [{current.start_line}, {current.end_line}]'
+            )
 
     return ranges
 
@@ -1873,14 +1921,7 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
     for patch in patches:
         start_line = int(patch["start_line"])
         end_line = int(patch["end_line"])
-
-        removed = lines[start_line - 1 : end_line]
-
-        replacement = patch["content_line_array"]
-
-        # Perform the slice replacement
-        lines[start_line - 1 : end_line] = replacement
-
+        lines[start_line - 1 : end_line] = patch["content_line_array"]
     result = eol.join(lines)
     if original_text.endswith(eol):
         result += eol
@@ -1891,6 +1932,20 @@ def patch_manifest_document_path(file_entry: dict[str, Any]) -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
+
+
+def resolve_patch_suffix(
+    config: dict[str, Any],
+    patch_suffix_argument: str | None,
+ ) -> tuple[str, bool]:
+    configured_suffix = str(
+        config.get('patch_suffix', DEFAULT_CONFIG['patch_suffix']) or ''
+    ).strip()
+    if patch_suffix_argument is not None:
+        return patch_suffix_argument, True
+    if configured_suffix and configured_suffix.lower() != 'off':
+        return configured_suffix, configured_suffix != DEFAULT_CONFIG['patch_suffix']
+    return DEFAULT_CONFIG['patch_suffix'], False
 
 
 def build_patch_changes(
@@ -2036,23 +2091,18 @@ def write_patch_changes(
 
     for path_text, updated_text in changed_items:
         original_path = Path(path_text)
-        if patch_review:
-            target_path = (
-                append_suffix_to_path(original_path, patch_suffix)
-                if suffix_provided
-                else original_path
-            )
-            target_path.write_text(updated_text, encoding="utf-8")
-            written_paths.append(str(target_path))
-            print(
-                f"file_written="
-                f"{str(target_path) if suffix_provided else path_text}"
-            )
-        else:
-            target_path = append_suffix_to_path(original_path, patch_suffix)
-            target_path.write_text(updated_text, encoding="utf-8")
-            written_paths.append(str(target_path))
-            print(f"file_written={target_path}")
+        use_suffix = not patch_review or suffix_provided
+        target_path = (
+            append_suffix_to_path(original_path, patch_suffix)
+            if use_suffix
+            else original_path
+        )
+        target_path.write_text(updated_text, encoding="utf-8")
+        written_paths.append(str(target_path))
+        print(
+            f"file_written="
+            f"{str(target_path) if use_suffix else path_text}"
+        )
     return written_paths
 
 
@@ -2080,18 +2130,9 @@ def handle_patch_file_apply(
         if patch_review_argument is not None
         else coerce_bool(config.get("patch_review", "off"))
     )
-    configured_patch_suffix = str(
-        config.get("patch_suffix", DEFAULT_CONFIG["patch_suffix"]) or ""
-    ).strip()
-    if patch_suffix_argument is not None:
-        patch_suffix = patch_suffix_argument
-        suffix_provided = True
-    elif configured_patch_suffix and configured_patch_suffix.lower() != "off":
-        patch_suffix = configured_patch_suffix
-        suffix_provided = configured_patch_suffix != DEFAULT_CONFIG["patch_suffix"]
-    else:
-        patch_suffix = DEFAULT_CONFIG["patch_suffix"]
-        suffix_provided = False
+    patch_suffix, suffix_provided = resolve_patch_suffix(
+        config, patch_suffix_argument
+    )
 
     try:
         patch_branch_setting = resolve_patch_branch_setting(
@@ -2127,10 +2168,15 @@ def handle_patch_file_apply(
 
     if patch_review:
         while True:
-            patch_choice = input("Apply these changes? [y/n/p]: ").strip().lower()
-            if patch_choice == "p":
-                page_or_print(diff_text)
+            patch_input = input("Apply these changes? [y/n/p/h/R/S]: ")
+            patch_input, suffix_provided = process_patch_review_input(
+                patch_input,
+                diff_text,
+                suffix_provided,
+            )
+            if patch_input is None:
                 continue
+            patch_choice = patch_input.lower()
             if patch_choice in ("y", "yes"):
                 break
             if patch_choice in ("n", "no"):
@@ -2163,7 +2209,6 @@ def handle_patch_file_apply(
         print(f"ERROR: Failed to {action}: {exc}", file=sys.stderr)
         return 1
     return 0
-    return 0
 
 def handle_patch_file_print(
     patch_file_argument: str,
@@ -2190,6 +2235,7 @@ def handle_patch_file_print(
     sys.stdout.write(diff_text)
     return 0
 
+# -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
 
@@ -2300,6 +2346,16 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
         if normalized in ("off", "false", "no", "0"):
             return False
     return default
+
+def resolve_bool_option(
+    override: bool | None,
+    config: dict[str, Any],
+    key: str,
+    default: bool = False,
+ ) -> bool:
+    if override is not None:
+        return override
+    return coerce_bool(config.get(key, default), default)
 
 def parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
@@ -2437,6 +2493,44 @@ def resolve_configured_prompt(value: Any, default: str) -> str:
         raise ValueError(f"cannot read configured system prompt file {value} ({exc})") from exc
 
 
+def resolve_prompt_setting(
+    explicit_value: str | None,
+    prompt_file: Path | None,
+    config: dict[str, Any],
+    config_key: str,
+    default: str,
+    prompt_expansion_enabled: bool,
+    strip_configured_result: bool = False,
+ ) -> str:
+    if explicit_value:
+        prompt = str(explicit_value).strip()
+    elif prompt_file is not None:
+        prompt = read_file(prompt_file).strip()
+    else:
+        prompt = resolve_configured_prompt(
+            config.get(config_key, default),
+            default,
+        )
+
+    expanded = expand_prompt_names(prompt, prompt_expansion_enabled)
+    if strip_configured_result and not explicit_value and prompt_file is None:
+        return expanded.strip()
+    return expanded
+
+
+def parse_config_files(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, str):
+        raise ValueError("config files must be a pipe-separated string")
+    raw_value = value.strip()
+    if not raw_value:
+        return []
+    files = [path.strip() for path in raw_value.split("|")]
+    if any(not path for path in files):
+        raise ValueError("config files must not contain empty paths")
+    return files
+
 def read_files_list(
     paths: Path | list[Path],
 ) -> list[str]:
@@ -2461,29 +2555,43 @@ def build_context(
     file_paths: list[Path],
     max_file_size_kb: int,
     add_line_numbers: bool = True,
+    stdin_content: str | None = None,
 ) -> str:
     sections = []
     max_bytes = max_file_size_kb * 1024
 
     for path in file_paths:
-        if not path.exists():
-            sections.append(f"[MISSING FILE: {path}]")
-            continue
+        context_path = "/proc/self/stdin" if path == Path("-") else str(path)
+        if path == Path("-"):
+            if stdin_content is None:
+                sections.append(f"[MISSING FILE: {context_path}]")
+                continue
+            stdin_size = len(stdin_content.encode("utf-8"))
+            if stdin_size > max_bytes:
+                sections.append(
+                    f"[SKIPPED LARGE FILE: {context_path} ({stdin_size} bytes)]"
+                )
+                continue
+            content = stdin_content
+        else:
+            if not path.exists():
+                sections.append(f"[MISSING FILE: {context_path}]")
+                continue
 
-        if path.stat().st_size > max_bytes:
-            sections.append(
-                f"[SKIPPED LARGE FILE: {path} ({path.stat().st_size} bytes)]"
-            )
-            continue
+            if path.stat().st_size > max_bytes:
+                sections.append(
+                    f"[SKIPPED LARGE FILE: {context_path} ({path.stat().st_size} bytes)]"
+                )
+                continue
 
-        content = read_file(path)
+            content = read_file(path)
         if add_line_numbers:
             numbered_content = number_lines(content)
         else:
             numbered_content = content
 
         sections.append(
-            f"<file path='{path}' encoding='utf-8'>\n{numbered_content}\n</file>".strip()
+            f"<file path='{context_path}' encoding='utf-8'>\n{numbered_content}\n</file>".strip()
         )
 
     return "\n".join(sections)
@@ -2499,6 +2607,10 @@ def load_json_schema(path: Path) -> dict[str, Any]:
     except Exception as exc:
         print(f"ERROR: Failed to load JSON schema: {path}\n{exc}", file=sys.stderr)
         raise SystemExit(1)
+
+
+def clean_json_response(raw: str) -> str:
+    return re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', raw).strip()
 
 
 def pretty_json(raw: str) -> str:
@@ -3233,7 +3345,7 @@ def run_tree_mode(
                 error_text = "LLM returned an empty response"
                 error_type = "temp"
             if response_format in ("json", "schema") and result.strip():
-                cleaned_result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
+                cleaned_result = clean_json_response(result)
                 try:
                     result = json.dumps(json.loads(cleaned_result), indent=2, ensure_ascii=False)
                 except json.JSONDecodeError as exc:
@@ -3478,7 +3590,7 @@ def parse_args() -> argparse.Namespace:
         "-f",
         "--files",
         nargs="+",
-        help="Files to include as context",
+        help="Files to include as context (use - for STDIN)",
     )
 
     files_group.add_argument(
@@ -4200,14 +4312,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         type=int,
         metavar="KEEP_DAYS",
-        help="Delete session data older than KEEP_DAYS days (default: 60)",
+        help="Remove session data older than KEEP_DAYS (default: 60)",
     )
 
     return parser.parse_args()
 
 
 def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
-    """Disable options that require task/file context or patch mode in ask mode."""
     disabled_options: dict[str, Any] = {
         "files": None,
         "files_list": None,
@@ -4248,7 +4359,6 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
 def main() -> int:
     tokenizer_padding = 0
 
-    json_schema = None
     json_schema = None
     json_patch_responses: list[str] = []
     json_patch_task: str | None = None
@@ -4740,7 +4850,6 @@ def main() -> int:
         return 0
 
 
-    ask_mode: bool = args.ask is not None or args.ask_file is not None
     state_enabled = not ask_mode
     tree_mode = args.tree_files is not None or args.tree_files_list is not None
     if args.reuse_session is not None:
@@ -4821,9 +4930,6 @@ def main() -> int:
         elif args.files:
             file_names = args.files
 
-        if not file_names and args.reuse_session is None:
-            print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
-            return 1
     else:
         task = ""
 
@@ -4852,45 +4958,57 @@ def main() -> int:
         return 0
 
     config = load_config()
+    if (
+        not tree_mode
+        and not ask_mode
+        and not args.list_models
+        and not file_names
+        and args.reuse_session is None
+    ):
+        if args.files is None and args.files_list is None:
+            file_names = parse_config_files(
+                config.get("files", DEFAULT_CONFIG["files"])
+            )
+        if not file_names:
+            print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
+            return 1
 
-    prompt_expansion_enabled = (
-        args.prompt_expansion
-        if args.prompt_expansion is not None
-        else coerce_bool(config.get("prompt_expansion", "off"))
+    prompt_expansion_enabled = resolve_bool_option(
+        args.prompt_expansion,
+        config,
+        'prompt_expansion',
     )
     task = expand_prompt_names(task, prompt_expansion_enabled)
     tree_task_prompts = expand_tree_prompt_values(
         tree_task_prompts, prompt_expansion_enabled
     )
-    system_prompt_with_task = (
-        args.system_prompt_with_task
-        if args.system_prompt_with_task is not None
-        else coerce_bool(
-            config.get(
-                "system_prompt_with_task",
-                DEFAULT_CONFIG["system_prompt_with_task"],
-            )
-        )
+    system_prompt_with_task = resolve_bool_option(
+        args.system_prompt_with_task,
+        config,
+        'system_prompt_with_task',
     )
-    add_line_numbers = (
-        args.no_line_numbers
-        if args.no_line_numbers is not None
-        else coerce_bool(config.get("line_numbers", "on"), True)
+    add_line_numbers = resolve_bool_option(
+        args.no_line_numbers,
+        config,
+        'line_numbers',
+        True,
     )
 
-    quiet_enabled = (
-        args.quiet
-        if args.quiet is not None
-        else coerce_bool(config.get("quiet", "off"))
+    quiet_enabled = resolve_bool_option(
+        args.quiet,
+        config,
+        'quiet',
     )
+
     if quiet_enabled:
         VERBOSE = 0
 
-    patch_mode = (
-        args.patch
-        if args.patch is not None
-        else coerce_bool(config.get("patch", "off"))
+    patch_mode = resolve_bool_option(
+        args.patch,
+        config,
+        'patch',
     )
+
     try:
         patch_branch_setting = resolve_patch_branch_setting(
             args.patch_branch
@@ -4900,37 +5018,33 @@ def main() -> int:
     except ValueError as exc:
         print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
         return 1
+
     patch_branch_mode = patch_branch_setting is not None
-    patch_save_enabled = args.noninteractive or (
-        args.patch_save
-        if args.patch_save is not None
-        else coerce_bool(config.get("patch_save", "on"), True)
+    patch_save_enabled = args.noninteractive or resolve_bool_option(
+        args.patch_save,
+        config,
+        'patch_save',
+        True,
     )
-    patch_review = (
-        args.patch_review
-        if args.patch_review is not None
-        else coerce_bool(config.get("patch_review", "off"))
+    patch_review = resolve_bool_option(
+        args.patch_review,
+        config,
+        'patch_review',
     )
-    plan_mode = (
-        args.plan
-        if args.plan is not None
-        else coerce_bool(config.get("plan", "off"))
+    plan_mode = resolve_bool_option(
+        args.plan,
+        config,
+        'plan',
     )
-    print_reasoning = (
-        args.print_reasoning
-        if args.print_reasoning is not None
-        else coerce_bool(config.get("print_reasoning", "off"))
+    print_reasoning = resolve_bool_option(
+        args.print_reasoning,
+        config,
+        'print_reasoning',
     )
-    configured_patch_suffix = str(config.get("patch_suffix", DEFAULT_CONFIG["patch_suffix"]) or "").strip()
-    if args.patch_suffix is not None:
-        patch_suffix = args.patch_suffix
-        suffix_provided = True
-    elif configured_patch_suffix and configured_patch_suffix.lower() != "off":
-        patch_suffix = configured_patch_suffix
-        suffix_provided = configured_patch_suffix != DEFAULT_CONFIG["patch_suffix"]
-    else:
-        patch_suffix = DEFAULT_CONFIG["patch_suffix"]
-        suffix_provided = False
+    patch_suffix, suffix_provided = resolve_patch_suffix(
+        config, args.patch_suffix
+    )
+
     if patch_branch_mode:
         patch_suffix = ''
         suffix_provided = False
@@ -4945,7 +5059,10 @@ def main() -> int:
         print("ERROR: --patch requires --task or --task-file", file=sys.stderr)
         return 1
     if patch_mode and (args.ask or args.ask_file):
-        print("ERROR: --patch only supports --task or --task-file ", file=sys.stderr)
+        print("ERROR: --patch only supports --task or --task-file", file=sys.stderr)
+        return 1
+    if patch_mode and "-" in file_names:
+        print("ERROR: --patch does not support STDIN in --files", file=sys.stderr)
         return 1
     if patch_branch_mode and not patch_mode:
         print('ERROR: --patch-branch requires --patch', file=sys.stderr)
@@ -4970,10 +5087,12 @@ def main() -> int:
     openai_organization = str(args.meta_organization or config.get("meta_organization", "")).strip()
     openai_project = str(args.meta_project or config.get("meta_project", "")).strip()
     safety_identifier = config.get("safety_identifier", None)
-    api_log = (
-        args.no_api_log
-        if args.no_api_log is not None
-        else coerce_bool(config.get("api_log", True), True)
+    safety_identifier = config.get('safety_identifier', None)
+    api_log = resolve_bool_option(
+        args.no_api_log,
+        config,
+        'api_log',
+        True,
     )
 
     if args.list_models:
@@ -4994,68 +5113,40 @@ def main() -> int:
             _handle_openai_error(exc)
         return 0
 
-    if args.system_prompt:
-        system_prompt = expand_prompt_names(
-            str(args.system_prompt).strip(),
-            prompt_expansion_enabled,
-        )
-    elif args.system_prompt_file:
-        system_prompt = expand_prompt_names(
-            read_file(args.system_prompt_file).strip(),
-            prompt_expansion_enabled,
-        )
-    else:
-        configured_system_prompt = resolve_configured_prompt(
-            config.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
-            DEFAULT_SYSTEM_PROMPT,
-        )
-        system_prompt = expand_prompt_names(
-            configured_system_prompt,
-            prompt_expansion_enabled,
-        )
-
-    if args.linenum_system_prompt:
-        linenum_system_prompt = expand_prompt_names(
-            str(args.linenum_system_prompt).strip(),
-            prompt_expansion_enabled,
-        )
-    else:
-        linenum_system_prompt = expand_prompt_names(
-            resolve_configured_prompt(
-                config.get("linenum_system_prompt", DEFAULT_LINENUM_SYSTEM_PROMPT),
-                DEFAULT_LINENUM_SYSTEM_PROMPT,
-            ),
-            prompt_expansion_enabled,
-        ).strip()
-
-    if args.patch_system_prompt:
-        patch_system_prompt = expand_prompt_names(
-            str(args.patch_system_prompt).strip(),
-            prompt_expansion_enabled,
-        )
-    else:
-        patch_system_prompt = expand_prompt_names(
-            resolve_configured_prompt(
-                config.get("patch_system_prompt", DEFAULT_PATCH_SYSTEM_PROMPT),
-                DEFAULT_PATCH_SYSTEM_PROMPT,
-            ),
-            prompt_expansion_enabled,
-        ).strip()
-
-
-    if args.plan_system_prompt:
-        plan_system_prompt = expand_prompt_names(
-            str(args.plan_system_prompt).strip(),
-            prompt_expansion_enabled,
-        )
-    else:
-        plan_system_prompt = expand_prompt_names(
-            resolve_configured_prompt(
-                config.get("plan_system_prompt", DEFAULT_PLAN_SYSTEM_PROMPT),
-                DEFAULT_PLAN_SYSTEM_PROMPT,
-            ),
-            prompt_expansion_enabled,
-        )
+    system_prompt = resolve_prompt_setting(
+        explicit_value=args.system_prompt,
+        prompt_file=args.system_prompt_file,
+        config=config,
+        config_key='system_prompt',
+        default=DEFAULT_SYSTEM_PROMPT,
+        prompt_expansion_enabled=prompt_expansion_enabled,
+    )
+    linenum_system_prompt = resolve_prompt_setting(
+        explicit_value=args.linenum_system_prompt,
+        prompt_file=None,
+        config=config,
+        config_key='linenum_system_prompt',
+        default=DEFAULT_LINENUM_SYSTEM_PROMPT,
+        prompt_expansion_enabled=prompt_expansion_enabled,
+        strip_configured_result=True,
+    )
+    patch_system_prompt = resolve_prompt_setting(
+        explicit_value=args.patch_system_prompt,
+        prompt_file=None,
+        config=config,
+        config_key='patch_system_prompt',
+        default=DEFAULT_PATCH_SYSTEM_PROMPT,
+        prompt_expansion_enabled=prompt_expansion_enabled,
+        strip_configured_result=True,
+    )
+    plan_system_prompt = resolve_prompt_setting(
+        explicit_value=args.plan_system_prompt,
+        prompt_file=None,
+        config=config,
+        config_key='plan_system_prompt',
+        default=DEFAULT_PLAN_SYSTEM_PROMPT,
+        prompt_expansion_enabled=prompt_expansion_enabled,
+    )
 
     temperature = (
         args.temperature
@@ -5153,15 +5244,14 @@ def main() -> int:
         system_prompt = system_prompt + "\n" + patch_system_prompt
         add_line_numbers = True
 
-    stream_enabled = (
-        args.stream
-        if args.stream is not None
-        else coerce_bool(config.get("stream", "off"))
+    stream_enabled = resolve_bool_option(
+        args.stream,
+        config,
+        'stream',
     )
-    if stream_enabled and response_format != "text":
+    if stream_enabled and response_format != 'text':
         stream_enabled = False
 
-    json_schema: dict[str, Any] | None = json_schema
     if response_format == "schema" and json_schema is None:
         if not args.schema_file:
             print(
@@ -5176,6 +5266,46 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    def call_model(
+        request_system_prompt: str,
+        request_user_prompt: str,
+        *,
+        response_format_override: str | None = None,
+        stream: bool = False,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        request_response_format = (
+            response_format
+            if response_format_override is None
+            else response_format_override
+        )
+        request_schema = (
+            json_schema if response_format_override is None else None
+        )
+        return call_openai(
+            api_key=api_key,
+            openai_base_url=openai_base_url,
+            openai_proxy=openai_proxy,
+            openai_organization=openai_organization,
+            openai_project=openai_project,
+            model=model,
+            system_prompt=request_system_prompt,
+            user_prompt=request_user_prompt,
+            response_format=request_response_format,
+            json_schema=request_schema,
+            response_verbosity=response_verbosity,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            openai_service_tier=openai_service_tier,
+            openai_reasoning=openai_reasoning,
+            reasoning_mode=reasoning_mode,
+            extra_body=extra_body,
+            llm_timeout=llm_timeout,
+            safety_identifier=safety_identifier,
+            store=api_log,
+            stream=stream,
+        )
 
     api_key = resolve_api_key(config)
     if not api_key:
@@ -5433,13 +5563,20 @@ def main() -> int:
             )
         full_system_prompt = system_prompt
     else:
-        file_paths=[Path(f).resolve() for f in file_names]
+        file_paths = [
+            Path(f) if f == "-" else Path(f).resolve()
+            for f in file_names
+        ]
         max_file_size_kb=coerce_int(config.get("max_file_size_kb", 512), 512)
         try:
+            stdin_content = (
+                sys.stdin.read() if "-" in file_names else None
+            )
             context = build_context(
                 file_paths=file_paths,
                 max_file_size_kb=max_file_size_kb,
                 add_line_numbers=add_line_numbers,
+                stdin_content=stdin_content,
             )
         except Exception as exc:
             try:
@@ -5566,29 +5703,10 @@ def main() -> int:
         plan_start_time = time.perf_counter()
         plan_response_obj: Any = None
         try:
-            plan_response_obj, plan_usage = call_openai(
-                api_key=api_key,
-                openai_base_url=openai_base_url,
-                openai_proxy=openai_proxy,
-                openai_organization=openai_organization,
-                openai_project=openai_project,
-                model=model,
-                system_prompt=plan_full_system_prompt,
-                user_prompt=plan_user_prompt,
-                response_format="text",
-                json_schema=None,
-                response_verbosity=response_verbosity,
-                temperature=temperature,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-                openai_service_tier=openai_service_tier,
-                openai_reasoning=openai_reasoning,
-                reasoning_mode=reasoning_mode,
-                extra_body=extra_body,
-                llm_timeout=llm_timeout,
-                safety_identifier=safety_identifier,
-                store=api_log,
-                stream=False,
+            plan_response_obj, plan_usage = call_model(
+                plan_full_system_prompt,
+                plan_user_prompt,
+                response_format_override='text',
             )
             plan_result = str(getattr(plan_response_obj, "output_text", "") or "").strip()
         except Exception as exc:
@@ -5662,8 +5780,6 @@ def main() -> int:
             json_schema=json_schema,
             include_task=not system_prompt_with_task,
         )
-        if patch_mode:
-            user_prompt = user_prompt + "\n" + patch_system_prompt
     request_tokens = estimate_request_tokens(
         model=model,
         system_prompt=full_system_prompt,
@@ -5740,28 +5856,9 @@ def main() -> int:
 
             stream_sink = emit_stream_text
 
-        response_obj, usage = call_openai(
-            api_key=api_key,
-            openai_base_url=openai_base_url,
-            openai_proxy=openai_proxy,
-            openai_organization=openai_organization,
-            openai_project=openai_project,
-            model=model,
-            system_prompt=full_system_prompt,
-            user_prompt=user_prompt,
-            response_format=response_format,
-            json_schema=json_schema,
-            response_verbosity=response_verbosity,
-            temperature=temperature,
-            top_p=top_p,
-            max_output_tokens=max_output_tokens,
-            openai_service_tier=openai_service_tier,
-            openai_reasoning=openai_reasoning,
-            reasoning_mode=reasoning_mode,
-            extra_body=extra_body,
-            llm_timeout=llm_timeout,
-            safety_identifier=safety_identifier,
-            store=api_log,
+        response_obj, usage = call_model(
+            full_system_prompt,
+            user_prompt,
             stream=stream_enabled,
         )
         if stream_enabled:
@@ -5895,29 +5992,9 @@ def main() -> int:
             )
 
         revision_start_time = time.perf_counter()
-        revision_response_obj, revision_usage = call_openai(
-            api_key=api_key,
-            openai_base_url=openai_base_url,
-            openai_proxy=openai_proxy,
-            openai_organization=openai_organization,
-            openai_project=openai_project,
-            model=model,
-            system_prompt=full_system_prompt,
-            user_prompt=revision_user_prompt,
-            response_format=response_format,
-            json_schema=json_schema,
-            response_verbosity=response_verbosity,
-            temperature=temperature,
-            top_p=top_p,
-            max_output_tokens=max_output_tokens,
-            openai_service_tier=openai_service_tier,
-            openai_reasoning=openai_reasoning,
-            reasoning_mode=reasoning_mode,
-            extra_body=extra_body,
-            llm_timeout=llm_timeout,
-            safety_identifier=safety_identifier,
-            store=api_log,
-            stream=False,
+        revision_response_obj, revision_usage = call_model(
+            full_system_prompt,
+            revision_user_prompt,
         )
         revision_result = str(
             getattr(revision_response_obj, 'output_text', '') or ''
@@ -5977,11 +6054,7 @@ def main() -> int:
                     )
                     return 1
 
-                result = re.sub(
-                    r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)',
-                    '',
-                    result,
-                ).strip()
+                result = clean_json_response(result)
                 manifest = json.loads(result)
             except json.JSONDecodeError as exc:
                 print('<invalid_json_patch>')
@@ -6071,10 +6144,16 @@ def main() -> int:
             if patch_review:
                 while True:
                     patch_input = input(
-                        'Apply these changes? [y/n/p/</>/e/E <prompt>]: '
-                    ).strip()
-                    if not patch_input:
-                        print('Usage: [y]es, [n]o, [p]ager, [<]prevturn, [>]nextturn, [e]dit, E <prompt>')
+                        'Apply these changes? '
+                        '[y/n/p/h/R/S/</>/e/E <prompt>]: '
+                    )
+                    patch_input, suffix_provided = process_patch_review_input(
+                        patch_input,
+                        diff_text,
+                        suffix_provided,
+                        allow_navigation=True,
+                    )
+                    if patch_input is None:
                         continue
                     if patch_input == '<':
                         if patch_turn_index == 0:
@@ -6203,7 +6282,7 @@ def main() -> int:
                 print("ERROR: LLM returned empty response", file=sys.stderr)
                 return 1
 
-            result = re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', result).strip()
+            result = clean_json_response(result)
             result = json.loads(result)
         except json.JSONDecodeError as exc:
             print(result)
