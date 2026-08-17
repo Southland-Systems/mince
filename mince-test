@@ -1,0 +1,1885 @@
+#!/usr/bin/env python3
+"""Run deterministic, offline integration tests for mince."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestFailure(Exception):
+    """An expected integration-test failure."""
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise TestFailure(message)
+
+
+class MockResponsesAPI:
+    """Serve a sequence of Responses API payloads on loopback only."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        if not responses:
+            raise ValueError("at least one mock response is required")
+        self.responses = responses
+        self.requests: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self.url = ""
+
+    @staticmethod
+    def _payload(value: Any, index: int) -> bytes:
+        if isinstance(value, str):
+            output_text = value
+            usage: dict[str, Any] = {}
+        elif isinstance(value, dict):
+            if "output_text" in value:
+                output_text = value["output_text"]
+            elif "output" in value:
+                output_text = json.dumps(
+                    value["output"],
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+            else:
+                raise ValueError("mock response requires output or output_text")
+            usage = value.get("usage", {})
+        else:
+            raise ValueError("mock response must be a string or object")
+        if not isinstance(output_text, str):
+            raise ValueError("mock response output must be text")
+        if not isinstance(usage, dict) or not usage:
+            usage = {
+                "input_tokens": 8,
+                "output_tokens": 4,
+                "total_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            }
+        response = {
+            "id": f"resp_offline_{index}",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "background": False,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "max_tool_calls": None,
+            "metadata": {},
+            "model": "offline-test-model",
+            "output": [
+                {
+                    "id": f"msg_offline_{index}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": output_text,
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                }
+            ],
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "prompt": None,
+            "reasoning": {"effort": None, "summary": None},
+            "safety_identifier": None,
+            "service_tier": "default",
+            "store": False,
+            "temperature": 1,
+            "text": {"format": {"type": "text"}, "verbosity": "medium"},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_logprobs": 0,
+            "top_p": 1,
+            "truncation": "disabled",
+            "usage": usage,
+            "user": None,
+        }
+        return json.dumps(response, ensure_ascii=False).encode("utf-8")
+
+    def __enter__(self) -> "MockResponsesAPI":
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                try:
+                    request = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    request = {"raw": body.decode("utf-8", errors="replace")}
+                if not isinstance(request, dict):
+                    request = {"value": request}
+                with owner._lock:
+                    owner.requests.append(request)
+                    index = len(owner.requests) - 1
+                    response_value = owner.responses[min(index, len(owner.responses) - 1)]
+                response_payload = json.loads(
+                    owner._payload(response_value, index).decode("utf-8")
+                )
+                if request.get("stream") is True:
+                    output_text = response_payload["output"][0]["content"][0]["text"]
+                    events = [
+                        {
+                            "type": "response.output_text.delta",
+                            "content_index": 0,
+                            "delta": output_text,
+                            "item_id": f"msg_offline_{index}",
+                            "logprobs": [],
+                            "obfuscation": "",
+                            "output_index": 0,
+                            "sequence_number": 0,
+                        },
+                        {
+                            "type": "response.completed",
+                            "response": response_payload,
+                            "sequence_number": 1,
+                        },
+                    ]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    for event in events:
+                        event_text = (
+                            f"event: {event['type']}\n"
+                            f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        ).encode("utf-8")
+                        self.wfile.write(event_text)
+                        self.wfile.flush()
+                    return
+                payload = json.dumps(
+                    response_payload, ensure_ascii=False
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="mince-test-mock",
+            daemon=True,
+        )
+        self._thread.start()
+        self.url = f"http://127.0.0.1:{self._server.server_port}/v1"
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                raise TestFailure("offline mock server did not stop")
+        return False
+
+
+class OfflineTests:
+    def __init__(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="mince-test-",
+        )
+        self.root = Path(self._temporary_directory.name)
+        self.home = self.root / "home"
+        self.work = self.root / "work"
+        self.home.mkdir()
+        self.work.mkdir()
+        self.command = ["mince"]
+
+    def run(
+        self,
+        *arguments: object,
+        check: bool = True,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(self.home),
+                "OPENAI_API_KEY": "offline-test-key",
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+                "HTTP_PROXY": "",
+                "HTTPS_PROXY": "",
+                "ALL_PROXY": "",
+                "http_proxy": "",
+                "https_proxy": "",
+                "all_proxy": "",
+            }
+        )
+        command = [*self.command, *(str(argument) for argument in arguments)]
+        completed = subprocess.run(
+            command,
+            cwd=cwd or ROOT,
+            env=environment,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        if check and completed.returncode != 0:
+            raise TestFailure(
+                f"{command!r} failed\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}"
+            )
+        return completed
+
+    def test_default_config(self) -> None:
+        result = self.run("--print-default-config")
+        config = json.loads(result.stdout)
+        require(
+            config["model"] == "gpt-5.6-luna",
+            "default model is incorrect",
+        )
+        require(
+            bool(config["linenum_system_prompt"]),
+            "line-number prompt is missing",
+        )
+        require(
+            config["patch"] == "off",
+            "patch mode default is incorrect",
+        )
+
+    def test_inherited_profile_overrides(self) -> None:
+        self.run("--inherit-profile", "child")
+        inherited = self.run(
+            "--profile",
+            "child",
+            "--get-config",
+            "model",
+        )
+        require(
+            inherited.stdout.strip() == "model=gpt-5.6-luna",
+            "inherited profile did not expose the parent model",
+        )
+        self.run(
+            "--profile",
+            "child",
+            "--set-config",
+            "model=child-model",
+        )
+        profile_path = self.home / ".local/state/mince/child.json"
+        raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        require(
+            raw_profile.get("_inherit_profile") == "config"
+            and raw_profile.get("model") == "child-model",
+            "profile override was not stored as a child value",
+        )
+        overridden = self.run(
+            "--profile",
+            "child",
+            "--get-config",
+            "model",
+        )
+        require(
+            overridden.stdout.strip() == "model=child-model",
+            "child profile override was not used",
+        )
+        self.run(
+            "--profile",
+            "child",
+            "--set-config",
+            "model=DEFAULT",
+        )
+        raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        require(
+            "model" not in raw_profile,
+            "DEFAULT did not remove the inherited child override",
+        )
+        restored = self.run(
+            "--profile",
+            "child",
+            "--get-config",
+            "model",
+        )
+        require(
+            restored.stdout.strip() == "model=gpt-5.6-luna",
+            "parent value was not restored after resetting the child",
+        )
+        self.run("--remove-profile", "child")
+        require(not profile_path.exists(), "temporary child profile was not removed")
+
+    def test_tree_filtering(self) -> None:
+        tree = self.work / "tree"
+        tree.mkdir()
+        keep = tree / "keep.txt"
+        skip = tree / "skip.txt"
+        keep.write_text("keep\n", encoding="utf-8")
+        skip.write_text("skip\n", encoding="utf-8")
+        result = self.run(
+            "--tree-files",
+            tree,
+            "--tree-include",
+            "*.txt",
+            "--tree-exclude",
+            "skip*",
+            "--tree-show-only",
+        )
+        require(str(keep) in result.stdout, "included tree file is missing")
+        require("skip.txt" not in result.stdout, "excluded tree file was listed")
+
+    def test_tree_api_processing(self) -> None:
+        tree = self.work / "api-tree"
+        tree.mkdir()
+        (tree / "a.py").write_text("alpha\n", encoding="utf-8")
+        (tree / "b.txt").write_text("bravo\n", encoding="utf-8")
+        with MockResponsesAPI(["tree answer"]) as mock:
+            result = self.run(
+                "--tree-files",
+                tree,
+                "--tree-task",
+                "Summarize each tree file.",
+                "--tree-parallel",
+                "1",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(len(mock.requests) == 2, "expected one tree request per file")
+        request_inputs = [
+            str(request.get("input", ""))
+            for request in mock.requests
+        ]
+        require(
+            all("Summarize each tree file." in value for value in request_inputs),
+            "tree task was omitted from one or more requests",
+        )
+        require(
+            any("1 alpha" in value for value in request_inputs),
+            "tree request omitted numbered file context",
+        )
+        session_name = re_search(
+            r"tree_session_name=(\S+)",
+            result.stdout,
+        )
+        require(session_name is not None, "tree session name was not printed")
+        combined = (
+            self.home / ".local/state/mince/trees" / session_name
+            / f"{session_name}.md"
+        )
+        require(combined.is_file(), "combined tree result was not written")
+        combined_text = combined.read_text(encoding="utf-8")
+        require(
+            "# **api-tree/a.py**" in combined_text
+            and "# **api-tree/b.txt**" in combined_text,
+            "combined tree result omitted a processed file",
+        )
+        require(
+            combined_text.count("tree answer") == 2,
+            "combined tree result did not contain both API responses",
+        )
+
+    def test_tree_extension_prompts(self) -> None:
+        tree = self.work / "prompted-tree"
+        tree.mkdir()
+        (tree / "main.py").write_text("python\n", encoding="utf-8")
+        (tree / "notes.txt").write_text("text\n", encoding="utf-8")
+        task_prompts = self.work / "tree-tasks.txt"
+        task_prompts.write_text(
+            "*: General tree task\n.py: Python-specific tree task\n",
+            encoding="utf-8",
+        )
+        system_prompts = self.work / "tree-systems.txt"
+        system_prompts.write_text(
+            "*: General system instruction\n.py: Python-specific system instruction\n",
+            encoding="utf-8",
+        )
+        with MockResponsesAPI(["tree prompt answer"]) as mock:
+            self.run(
+                "--tree-files",
+                tree,
+                "--tree-task-file",
+                task_prompts,
+                "--tree-system-prompt-file",
+                system_prompts,
+                "--tree-parallel",
+                "1",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        request_inputs = [
+            str(request.get("input", "")) for request in mock.requests
+        ]
+        python_input = next(
+            value for value in request_inputs if "1 python" in value
+        )
+        text_input = next(
+            value for value in request_inputs if "1 text" in value
+        )
+        require(
+            "Python-specific tree task" in python_input
+            and "General tree task" not in python_input,
+            "extension-specific tree task was not selected",
+        )
+        require(
+            "General tree task" in text_input
+            and "Python-specific tree task" not in text_input,
+            "wildcard tree task was not selected",
+        )
+        python_instructions = next(
+            str(request.get("instructions", ""))
+            for request in mock.requests
+            if "1 python" in str(request.get("input", ""))
+        )
+        require(
+            "Python-specific system instruction" in python_instructions,
+            "extension-specific system prompt was not selected",
+        )
+
+    def test_prompt_library(self) -> None:
+        self.run("--prompt-edit", "offline", "Offline prompt")
+        printed = self.run("--prompt-print-json", "offline")
+        prompts = json.loads(printed.stdout)
+        require(
+            prompts == {"offline": "Offline prompt"},
+            "prompt JSON output is incorrect",
+        )
+        self.run("--prompt-assign", "offline", "config", "system")
+        configured = self.run("--get-config", "system_prompt")
+        require(
+            "./offline.md" in configured.stdout,
+            "prompt assignment was not saved",
+        )
+        self.run("--prompt-unassign", "offline", "config", "system")
+        restored = self.run("--get-config", "system_prompt")
+        require(
+            "You are a concise" in restored.stdout,
+            "prompt unassignment did not restore the default",
+        )
+    def test_prompt_expansion(self) -> None:
+        self.run("--prompt-edit", "leaf", "Expanded leaf prompt")
+        self.run(
+            "--prompt-edit",
+            "outer",
+            "Before ^^leaf^^ after",
+        )
+        with MockResponsesAPI(["offline prompt expansion"]) as mock:
+            result = self.run(
+                "--ask",
+                "^^outer^^",
+                "--prompt-expansion",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "offline prompt expansion" in result.stdout,
+            "expanded prompt response was not printed",
+        )
+        require(len(mock.requests) == 1, "expected one prompt expansion request")
+        request_input = str(mock.requests[0].get("input", ""))
+        require(
+            "Before Expanded leaf prompt after" in request_input,
+            "prompt-library reference was not expanded in the request",
+        )
+
+    def test_file_list_and_prompt_file_inputs(self) -> None:
+        ask_one = self.work / "ask-one.txt"
+        ask_two = self.work / "ask-two.txt"
+        context_one = self.work / "list-context-one.txt"
+        context_two = self.work / "list-context-two.txt"
+        task_file = self.work / "task-file.txt"
+        files_list = self.work / "context-files.list"
+        ask_one.write_text("Ask from first file\n", encoding="utf-8")
+        ask_two.write_text("Ask from second file\n", encoding="utf-8")
+        context_one.write_text("First context line\n", encoding="utf-8")
+        context_two.write_text("Second context line\n", encoding="utf-8")
+        task_file.write_text("Task loaded from a file\n", encoding="utf-8")
+        files_list.write_text(
+            f"{context_one}\n# ignored comment\n\n{context_two}\n",
+            encoding="utf-8",
+        )
+        with MockResponsesAPI(
+            ["offline ask-file", "offline task-file"]
+        ) as mock:
+            ask_result = self.run(
+                "--ask-file",
+                ask_one,
+                ask_two,
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+            task_result = self.run(
+                "--task-file",
+                task_file,
+                "--files-list",
+                files_list,
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "offline ask-file" in ask_result.stdout,
+            "ask-file response was not printed",
+        )
+        ask_input = str(mock.requests[0].get("input", ""))
+        require(
+            "Ask from first file" in ask_input
+            and "Ask from second file" in ask_input,
+            "multiple ask prompt files were not combined",
+        )
+        require(
+            "offline task-file" in task_result.stdout,
+            "task-file response was not printed",
+        )
+        task_input = str(mock.requests[1].get("input", ""))
+        require(
+            "Task loaded from a file" in task_input
+            and "1 First context line" in task_input
+            and "1 Second context line" in task_input,
+            "task or files-list input was not included in the request",
+        )
+        require(
+            "# ignored comment" not in task_input,
+            "comments in a files list were treated as context files",
+        )
+
+    def test_streaming_text_response(self) -> None:
+        with MockResponsesAPI(["offline streamed response"]) as mock:
+            result = self.run(
+                "--ask",
+                "Stream the offline response.",
+                "--stream",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            result.stdout == "offline streamed response\n",
+            "streamed response text was not emitted correctly",
+        )
+        require(len(mock.requests) == 1, "expected one streaming request")
+        require(
+            mock.requests[0].get("stream") is True,
+            "streaming was not requested from the API",
+        )
+
+    @staticmethod
+    def _patch_file_entry(
+        path: Path,
+        *,
+        total_lines: int,
+        line_ending: str = "lf",
+        patches: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "document": {
+                "path": str(path),
+                "encoding": "utf-8",
+                "line_ending": line_ending,
+                "total_lines": total_lines,
+            },
+            "patches": patches,
+        }
+
+    def _patch_manifest(
+        self,
+        path: Path,
+        *,
+        line_ending: str = "lf",
+        total_lines: int = 3,
+        patches: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "files": [
+                self._patch_file_entry(
+                    path,
+                    total_lines=total_lines,
+                    line_ending=line_ending,
+                    patches=patches,
+                )
+            ],
+            "commit_message": "Apply offline test patch",
+        }
+
+    def test_multifile_patch_and_new_file(self) -> None:
+        existing = self.work / "multi-existing.txt"
+        created = self.work / "multi-created.txt"
+        existing.write_text("first\nsecond\n", encoding="utf-8")
+        manifest = {
+            "files": [
+                self._patch_file_entry(
+                    existing,
+                    total_lines=2,
+                    patches=[
+                        {
+                            "patch_id": "multi-p1",
+                            "block_id": "multi-b1",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "content_line_array": ["first-updated"],
+                            "summary": "Update the existing file",
+                            "confidence": 1.0,
+                            "needs_manual_review": False,
+                        }
+                    ],
+                ),
+                self._patch_file_entry(
+                    created,
+                    total_lines=1,
+                    patches=[
+                        {
+                            "patch_id": "multi-p2",
+                            "block_id": "multi-b2",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "content_line_array": ["created-content"],
+                            "summary": "Create the missing file",
+                            "confidence": 1.0,
+                            "needs_manual_review": False,
+                        }
+                    ],
+                ),
+            ],
+            "commit_message": "Apply the multifile offline patch",
+        }
+        manifest_path = self.work / "multifile.json"
+        manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        self.run(
+            "--patch-file-apply",
+            manifest_path,
+            "--patch-suffix",
+            ".multi",
+            "--log",
+            "off",
+        )
+        require(
+            existing.with_name(existing.name + ".multi").read_text(
+                encoding="utf-8"
+            ) == "first-updated\nsecond\n",
+            "multifile patch changed the existing file incorrectly",
+        )
+        require(
+            created.with_name(created.name + ".multi").read_text(
+                encoding="utf-8"
+            ) == "created-content",
+            "patch did not create the missing file",
+        )
+
+    def test_empty_file_patch_insertion(self) -> None:
+        target = self.work / "empty-insert.txt"
+        target.write_bytes(b"")
+        manifest = self._patch_manifest(
+            target,
+            total_lines=1,
+            patches=[
+                {
+                    "patch_id": "empty-p1",
+                    "block_id": "empty-b1",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "content_line_array": [
+                        "inserted",
+                        "without-final-newline",
+                    ],
+                    "summary": "Insert content into an empty file",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                }
+            ],
+        )
+        manifest_path = self.work / "empty-insert.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.run(
+            "--patch-file-apply",
+            manifest_path,
+            "--patch-suffix",
+            ".inserted",
+            "--log",
+            "off",
+        )
+        require(
+            target.with_name(target.name + ".inserted").read_bytes()
+            == b"inserted\nwithout-final-newline",
+            "empty-file insertion did not preserve the expected content",
+        )
+
+    def test_saved_patch_validation_and_line_endings(self) -> None:
+        target = self.work / "patch-target.txt"
+        target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        manifest = self._patch_manifest(
+            target,
+            patches=[
+                {
+                    "patch_id": "p1",
+                    "block_id": "b1",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "content_line_array": ["beta-updated"],
+                    "summary": "Update beta",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                }
+            ],
+        )
+        manifest_path = self.work / "patch.json"
+        manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        printed = self.run(
+            "--patch-file-print",
+            manifest_path,
+            "--log",
+            "off",
+        )
+        require("-beta" in printed.stdout, "patch diff omitted the original line")
+        require(
+            "+beta-updated" in printed.stdout,
+            "patch diff omitted the replacement line",
+        )
+        self.run(
+            "--patch-file-apply",
+            manifest_path,
+            "--patch-suffix",
+            ".patched",
+            "--log",
+            "off",
+        )
+        require(
+            target.with_name(target.name + ".patched").read_text(
+                encoding="utf-8"
+            ) == "alpha\nbeta-updated\ngamma\n",
+            "saved patch produced incorrect output",
+        )
+
+        crlf_target = self.work / "crlf.txt"
+        crlf_target.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+        crlf_manifest = self._patch_manifest(
+            crlf_target,
+            line_ending="crlf",
+            patches=[
+                {
+                    "patch_id": "crlf-1",
+                    "block_id": "crlf-block",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "content_line_array": ["two-updated"],
+                    "summary": "Update CRLF text",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                }
+            ],
+        )
+        crlf_manifest_path = self.work / "crlf.json"
+        crlf_manifest_path.write_text(
+            json.dumps(crlf_manifest),
+            encoding="utf-8",
+        )
+        self.run(
+            "--patch-file-apply",
+            crlf_manifest_path,
+            "--patch-suffix",
+            ".crlf",
+            "--log",
+            "off",
+        )
+        require(
+            crlf_target.with_name(crlf_target.name + ".crlf").read_bytes()
+            == b"one\r\ntwo-updated\r\nthree\r\n",
+            "patch application did not preserve CRLF endings",
+        )
+
+        bad_manifest = json.loads(json.dumps(manifest))
+        bad_manifest["files"][0]["patches"].append(
+            {
+                "patch_id": "overlap",
+                "block_id": "overlap-block",
+                "start_line": 1,
+                "end_line": 2,
+                "content_line_array": ["replacement"],
+                "summary": "Invalid overlap",
+                "confidence": 1.0,
+                "needs_manual_review": False,
+            }
+        )
+        bad_manifest_path = self.work / "overlap.json"
+        bad_manifest_path.write_text(
+            json.dumps(bad_manifest),
+            encoding="utf-8",
+        )
+        failed = self.run(
+            "--patch-file-apply",
+            bad_manifest_path,
+            "--patch-suffix",
+            ".bad",
+            "--log",
+            "off",
+            check=False,
+        )
+        require(failed.returncode != 0, "overlapping patch was accepted")
+        require(
+            not target.with_name(target.name + ".bad").exists(),
+            "invalid patch created an output file",
+        )
+
+    def test_patch_review_without_suffix(self) -> None:
+        target = self.work / "review-target.txt"
+        target.write_text("review-first\nreview-second\n", encoding="utf-8")
+        response = {
+            "output": {
+                "files": [
+                    self._patch_file_entry(
+                        target,
+                        total_lines=2,
+                        patches=[
+                            {
+                                "patch_id": "review-p1",
+                                "block_id": "review-b1",
+                                "start_line": 2,
+                                "end_line": 2,
+                                "content_line_array": ["review-updated"],
+                                "summary": "Update the reviewed line",
+                                "confidence": 1.0,
+                                "needs_manual_review": False,
+                            }
+                        ],
+                    )
+                ],
+                "commit_message": "Apply reviewed offline patch",
+            }
+        }
+        with MockResponsesAPI([response]) as mock:
+            self.run(
+                "--task",
+                "Review the offline patch.",
+                "--files",
+                target,
+                "--patch",
+                "--patch-review",
+                "--patch-save",
+                "off",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+                input_text="y\n",
+            )
+        require(
+            target.read_text(encoding="utf-8")
+            == "review-first\nreview-updated\n",
+            "accepted reviewed patch was not written to the original file",
+        )
+        require(
+            not target.with_name(target.name + ".mcepatched").exists(),
+            "reviewed patch unexpectedly created a suffixed file",
+        )
+        require(len(mock.requests) == 1, "expected one reviewed patch request")
+
+    def test_text_and_json_api_responses(self) -> None:
+        context = self.work / "context.txt"
+        context.write_text("first\nsecond\n", encoding="utf-8")
+        with MockResponsesAPI(["offline text response"]) as mock:
+            result = self.run(
+                "--task",
+                "Return the offline response.",
+                "--files",
+                context,
+                "--system-prompt",
+                "offline system",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "offline text response" in result.stdout,
+            "text response was not printed",
+        )
+        require(len(mock.requests) == 1, "expected one text request")
+        request = mock.requests[0]
+        input_value = request.get("input", "")
+        if isinstance(input_value, list):
+            input_value = json.dumps(input_value)
+        require("1 first" in str(input_value), "first numbered context line is missing")
+        require("2 second" in str(input_value), "second numbered context line is missing")
+        require(
+            "offline system" in str(request.get("instructions", "")),
+            "system prompt is missing",
+        )
+
+        with MockResponsesAPI([{"output": {"answer": "offline json"}}]) as mock:
+            result = self.run(
+                "--ask",
+                "Return JSON.",
+                "--response-format",
+                "json",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            json.loads(result.stdout) == {"answer": "offline json"},
+            "JSON response was not formatted",
+        )
+        require(len(mock.requests) == 1, "expected one JSON request")
+
+    def test_api_patch(self) -> None:
+        target = self.work / "api-patch-target.txt"
+        target.write_text("api-start\nmiddle\napi-end\n", encoding="utf-8")
+        response = {
+            "output": {
+                "files": [
+                    {
+                        "document": {
+                            "path": str(target),
+                            "encoding": "utf-8",
+                            "line_ending": "lf",
+                            "total_lines": 3,
+                        },
+                        "patches": [
+                            {
+                                "patch_id": "api-p1",
+                                "block_id": "api-b1",
+                                "start_line": 2,
+                                "end_line": 2,
+                                "content_line_array": ["middle-updated"],
+                                "summary": "Update middle line",
+                                "confidence": 1.0,
+                                "needs_manual_review": False,
+                            }
+                        ],
+                    }
+                ],
+                "commit_message": "Apply offline API patch",
+            }
+        }
+        with MockResponsesAPI([response]) as mock:
+            self.run(
+                "--task",
+                "Update the API patch fixture.",
+                "--files",
+                target,
+                "--patch",
+                "--patch-review",
+                "off",
+                "--patch-save",
+                "off",
+                "--patch-suffix",
+                ".api",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            target.with_name(target.name + ".api").read_text(
+                encoding="utf-8"
+            ) == "api-start\nmiddle-updated\napi-end\n",
+            "API patch output was incorrect",
+        )
+        require(len(mock.requests) == 1, "expected one API patch request")
+
+    def test_reuse_session_rejects_changed_files(self) -> None:
+        target = self.work / "reuse-target.txt"
+        target.write_text("original\n", encoding="utf-8")
+        response = {
+            "output": {
+                "files": [
+                    self._patch_file_entry(
+                        target,
+                        total_lines=1,
+                        patches=[
+                            {
+                                "patch_id": "reuse-p1",
+                                "block_id": "reuse-b1",
+                                "start_line": 1,
+                                "end_line": 1,
+                                "content_line_array": ["updated"],
+                                "summary": "Update the reused file",
+                                "confidence": 1.0,
+                                "needs_manual_review": False,
+                            }
+                        ],
+                    )
+                ],
+                "commit_message": "Record reused session patch",
+            }
+        }
+        with MockResponsesAPI([response]) as mock:
+            initial = self.run(
+                "--task",
+                "Record the reusable patch context.",
+                "--files",
+                target,
+                "--patch",
+                "--noninteractive",
+                "--patch-save",
+                "off",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+            session_name = re_search(
+                r"state_session_name=(\S+)",
+                initial.stdout,
+            )
+            require(
+                session_name is not None,
+                "initial patch did not report its state session",
+            )
+            target.write_text("changed\n", encoding="utf-8")
+            failed = self.run(
+                "--task",
+                "Reuse the changed patch context.",
+                "--reuse-session",
+                session_name,
+                "--patch",
+                "--noninteractive",
+                "--patch-save",
+                "off",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+                check=False,
+            )
+        require(
+            failed.returncode != 0,
+            "session reuse accepted a changed context file",
+        )
+        require(
+            "checksums do not match" in failed.stderr,
+            "checksum mismatch was not reported",
+        )
+        require(
+            len(mock.requests) == 1,
+            "checksum failure should happen before the second API request",
+        )
+
+    def test_shell_script_and_state(self) -> None:
+        responses = [
+            {
+                "output": {
+                    "commands": [
+                        {
+                            "command": "cat",
+                            "lines": ["offline-shell"],
+                            "reason": "Produce deterministic offline output",
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "action": "session_end",
+                    "commands": [],
+                    "reason": "Offline shell session completed",
+                }
+            },
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task",
+                "Run the offline check.",
+                "--shell",
+                "--noninteractive",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "Offline shell session completed" in result.stdout,
+            "shell session reason was not printed",
+        )
+        require(
+            len(mock.requests) == 2,
+            "expected initial shell and follow-up requests",
+        )
+        followup_input = str(mock.requests[1].get("input", ""))
+        require(
+            "<shell_output>" in followup_input,
+            "shell output was not sent to follow-up",
+        )
+        require(
+            "offline-shell" in followup_input,
+            "script output was not sent to follow-up",
+        )
+        state_match = re_search(
+            r"state_session_name=(\S+)",
+            result.stdout,
+        )
+        require(state_match is not None, "shell state session name was not printed")
+        state = self.run(
+            "--state-print-json",
+            state_match,
+            "0",
+            "response_shell_output",
+        )
+        require(
+            "offline-shell" in state.stdout,
+            "shell output was not saved in state",
+        )
+
+    def test_shell_followup_commands_and_failures(self) -> None:
+        responses = [
+            {
+                "output": {
+                    "commands": [
+                        {
+                            "command": "printf initial",
+                            "reason": "Produce initial output",
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "action": "commands",
+                    "commands": [
+                        {
+                            "command": "sh -c 'printf shell-error >&2; exit 3'",
+                            "reason": "Run the failure check",
+                        }
+                    ],
+                    "reason": "The follow-up check is required",
+                }
+            },
+            {
+                "output": {
+                    "action": "session_end",
+                    "commands": [],
+                    "reason": "Shell failure output was inspected",
+                }
+            },
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task",
+                "Run two offline shell checks.",
+                "--shell",
+                "--noninteractive",
+                "--llm-timeout",
+                "5",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "Shell failure output was inspected" in result.stdout,
+            "shell follow-up session did not finish",
+        )
+        require(len(mock.requests) == 3, "expected three shell API requests")
+        followup_input = str(mock.requests[2].get("input", ""))
+        require(
+            "<exit_status>3" in followup_input,
+            "failed shell exit status was omitted from follow-up",
+        )
+        require(
+            "shell-error" in followup_input,
+            "shell stderr was omitted from follow-up",
+        )
+
+    def test_shell_timeout_is_reported(self) -> None:
+        responses = [
+            {
+                "output": {
+                    "commands": [
+                        {
+                            "command": "sleep 2",
+                            "reason": "Exercise timeout handling",
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "action": "session_end",
+                    "commands": [],
+                    "reason": "Shell timeout output was inspected",
+                }
+            },
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task",
+                "Run the timeout check.",
+                "--shell",
+                "--noninteractive",
+                "--llm-timeout",
+                "1",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "Shell timeout output was inspected" in result.stdout,
+            "shell timeout session did not finish",
+        )
+        require(len(mock.requests) == 2, "expected initial and follow-up requests")
+        followup_input = str(mock.requests[1].get("input", ""))
+        require(
+            "<exit_status>timeout" in followup_input
+            and "command exceeded timeout of 1 seconds" in followup_input,
+            "shell timeout details were omitted from follow-up",
+        )
+
+    def test_patch_branch_writes_and_commits(self) -> None:
+        repo = self.work / "patch-branch-repo"
+        repo.mkdir()
+        target = repo / "target.txt"
+        target.write_text("branch-start\nbranch-middle\n", encoding="utf-8")
+
+        def git(*arguments: str) -> str:
+            completed = subprocess.run(
+                ["git", *arguments],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            require(
+                completed.returncode == 0,
+                f"git {arguments!r} failed: {completed.stderr}",
+            )
+            return completed.stdout.strip()
+
+        git("init")
+        git("config", "user.email", "offline@example.test")
+        git("config", "user.name", "Offline Test")
+        git("add", "target.txt")
+        git("commit", "-m", "Initial offline branch fixture")
+        git("branch", "-M", "main")
+
+        response = {
+            "output": {
+                "files": [
+                    {
+                        "document": {
+                            "path": str(target.resolve()),
+                            "encoding": "utf-8",
+                            "line_ending": "lf",
+                            "total_lines": 2,
+                        },
+                        "patches": [
+                            {
+                                "patch_id": "branch-p1",
+                                "block_id": "branch-b1",
+                                "start_line": 2,
+                                "end_line": 2,
+                                "content_line_array": ["branch-updated"],
+                                "summary": "Update the branch fixture",
+                                "confidence": 1.0,
+                                "needs_manual_review": False,
+                            }
+                        ],
+                    }
+                ],
+                "commit_message": "Apply branch test patch",
+            }
+        }
+        with MockResponsesAPI([response]) as mock:
+            self.run(
+                "--task",
+                "Update the branch fixture.",
+                "--files",
+                "target.txt",
+                "--patch",
+                "--patch-branch",
+                "feature",
+                "--patch-review",
+                "off",
+                "--patch-save",
+                "off",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+                cwd=repo,
+            )
+
+        require(
+            target.read_text(encoding="utf-8")
+            == "branch-start\nbranch-updated\n",
+            "patch branch did not write the updated file",
+        )
+        require(
+            git("branch", "--show-current") == "mcefeature",
+            "patch branch was not checked out after applying changes",
+        )
+        require(
+            git("log", "-1", "--pretty=%s") == "Apply branch test patch",
+            "patch branch did not create the expected commit",
+        )
+        require(
+            len(mock.requests) == 1,
+            "expected one patch-branch API request",
+        )
+
+    def test_state_artifact_listing(self) -> None:
+        result = self.run("--state-print-json")
+        artifact_types = json.loads(result.stdout)
+        require(
+            "request_files" in artifact_types
+            and "response_schema_patch" in artifact_types
+            and "response_shell_output" in artifact_types,
+            "state artifact type listing is incomplete",
+        )
+
+    def test_prompt_placement_and_line_number_override(self) -> None:
+        context = self.work / "prompt-placement.txt"
+        context.write_text("first\nsecond\n", encoding="utf-8")
+        with MockResponsesAPI(["offline placement response"]) as mock:
+            result = self.run(
+                "--task",
+                "Place the task in the system instructions.",
+                "--files",
+                context,
+                "--system-prompt",
+                "offline system",
+                "--system-prompt-with-task",
+                "--no-line-numbers",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "offline placement response" in result.stdout,
+            "prompt placement response was not printed",
+        )
+        require(len(mock.requests) == 1, "expected one placement request")
+        request = mock.requests[0]
+        input_value = str(request.get("input", ""))
+        instructions = str(request.get("instructions", ""))
+        require(
+            "Place the task in the system instructions." in instructions,
+            "task was not appended to the system instructions",
+        )
+        require(
+            "Place the task in the system instructions." not in input_value,
+            "task was unexpectedly duplicated in the user prompt",
+        )
+        require(
+            "1 first" not in input_value and "2 second" not in input_value,
+            "line numbers were not disabled",
+        )
+        require(
+            "first" in input_value and "second" in input_value,
+            "context was omitted when line numbers were disabled",
+        )
+
+    def test_custom_schema_response(self) -> None:
+        schema = {
+            "type": "json_schema",
+            "name": "offline_answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        }
+        schema_path = self.work / "offline-schema.json"
+        schema_path.write_text(
+            json.dumps(schema),
+            encoding="utf-8",
+        )
+        with MockResponsesAPI([{"output": {"answer": "structured offline"}}]) as mock:
+            result = self.run(
+                "--ask",
+                "Return a structured response.",
+                "--response-format",
+                "schema",
+                "--schema-file",
+                schema_path,
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            json.loads(result.stdout) == {"answer": "structured offline"},
+            "custom schema response was not formatted",
+        )
+        require(len(mock.requests) == 1, "expected one schema request")
+        request_text = mock.requests[0].get("text")
+        require(
+            isinstance(request_text, dict)
+            and request_text.get("format") == schema,
+            "custom schema was not sent to the API",
+        )
+
+    def test_patch_state_artifacts_and_saved_json(self) -> None:
+        target = self.work / "saved-artifacts.txt"
+        target.write_text("keep\nchange\n", encoding="utf-8")
+        manifest = self._patch_manifest(
+            target,
+            total_lines=2,
+            patches=[
+                {
+                    "patch_id": "artifact-p1",
+                    "block_id": "artifact-b1",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "content_line_array": ["change-updated"],
+                    "summary": "Update the artifact fixture",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                }
+            ],
+        )
+        manifest_path = self.work / "saved-artifacts.json"
+        manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        with MockResponsesAPI([{"output": manifest}]) as mock:
+            initial = self.run(
+                "--task",
+                "Update the saved patch fixture.",
+                "--files",
+                target,
+                "--patch",
+                "--patch-review",
+                "--patch-save",
+                "--patch-suffix",
+                ".reviewed",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+                input_text="y\n",
+            )
+        saved_json_text = re_search(
+            r"patch_json_file=(\S+)",
+            initial.stderr,
+        )
+        require(saved_json_text is not None, "saved patch JSON path was not printed")
+        saved_json = Path(saved_json_text)
+        state = self.run(
+            "--state-print-json",
+            saved_json.stem,
+            "0",
+            "response_schema_patch",
+            "response_diff_patch",
+            "response_schema_patch_applied",
+        )
+        artifacts = json.loads(state.stdout)
+        require(
+            "change-updated" in artifacts["response_schema_patch"],
+            "validated patch JSON was not saved in state",
+        )
+        require(
+            "+change-updated" in artifacts["response_diff_patch"],
+            "validated patch diff was not saved in state",
+        )
+        reviewed_target = target.with_name(target.name + ".reviewed")
+        require(
+            str(reviewed_target) in artifacts["response_schema_patch_applied"],
+            "applied patch paths were not saved in state",
+        )
+        require(
+            target.read_text(encoding="utf-8") == "keep\nchange\n"
+            and reviewed_target.read_text(encoding="utf-8") == "keep\nchange-updated\n",
+            "reviewed patch output was incorrect",
+        )
+        printed = self.run(
+            "--patch-file-print",
+            saved_json,
+            "--log",
+            "off",
+        )
+        require(
+            "-change" in printed.stdout and "+change-updated" in printed.stdout,
+            "saved patch JSON did not produce the expected diff",
+        )
+        self.run(
+            "--patch-file-apply",
+            saved_json,
+            "--patch-suffix",
+            ".saved",
+            "--log",
+            "off",
+        )
+        require(
+            target.with_name(target.name + ".saved").read_text(
+                encoding="utf-8"
+            ) == "keep\nchange-updated\n",
+            "saved patch JSON could not be applied",
+        )
+
+    def test_patch_deletion_and_replacement_ranges(self) -> None:
+        target = self.work / "range-patch.txt"
+        target.write_text(
+            "one\ntwo\nthree\nfour\nfive\n",
+            encoding="utf-8",
+        )
+        manifest = self._patch_manifest(
+            target,
+            total_lines=5,
+            patches=[
+                {
+                    "patch_id": "range-delete-first",
+                    "block_id": "range-block-first",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "content_line_array": [],
+                    "summary": "Delete the first line",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                },
+                {
+                    "patch_id": "range-expand-second",
+                    "block_id": "range-block-second",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "content_line_array": ["two-a", "two-b"],
+                    "summary": "Expand the second line",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                },
+                {
+                    "patch_id": "range-delete-last",
+                    "block_id": "range-block-last",
+                    "start_line": 5,
+                    "end_line": 5,
+                    "content_line_array": [],
+                    "summary": "Delete the last line",
+                    "confidence": 1.0,
+                    "needs_manual_review": False,
+                },
+            ],
+        )
+        manifest_path = self.work / "range-patch.json"
+        manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        self.run(
+            "--patch-file-apply",
+            manifest_path,
+            "--patch-suffix",
+            ".ranges",
+            "--log",
+            "off",
+        )
+        require(
+            target.with_name(target.name + ".ranges").read_text(
+                encoding="utf-8"
+            ) == "two-a\ntwo-b\nthree\nfour\n",
+            "deletion and replacement ranges produced incorrect output",
+        )
+
+    def test_successful_shell_session_reuse(self) -> None:
+        responses = [
+            {
+                "output": {
+                    "commands": [
+                        {
+                            "command": "printf first-shell",
+                            "reason": "Produce the first shell output",
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "action": "session_end",
+                    "commands": [],
+                    "reason": "First shell session completed",
+                }
+            },
+            {
+                "output": {
+                    "commands": [
+                        {
+                            "command": "printf second-shell",
+                            "reason": "Produce the reused shell output",
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "action": "session_end",
+                    "commands": [],
+                    "reason": "Reused shell session completed",
+                }
+            },
+        ]
+        with MockResponsesAPI(responses) as mock:
+            first = self.run(
+                "--task",
+                "Run the first offline shell session.",
+                "--shell",
+                "--noninteractive",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+            session_name = re_search(
+                r"state_session_name=(\S+)",
+                first.stdout,
+            )
+            require(session_name is not None, "initial shell session name was not printed")
+            second = self.run(
+                "--task",
+                "Run the reused offline shell session.",
+                "--shell",
+                "--shell-confirm",
+                "--reuse-session",
+                session_name,
+                "--noninteractive",
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            "Reused shell session completed" in second.stdout,
+            "reused shell session did not finish",
+        )
+        require(len(mock.requests) == 4, "expected two requests per shell session")
+        reused_input = str(mock.requests[2].get("input", ""))
+        require(
+            "<previous_turn>" in reused_input
+            and "First shell session completed" in reused_input,
+            "completed shell history was not included in the reused request",
+        )
+        state = self.run(
+            "--state-print-json",
+            session_name,
+            "2",
+            "response_shell_output",
+        )
+        require(
+            "second-shell" in state.stdout,
+            "reused shell output was not saved in state",
+        )
+
+    def test_patch_branch_merge_and_remove(self) -> None:
+        repo = self.work / "patch-branch-management-repo"
+        repo.mkdir()
+        target = repo / "target.txt"
+        target.write_text("base\n", encoding="utf-8")
+
+        def git(*arguments: str) -> str:
+            completed = subprocess.run(
+                ["git", *arguments],
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            require(
+                completed.returncode == 0,
+                f"git {arguments!r} failed: {completed.stderr}",
+            )
+            return completed.stdout.strip()
+
+        git("init")
+        git("config", "user.email", "offline@example.test")
+        git("config", "user.name", "Offline Test")
+        git("add", "target.txt")
+        git("commit", "-m", "Initial branch management fixture")
+        git("branch", "-M", "main")
+        git("switch", "--create", "mcefeature")
+        target.write_text("merged\n", encoding="utf-8")
+        git("add", "target.txt")
+        git("commit", "-m", "Feature branch fixture")
+        git("switch", "main")
+
+        self.run(
+            "--patch-merge",
+            "Merge offline branch fixture",
+            "--patch-branch",
+            "feature",
+            cwd=repo,
+        )
+        require(
+            target.read_text(encoding="utf-8") == "merged\n",
+            "patch branch merge did not update the target",
+        )
+        require(
+            git("branch", "--list", "mcefeature") == "",
+            "merged patch branch was not deleted",
+        )
+
+        git("switch", "--create", "mceorphan")
+        git("switch", "main")
+        self.run(
+            "--patch-branch-remove",
+            "orphan",
+            cwd=repo,
+        )
+        require(
+            git("branch", "--list", "mceorphan") == "",
+            "patch branch removal did not delete the branch",
+        )
+
+    def close(self) -> None:
+        self._temporary_directory.cleanup()
+
+
+def re_search(pattern: str, text: str) -> str | None:
+    import re
+
+    match = re.search(pattern, text)
+    return match.group(1) if match else None
+
+
+def main() -> int:
+    tests = [
+        ("prints the built-in configuration offline", "test_default_config"),
+        ("supports inherited profile overrides", "test_inherited_profile_overrides"),
+        ("filters tree inputs without an API", "test_tree_filtering"),
+        ("processes tree files through a local API", "test_tree_api_processing"),
+        ("selects extension-specific tree prompts", "test_tree_extension_prompts"),
+        ("creates, assigns, and removes prompt-library entries", "test_prompt_library"),
+        ("expands prompt-library references", "test_prompt_expansion"),
+        ("loads prompt and context files", "test_file_list_and_prompt_file_inputs"),
+        ("lists state artifact types offline", "test_state_artifact_listing"),
+        ("applies patches to multiple files and creates files", "test_multifile_patch_and_new_file"),
+        ("inserts patches into empty files", "test_empty_file_patch_insertion"),
+        ("validates patches and preserves line endings", "test_saved_patch_validation_and_line_endings"),
+        ("reviews patches interactively without a suffix", "test_patch_review_without_suffix"),
+        ("handles text and JSON responses from a local API", "test_text_and_json_api_responses"),
+        ("handles streamed text responses", "test_streaming_text_response"),
+        ("preserves prompt placement and line-number overrides", "test_prompt_placement_and_line_number_override"),
+        ("handles custom JSON-schema responses", "test_custom_schema_response"),
+        ("validates and writes an API patch response", "test_api_patch"),
+        ("records patch artifacts and reapplies saved JSON", "test_patch_state_artifacts_and_saved_json"),
+        ("applies deletion and replacement patch ranges", "test_patch_deletion_and_replacement_ranges"),
+        ("rejects reused sessions with changed files", "test_reuse_session_rejects_changed_files"),
+        ("executes shell scripts and saves state offline", "test_shell_script_and_state"),
+        ("handles shell follow-up commands and failures", "test_shell_followup_commands_and_failures"),
+        ("reports shell command timeouts", "test_shell_timeout_is_reported"),
+        ("reuses completed shell sessions with confirmation", "test_successful_shell_session_reuse"),
+        ("writes and commits patch changes on a git branch", "test_patch_branch_writes_and_commits"),
+        ("merges and removes patch branches", "test_patch_branch_merge_and_remove"),
+    ]
+    print("TAP version 13")
+    print(f"1..{len(tests)}")
+    suite = OfflineTests()
+    failures = 0
+    try:
+        for number, (name, method_name) in enumerate(tests, start=1):
+            try:
+                getattr(suite, method_name)()
+            except Exception as exc:
+                failures += 1
+                print(f"not ok {number} - {name}")
+                for line in str(exc).splitlines() or [repr(exc)]:
+                    print(f"# {line}")
+            else:
+                print(f"ok {number} - {name}")
+    finally:
+        suite.close()
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

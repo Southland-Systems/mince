@@ -48,6 +48,13 @@ Manual install
   && pip install -U -r requirements.txt)
 ```
 
+Run offline tests (mince must be installed)
+
+```bash
+cd mince
+python mince-test
+```
+
 ## First run 🚀
 
 ```bash
@@ -155,6 +162,12 @@ Plan mode asks the model to create prompt for the next step using the supplied c
 mince --plan \
   --task "Review the error handling and propose the next implementation step" \
   --files src/main.py README.md
+```
+
+Perform shell tasks:
+
+```bash
+mince -p task --shell -t 'List the content of the current directory, and then write that listing to a file called "listing.txt" in the next turn. Then get the content of the file "/etc/passwd".'
 ```
 
 Create a dedicated 'ask' profile from the default profile:

@@ -71,6 +71,14 @@ DEFAULT_SYSTEM_PROMPT = "You are a concise and technically accurate software eng
 DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from the start of each line."
 DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a text block based patch using the provided JSON Schema named `line_replace_manifest` for one or more text files."
 DEFAULT_PLAN_SYSTEM_PROMPT = "Create a clear, self-contained AI prompt for the next step and design it only for the provided context and task. Return only the prompt, without commentary or code fences."
+DEFAULT_SHELL_SYSTEM_PROMPT = (
+    "Generate safe, necessary shell commands for the task. Return commands "
+    "using the shell command JSON Schema. Each command has a command string and a concise, non-empty "
+    "reason describing why it is needed. A script has the same command "
+    "string plus lines containing its script input. Commands are reviewed "
+    "before execution. After command output, use action=commands for more "
+    "work or action=session_end with a reason that completes the session."
+ )
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.6-luna",
@@ -85,10 +93,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
     "patch_system_prompt": DEFAULT_PATCH_SYSTEM_PROMPT,
     "plan_system_prompt": DEFAULT_PLAN_SYSTEM_PROMPT,
+    "shell_system_prompt": DEFAULT_SHELL_SYSTEM_PROMPT,
     "system_prompt_with_task": "off",
     "line_numbers": "on",
     "prompt_expansion": "off",
     "patch": "off",
+    "shell": "off",
     "patch_save": "on",
     "patch_review": "off",
     "patch_branch": "off",
@@ -194,6 +204,70 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
             "commit_message": { "type": "string", "minLength": 1},
         },
         "required": ["files", "commit_message"],
+    },
+}
+
+SHELL_COMMAND_ITEM_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "command": {"type": "string", "minLength": 1},
+            "reason": {"type": "string", "minLength": 1, "description": "Why this command is needed"},
+        },
+        "required": ["command", "reason"],
+    },
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "command": {"type": "string", "minLength": 1},
+            "lines": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+            },
+            "reason": {"type": "string", "minLength": 1, "description": "Why this command is needed"},
+        },
+        "required": ["command", "lines", "reason"],
+    },
+]
+
+SHELL_COMMAND_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "name": "shell_commands",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "commands": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"anyOf": SHELL_COMMAND_ITEM_SCHEMAS},
+            },
+        },
+        "required": ["commands"],
+    },
+}
+
+SHELL_FOLLOWUP_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "name": "shell_followup",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "action": {"type": "string", "enum": ["commands", "session_end"]},
+            "commands": {
+                "type": "array",
+                "minItems": 0,
+                "items": {"anyOf": SHELL_COMMAND_ITEM_SCHEMAS},
+            },
+            "reason": {"type": "string"},
+        },
+        "required": ["action", "commands", "reason"],
     },
 }
 
@@ -344,6 +418,7 @@ PROMPT_TYPE_ALIASES: dict[str, str] = {
     "linenum": "linenum_system_prompt",
     "patch": "patch_system_prompt",
     "plan": "plan_system_prompt",
+    "shell": "shell_system_prompt",
 }
 PROMPT_CONFIG_KEYS = tuple(dict.fromkeys(PROMPT_TYPE_ALIASES.values()))
 
@@ -356,7 +431,7 @@ def prompt_type_key(value: str) -> str:
         return PROMPT_TYPE_ALIASES[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"unknown prompt type '{value}'; choose system, linenum, patch, or plan"
+            f"unknown prompt type '{value}'; choose system, linenum, patch, plan, or shell"
         ) from exc
 
 
@@ -449,11 +524,12 @@ STATE_TURN_ARTIFACTS = (
     "response_schema_patch",
     "response_diff_patch",
     "response_schema_patch_applied",
-)
+    "response_shell_output",
+ )
 STATE_ARTIFACT_TYPES = (
     STATE_SESSION_ARTIFACT,
     *STATE_TURN_ARTIFACTS,
-)
+ )
 
 def normalize_state_artifact_type(value: str) -> str:
     artifact_type = value.strip()
@@ -650,6 +726,47 @@ def load_reused_session_patch_history(
         "</previous_turn>"
     )
 
+def load_reused_session_shell_history(
+    state_session_dir: Path,
+    turn: int | None = None,
+ ) -> str:
+    turn_dir = last_completed_state_turn(state_session_dir, turn)
+    request_task_path = turn_dir / "request_task"
+    response_path = turn_dir / "response"
+    shell_output_path = turn_dir / "response_shell_output"
+    if not request_task_path.is_file() or not response_path.is_file():
+        raise ValueError(
+            f"completed shell turn has no request_task or response: {turn_dir}"
+        )
+    try:
+        previous_task = request_task_path.read_text(encoding="utf-8")
+        previous_response = response_path.read_text(encoding="utf-8")
+        previous_shell_output = (
+            shell_output_path.read_text(encoding="utf-8")
+            if shell_output_path.is_file()
+            else ""
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"cannot read reused shell history from {turn_dir} ({exc})"
+        ) from exc
+    shell_output_block = (
+        f"<shell_output>\n{previous_shell_output}\n</shell_output>\n"
+        if previous_shell_output
+        else ""
+    )
+    return (
+        "<previous_turn>\n"
+        "<request_task>\n"
+        f"{previous_task}\n"
+        "</request_task>\n"
+        "<response>\n"
+        f"{previous_response}\n"
+        "</response>\n"
+        f"{shell_output_block}"
+        "</previous_turn>"
+    )
+
 def start_state_turn(
     state_session_dir: Path,
     turn: int,
@@ -723,6 +840,14 @@ def write_state_schema_patch_applied(
         encoding="utf-8",
     )
 
+def write_state_shell_output(
+    turn_dir: Path,
+    output: str,
+ ) -> None:
+    (turn_dir / "response_shell_output").write_text(
+        output,
+        encoding="utf-8",
+    )
 def prompt_file_path(name: str) -> Path:
     return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
 
@@ -1263,8 +1388,10 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
+    prompt_config_value(config, "shell_system_prompt", "System prompt for shell command mode")
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
+    prompt_config_value(config, "shell", "Shell mode (off, on)")
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
     prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)", parse_patch_branch_value)
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
@@ -1747,7 +1874,7 @@ def generate_unified_diff(original: str, updated: str, path: str) -> str:
     updated_lines = updated.splitlines(keepends=True)
 
     fromfile = path if original else "/dev/null"
-    tofile = path
+    tofile = path if updated else "/dev/null"
 
     diff_lines = list(
         difflib.unified_diff(
@@ -1762,12 +1889,317 @@ def generate_unified_diff(original: str, updated: str, path: str) -> str:
     return "".join(diff_lines) + "\n"
 
 def detect_line_ending(text: str) -> str:
-    return "crlf" if "\r\n" in text else "lf"
+    endings = re.findall(r"\r\n|\r|\n", text)
+    if not endings or all(ending == "\n" for ending in endings):
+        return "lf"
+    if all(ending == "\r\n" for ending in endings):
+        return "crlf"
+    return "mixed"
 
 
 def eol_for(line_ending: str) -> str:
     return "\r\n" if line_ending == "crlf" else "\n"
 
+
+def read_text_preserving_line_endings(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as file:
+        return file.read()
+
+
+def write_text_preserving_line_endings(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="") as file:
+        file.write(text)
+
+
+@dataclass(frozen=True)
+class ShellStep:
+    command: str
+    lines: tuple[str, ...] = ()
+    reason: str = ""
+
+@dataclass(frozen=True)
+class ShellTurn:
+    commands: tuple[ShellStep, ...]
+    output: str
+
+SHELL_OUTPUT_TOKEN_FRACTION = 0.8
+
+def _shell_step_from_value(value: Any, index: int) -> ShellStep:
+    if isinstance(value, str):
+        command = value.strip()
+        if not command:
+            raise ValueError(f"shell command {index} cannot be empty")
+        return ShellStep(command)
+    if not isinstance(value, dict):
+        raise ValueError(f"shell command {index} must be an object or string")
+    allowed_keys = {"command", "lines", "script", "reason"}
+    unexpected = set(value) - allowed_keys
+    if unexpected:
+        raise ValueError(
+            f"shell command {index} has unexpected fields: "
+            + ", ".join(sorted(unexpected))
+        )
+    command_value = value.get("command", value.get("script"))
+    if not isinstance(command_value, str) or not command_value.strip():
+        raise ValueError(f"shell command {index} requires a non-empty command")
+    reason_value = value.get("reason")
+    if not isinstance(reason_value, str) or not reason_value.strip():
+        raise ValueError(f"shell command {index} requires a non-empty reason")
+    reason = reason_value.strip()
+    if "lines" not in value:
+        return ShellStep(command=command_value.strip(), reason=reason)
+    raw_lines = value["lines"]
+    if not isinstance(raw_lines, list) or not raw_lines:
+        raise ValueError(f"shell script {index} requires a non-empty lines array")
+    if any(not isinstance(line, str) for line in raw_lines):
+        raise ValueError(f"shell script {index} lines must be strings")
+    return ShellStep(
+        command=command_value.strip(),
+        lines=tuple(raw_lines),
+        reason=reason,
+    )
+
+def normalize_shell_commands(values: Any) -> list[ShellStep]:
+    if not isinstance(values, list) or not values:
+        raise ValueError("shell manifest commands must be a non-empty array")
+    return [
+        _shell_step_from_value(value, index)
+        for index, value in enumerate(values, start=1)
+    ]
+
+
+def parse_shell_manifest(raw: str) -> list[ShellStep]:
+    try:
+        manifest = json.loads(clean_json_response(raw))
+    except json.JSONDecodeError:
+        raise
+    if not isinstance(manifest, dict):
+        raise ValueError("shell manifest must contain a JSON object")
+    if set(manifest) != {"commands"}:
+        raise ValueError("shell manifest must contain only a commands field")
+    return normalize_shell_commands(manifest["commands"])
+
+def parse_shell_followup_response(
+    raw: str,
+ ) -> tuple[str, list[ShellStep] | None, str | None]:
+    try:
+        response = json.loads(clean_json_response(raw))
+    except json.JSONDecodeError:
+        raise
+    if not isinstance(response, dict):
+        raise ValueError("shell follow-up response must contain a JSON object")
+    if set(response) != {"action", "commands", "reason"}:
+        raise ValueError("shell follow-up response must contain only action, commands, and reason")
+    action = response.get("action")
+    if action not in ("commands", "session_end"):
+        raise ValueError("shell follow-up action must be commands or session_end")
+    reason = response["reason"]
+    if not isinstance(reason, str):
+        raise ValueError("shell follow-up reason must be a string")
+    if action == "session_end":
+        if not reason.strip():
+            raise ValueError("shell follow-up session_end reason cannot be empty")
+        return action, None, reason
+    return action, normalize_shell_commands(response["commands"]), None
+
+def format_shell_commands(commands: list[ShellStep]) -> str:
+    blocks: list[str] = []
+    for index, step in enumerate(commands, start=1):
+        reason_prefix = (
+            f"{step.reason}\n"
+            if step.reason
+            else ""
+        )
+        if step.lines:
+            block = (
+                f"{reason_prefix}[{index}] $ {step.command} <<'MINCE_SCRIPT'\n"
+                + "\n".join(step.lines)
+                + "\nMINCE_SCRIPT"
+            )
+        else:
+            block = f"{reason_prefix}[{index}] $ {step.command}"
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+def format_shell_command_context(commands: list[ShellStep]) -> str:
+    blocks: list[str] = []
+    for index, step in enumerate(commands, start=1):
+        if step.lines:
+            block = (
+                f"[{index}] $ {step.command} <<'MINCE_SCRIPT'\n"
+                + "\n".join(step.lines)
+                + "\nMINCE_SCRIPT"
+            )
+        else:
+            block = f"[{index}] $ {step.command}"
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+def format_shell_command_archive(
+    archived_turns: list[ShellTurn],
+ ) -> str:
+    turn_blocks: list[str] = []
+    for turn in archived_turns:
+        if not turn.commands:
+            continue
+        turn_blocks.append(
+            f"<shell_turn index='{len(turn_blocks) + 1}'>\n"
+            f"{format_shell_command_context(list(turn.commands))}\n"
+            "</shell_turn>"
+        )
+    return "\n".join(turn_blocks)
+
+def shell_review_usage() -> str:
+    return "Usage: [y]es, [n]o, [p]ager, [h]elp, [e]dit, E <prompt>"
+
+def process_shell_review_input(
+    shell_input: str,
+    command_text: str,
+ ) -> str | None:
+    choice = shell_input.strip()
+    normalized_choice = choice.lower()
+    if not choice or normalized_choice == "h":
+        print(shell_review_usage())
+        return None
+    if normalized_choice == "p":
+        page_or_print(command_text)
+        return None
+    return choice
+
+def review_shell_commands(commands: list[ShellStep]) -> tuple[str, str | None]:
+    command_text = format_shell_commands(commands)
+    print()
+    print(command_text)
+    if NONINTERACTIVE:
+        return 'accept', None
+    while True:
+        choice = process_shell_review_input(
+            input('Run these shell commands? [y/n/p/h/e/E <prompt>]: '),
+            command_text,
+        )
+        if choice is None:
+            continue
+        normalized_choice = choice.lower()
+        if normalized_choice in ('y', 'yes'):
+            return 'accept', None
+        if normalized_choice in ('n', 'no'):
+            return 'reject', None
+        if normalized_choice == 'e':
+            return 'edit', None
+        if (
+            choice.startswith('E')
+            and len(choice) > 1
+            and choice[1].isspace()
+        ):
+            revision_task = choice[1:].strip()
+            if not revision_task:
+                print('Revision task cannot be empty.')
+                continue
+            return 'edit', revision_task
+        print('Please answer y, n, p, h, e, or E followed by a prompt.')
+
+def _shell_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+def execute_shell_commands(
+    commands: list[ShellStep],
+    timeout: int,
+ ) -> str:
+    output_blocks: list[str] = []
+    command_timeout = max(1, int(timeout))
+    for index, step in enumerate(commands, start=1):
+        script_input = None
+        if step.lines:
+            script_input = "\n".join(step.lines) + "\n"
+        try:
+            completed = subprocess.run(
+                step.command,
+                shell=True,
+                input=script_input,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=command_timeout,
+            )
+            status = str(completed.returncode)
+            stdout = _shell_text(completed.stdout)
+            stderr = _shell_text(completed.stderr)
+        except subprocess.TimeoutExpired as exc:
+            status = "timeout"
+            stdout = _shell_text(getattr(exc, "stdout", ""))
+            stderr = _shell_text(getattr(exc, "stderr", ""))
+            stderr = (stderr + "\n" if stderr else "") + (
+                f"command exceeded timeout of {command_timeout} seconds"
+            )
+        except Exception as exc:
+            status = "error"
+            stdout = ""
+            stderr = f"{type(exc).__name__}: {exc}"
+
+        stdout = "\n" + stdout if stdout != "" else stdout
+        stderr = "\n" + stderr if stderr != "" else stderr
+        output_blocks.append(
+            f"<command index='{index}'>\n"
+            f"<shell>\n{format_shell_commands([step])}\n</shell>\n"
+            f"<exit_status>{status}</exit_status>\n"
+            f"<stdout>{stdout}</stdout>\n"
+            f"<stderr>{stderr}</stderr>\n"
+            "</command>"
+        )
+    return "\n".join(output_blocks)
+
+def build_shell_followup_prompt(
+    task: str,
+    shell_output: list[ShellTurn | str] | str,
+    json_schema: dict[str, Any] | None = None,
+    shell_command_archive: list[ShellTurn] | None = None,
+ ) -> str:
+    schema_block = ""
+    if json_schema is not None:
+        schema_block = (
+            "\n<json_schema instructions='Return JSON that matches this schema exactly'>\n"
+            f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
+            "</json_schema>"
+        )
+    output_values = (
+        [shell_output] if isinstance(shell_output, str) else shell_output
+    )
+    output_history = [
+        value
+        if isinstance(value, ShellTurn)
+        else ShellTurn(commands=(), output=str(value))
+        for value in output_values
+    ]
+    archive_text = format_shell_command_archive(
+        shell_command_archive or []
+    )
+    archive_block = (
+        "\n<shell_command_context name='archive'>\n"
+        f"{archive_text}\n"
+        "</shell_command_context>\n"
+        if archive_text
+        else ""
+    )
+    shell_turn_blocks = "\n\n".join(
+        f"<shell_turn index='{index}'>\n"
+        f"<shell_output>\n{turn.output}\n</shell_output>\n"
+        "</shell_turn>"
+        for index, turn in enumerate(output_history, start=1)
+    )
+    return (
+        "The task was:\n"
+        f"\n{task}\n\n\n"
+        "The accepted shell commands from each turn have now been executed. "
+        "Their actual output is below.\n"
+        f"{archive_block}{shell_turn_blocks}\n"
+        "Decide whether more commands are needed or end the session. Use "
+        "action=commands with commands when more shell work is needed; "
+        "otherwise use action=session_end with a reason that completes the session.\n"
+        f"{schema_block}"
+    )
 
 PATCH_REVISION_HEADING = (
     "# Changes made below this line will be ignored; only text above this line will be used as the next task."
@@ -1777,7 +2209,7 @@ PATCH_REVISION_HEADING = (
 def patch_review_usage(allow_navigation: bool = False) -> str:
     options = (
         "[y]es, [n]o, [p]ager, [h]elp, "
-        "[R]emove patch suffix, [S] re-add patch suffix"
+        "[S] toggle patch suffix"
     )
     if allow_navigation:
         options += ", [<]prevturn, [>]nextturn, [e]dit, E <prompt>"
@@ -1798,12 +2230,11 @@ def process_patch_review_input(
     if normalized_choice == "p":
         page_or_print(diff_text)
         return None, suffix_provided
-    if normalized_choice == "r":
-        print("Patch suffix removed.")
-        return None, False
     if normalized_choice == "s":
-        print("Patch suffix re-added.")
-        return None, True
+        suffix_provided = not suffix_provided
+        state = "enabled" if suffix_provided else "disabled"
+        print(f"Patch suffix {state}.")
+        return None, suffix_provided
     return choice, suffix_provided
 
 
@@ -1823,6 +2254,15 @@ def build_patch_revision_editor_text(
 def extract_patch_revision_task(edited_text: str) -> str:
     task_text, separator, _ = edited_text.partition(PATCH_REVISION_HEADING)
     return (task_text if separator else edited_text).strip()
+def build_shell_revision_editor_text(
+    commands: list[ShellStep],
+    previous_task: str = '',
+ ) -> str:
+    return build_patch_revision_editor_text(
+        format_shell_command_context(commands),
+        previous_task,
+    )
+
 
 
 def prefix_line_numbers(text: str) -> str:
@@ -1851,6 +2291,16 @@ def validate_patch_ranges(
             raise ValueError(f'{patch_id}: start_line must be >= 1')
         if end_line < 1:
             raise ValueError(f'{patch_id}: end_line must be >= 1')
+        if total_lines == 0:
+            if start_line != 1 or end_line != 1:
+                raise ValueError(
+                    f'{patch_id}: empty documents only support line 1 insertion'
+                )
+        elif end_line > total_lines:
+            raise ValueError(
+                f'{patch_id}: end_line cannot exceed document total_lines '
+                f'({total_lines})'
+            )
         if start_line > end_line:
             raise ValueError(f'{patch_id}: start_line cannot be greater than end_line')
 
@@ -1881,9 +2331,13 @@ def apply_combined_patch_manifest(
     manifest: dict[str, Any],
 ) -> dict[str, str]:
     updated_texts: dict[str, str] = {}
+    seen_paths: set[str] = set()
 
     for file_entry in manifest.get("files", []):
         path = str(patch_manifest_document_path(file_entry))
+        if path in seen_paths:
+            raise ValueError(f"patch contains duplicate document path: {path}")
+        seen_paths.add(path)
         if path not in original_texts:
             original = ""
         else:
@@ -1908,6 +2362,22 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
 
     lines = original_text.splitlines(keepends=False)
     total_lines = len(lines)
+    declared_total_lines = int(document["total_lines"])
+    if total_lines == 0:
+        total_lines_match = declared_total_lines in (0, 1)
+    else:
+        total_lines_match = declared_total_lines == total_lines
+    if not total_lines_match:
+        raise ValueError(
+            f"patch document line count ({total_lines}) does not match "
+            f"manifest total_lines ({declared_total_lines})"
+        )
+    if original_text and detect_line_ending(original_text) != line_ending:
+        raise ValueError(
+            f"patch document line ending does not match manifest: "
+            f"expected {line_ending}, detected "
+            f"{detect_line_ending(original_text)}"
+        )
 
     validate_patch_ranges(file_manifest["patches"], total_lines)
 
@@ -2045,7 +2515,7 @@ def load_patch_original_texts(
         if not path.is_file():
             raise ValueError(f"patch document path is not a file: {path}")
         try:
-            original_texts[path_text] = path.read_text(encoding="utf-8")
+            original_texts[path_text] = read_text_preserving_line_endings(path)
         except Exception as exc:
             raise ValueError(f"cannot read patch document {path} ({exc})") from exc
     return original_texts
@@ -2077,7 +2547,8 @@ def write_patch_changes(
         prepare_patch_branch(repo_root, branch_name)
         for path_text, updated_text in changed_items:
             target_path = Path(path_text)
-            target_path.write_text(updated_text, encoding="utf-8")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_preserving_line_endings(target_path, updated_text)
             written_paths.append(str(target_path))
         git_commit_patch(
             repo_root,
@@ -2097,7 +2568,8 @@ def write_patch_changes(
             if use_suffix
             else original_path
         )
-        target_path.write_text(updated_text, encoding="utf-8")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_preserving_line_endings(target_path, updated_text)
         written_paths.append(str(target_path))
         print(
             f"file_written="
@@ -2168,7 +2640,7 @@ def handle_patch_file_apply(
 
     if patch_review:
         while True:
-            patch_input = input("Apply these changes? [y/n/p/h/R/S]: ")
+            patch_input = input("Apply these changes? [y/n/p/h/S]: ")
             patch_input, suffix_provided = process_patch_review_input(
                 patch_input,
                 diff_text,
@@ -2240,22 +2712,64 @@ def handle_patch_file_print(
 # -------------------------------------------------------------------
 
 def number_lines(text: str) -> str:
-    lines = text.splitlines()
+    lines = text.splitlines(keepends=True)
     if not lines:
         return ""
 
-    width = len(str(len(lines)))
-    return "\n".join(f"{i} {line}" for i, line in enumerate(lines, start=1))
+    return "".join(
+        f"{i} {line}" for i, line in enumerate(lines, start=1)
+    )
 
+
+def token_encoding_for_model(model: str) -> Any:
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        return tiktoken.get_encoding("o200k_base")
 
 def estimate_request_tokens(model: str, system_prompt: str, user_prompt: str) -> int:
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except Exception:
-        encoding = tiktoken.get_encoding("o200k_base")
+    encoding = token_encoding_for_model(model)
 
     request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
     return len(encoding.encode(request_text))
+
+def truncate_text_to_tokens(text: str, model: str, max_tokens: int) -> str:
+    if max_tokens <= 0 or not text:
+        return ""
+    encoding = token_encoding_for_model(model)
+    tokens = encoding.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+
+    marker = "\n[... shell output truncated ...]"
+    lower = 0
+    upper = min(len(tokens), max_tokens)
+    best: str | None = None
+    while lower <= upper:
+        midpoint = (lower + upper) // 2
+        candidate = encoding.decode(tokens[:midpoint]) + marker
+        if len(encoding.encode(candidate)) <= max_tokens:
+            best = candidate
+            lower = midpoint + 1
+        else:
+            upper = midpoint - 1
+    if best is not None:
+        return best
+    return encoding.decode(tokens[:max_tokens])
+
+def limit_shell_output_for_context(
+    shell_output: str,
+    model: str,
+    token_limit: int,
+ ) -> str:
+    max_output_tokens = max(
+        0, int(token_limit * SHELL_OUTPUT_TOKEN_FRACTION)
+    )
+    return truncate_text_to_tokens(
+        shell_output,
+        model,
+        max_output_tokens,
+    )
 
 def parse_token_cost(value: Any) -> tuple[float, float] | None:
     raw = str(value).strip()
@@ -2373,7 +2887,7 @@ def coerce_int(value: Any, default: int) -> int:
 
 def read_file(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        return read_text_preserving_line_endings(path)
     except UnicodeDecodeError:
         return path.read_bytes().decode("utf-8", errors="replace")
     except Exception as exc:
@@ -2590,8 +3104,14 @@ def build_context(
         else:
             numbered_content = content
 
+        context_ending = (
+            ""
+            if numbered_content.endswith(("\r", "\n"))
+            else "\n"
+        )
         sections.append(
-            f"<file path='{context_path}' encoding='utf-8'>\n{numbered_content}\n</file>".strip()
+            f"<file path='{context_path}' encoding='utf-8'>\n"
+            f"{numbered_content}{context_ending}</file>".strip()
         )
 
     return "\n".join(sections)
@@ -2613,11 +3133,12 @@ def clean_json_response(raw: str) -> str:
     return re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', raw).strip()
 
 
-def pretty_json(raw: str) -> str:
+def pretty_json(raw: Any) -> str:
     try:
-        return json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        return json.dumps(value, indent=2, ensure_ascii=False)
     except Exception:
-        return raw
+        return str(raw)
 
 
 def parse_extra_body(s: str) -> dict[str, Any]:
@@ -2668,10 +3189,16 @@ def build_user_prompt(
     json_schema: dict[str, Any] | None = None,
     json_patch_responses: list[str] | None = None,
     json_patch_task: str | None = None,
+    json_patch_block = "",
     include_task: bool = True,
- ) -> str:
+    additional_prompt: str = "",
     schema_block = ""
-    json_patch_block = ""
+ ) -> str:
+    additional_prompt_block = (
+        f'\n{additional_prompt.strip()}'
+        if additional_prompt.strip()
+        else ''
+    )
 
     if response_format == "schema" and json_schema is not None:
         schema_block = (
@@ -2697,7 +3224,7 @@ def build_user_prompt(
 <files current_working_directory='{os.getcwd()}'>
 {context}
 </files>
-{schema_block}{json_patch_block}
+{schema_block}{json_patch_block}{additional_prompt_block}
 """.strip()
 
 
@@ -2720,12 +3247,12 @@ def _handle_openai_error(exc: Exception) -> None:
         msg = f"Request timed out: {exc}"
     elif isinstance(exc, APIConnectionError):
         msg = f"Network error: {exc}"
-    elif isinstance(exc, APIError):
-        msg = f"API error: {exc}"
     elif isinstance(exc, UnprocessableEntityError):
         msg = f"Cannot process request despite it being correct: {exc}"
     elif isinstance(exc, InternalServerError):
         msg = f"API internal server error: {exc}"
+    elif isinstance(exc, APIError):
+        msg = f"API error: {exc}"
     else:
         msg = f"Unexpected error: {exc}"
     raise exc
@@ -3121,6 +3648,8 @@ def _tree_exception_message(exc: BaseException) -> str:
 
 
 def _is_openai_temp_error(exc: BaseException) -> bool:
+    if _is_openai_perm_error(exc):
+        return False
     return isinstance(exc, (
         RateLimitError,
         APIConnectionError,
@@ -3128,7 +3657,6 @@ def _is_openai_temp_error(exc: BaseException) -> bool:
         InternalServerError,
         APIError,
     ))
-
 def _is_openai_perm_error(exc: BaseException) -> bool:
     return isinstance(exc, (
         AuthenticationError,
@@ -3178,10 +3706,11 @@ def run_tree_mode(
     log_enabled: bool,
     log_path: Path | None,
     system_prompt_with_task: bool = False,
+    tree_session_stem: str = "",
+
 ) -> int:
     log_lock = threading.Lock()
     db_lock = threading.Lock()
-    records: list[dict[str, Any]] = []
     state_turn_lock = threading.Lock()
     next_state_turn = next_state_turn_index(state_session_dir)
 
@@ -3353,10 +3882,10 @@ def run_tree_mode(
                     error_type = "temp"
         except BaseException as exc:
             error_text = _tree_exception_message(exc)
-            if _is_openai_temp_error(exc):
-                error_type = "temp"
-            elif _is_openai_perm_error(exc):
+            if _is_openai_perm_error(exc):
                 error_type = "perm"
+            elif _is_openai_temp_error(exc):
+                error_type = "temp"
             else:
                 error_type = "perm"
         elapsed = time.perf_counter() - start_time
@@ -3628,6 +4157,24 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--shell",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Generate, review, and run shell commands for the task",
+    )
+
+    parser.add_argument(
+        "--shell-confirm",
+        action="store_true",
+        help=(
+            "Accept a reused shell session in noninteractive mode; "
+            "requires --shell, --reuse-session, and --noninteractive"
+        ),
+    )
+    parser.add_argument(
         '--patch-branch',
         nargs='?',
         const=PATCH_BRANCH_DEFAULT_NAME,
@@ -3837,6 +4384,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--shell-system-prompt",
+        metavar="TEXT",
+        help="System prompt for shell command mode",
+    )
+    parser.add_argument(
         "--plan-system-prompt",
         metavar="TEXT",
         help="System prompt for plan mode",
@@ -3932,7 +4484,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--response-format",
         choices=("text", "json", "schema"),
-        default="text",
+        default=None,
         help="LLM response format in text, JSON or JSON-Schema",
     )
 
@@ -3956,7 +4508,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--response-verbosity",
         choices=("low", "medium", "high", "off"),
-        default="off",
+        default=None,
         help="Verbosity level for text responses (default: off)",
     )
 
@@ -4220,7 +4772,7 @@ def parse_args() -> argparse.Namespace:
         "--prompt-assign",
         nargs=3,
         metavar=("NAME", "PROFILE", "TYPE"),
-        help="Add prompt NAME to PROFILE prompt TYPE (types: system, linenum, patch, plan)",
+        help="Add prompt NAME to PROFILE prompt TYPE (types: system, linenum, patch, plan, shell)",
     )
 
     profile_action_group.add_argument(
@@ -4325,6 +4877,8 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "plan": False,
         "plan_system_prompt": None,
         "patch": False,
+        "shell": False,
+        "shell_confirm": False,
         "patch_review": False,
         "patch_branch": False,
         "patch_branch_remove": None,
@@ -4334,6 +4888,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "patch_file_apply": None,
         "patch_file_print": None,
         "patch_system_prompt": None,
+        "shell_system_prompt": None,
         "reuse_session": None,
         "reuse_session_skip_verify": False,
         "tree_files": None,
@@ -4444,6 +4999,8 @@ def main() -> int:
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
             ("--noninteractive", args.noninteractive),
+            ("--shell", args.shell is not None),
+            ("--shell-confirm", args.shell_confirm),
             ("--reuse-session", args.reuse_session is not None),
             ("--tree-files", args.tree_files is not None),
             ("--tree-files-list", args.tree_files_list is not None),
@@ -4532,6 +5089,7 @@ def main() -> int:
             for value in (
                 args.ask,
                 args.ask_file,
+                args.shell,
                 args.task,
                 args.task_file,
                 args.patch,
@@ -4958,6 +5516,11 @@ def main() -> int:
         return 0
 
     config = load_config()
+    shell_mode = resolve_bool_option(
+        args.shell,
+        config,
+        'shell',
+    )
     if (
         not tree_mode
         and not ask_mode
@@ -4969,7 +5532,7 @@ def main() -> int:
             file_names = parse_config_files(
                 config.get("files", DEFAULT_CONFIG["files"])
             )
-        if not file_names:
+        if not file_names and not shell_mode:
             print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
             return 1
 
@@ -4987,11 +5550,10 @@ def main() -> int:
         config,
         'system_prompt_with_task',
     )
-    add_line_numbers = resolve_bool_option(
-        args.no_line_numbers,
-        config,
-        'line_numbers',
-        True,
+    add_line_numbers = (
+        not args.no_line_numbers
+        if args.no_line_numbers is not None
+        else resolve_bool_option(None, config, 'line_numbers', True)
     )
 
     quiet_enabled = resolve_bool_option(
@@ -5020,16 +5582,36 @@ def main() -> int:
         return 1
 
     patch_branch_mode = patch_branch_setting is not None
+    if args.shell_confirm and (
+        not shell_mode
+        or args.reuse_session is None
+        or not args.noninteractive
+    ):
+        print(
+            "ERROR: --shell-confirm requires --shell, --reuse-session, "
+            "and --noninteractive",
+            file=sys.stderr,
+        )
+        return 1
+    if shell_mode and args.reuse_session is not None and args.noninteractive and not args.shell_confirm:
+        print(
+            "ERROR: noninteractive shell reuse requires --shell-confirm",
+            file=sys.stderr,
+        )
+        return 1
     patch_save_enabled = args.noninteractive or resolve_bool_option(
         args.patch_save,
         config,
         'patch_save',
         True,
     )
-    patch_review = resolve_bool_option(
-        args.patch_review,
-        config,
-        'patch_review',
+    patch_review = (
+        not args.noninteractive
+        and resolve_bool_option(
+            args.patch_review,
+            config,
+            'patch_review',
+        )
     )
     plan_mode = resolve_bool_option(
         args.plan,
@@ -5049,8 +5631,17 @@ def main() -> int:
         patch_suffix = ''
         suffix_provided = False
 
-    if tree_mode and (plan_mode or patch_mode):
-        print("ERROR: tree mode cannot be combined with --plan or --patch", file=sys.stderr)
+    if tree_mode and (plan_mode or patch_mode or shell_mode):
+        print("ERROR: tree mode cannot be combined with --plan, --patch, or --shell", file=sys.stderr)
+        return 1
+    if patch_mode and shell_mode:
+        print("ERROR: --shell cannot be combined with --patch", file=sys.stderr)
+        return 1
+    if shell_mode and not (args.task or args.task_file):
+        print("ERROR: --shell requires --task or --task-file", file=sys.stderr)
+        return 1
+    if shell_mode and (args.ask or args.ask_file):
+        print("ERROR: --shell only supports --task or --task-file", file=sys.stderr)
         return 1
     if plan_mode and ask_mode:
         print("ERROR: --plan only supports --task or --task-file", file=sys.stderr)
@@ -5086,7 +5677,6 @@ def main() -> int:
     openai_proxy = str(args.proxy_server or config.get("proxy_server", "")).strip()
     openai_organization = str(args.meta_organization or config.get("meta_organization", "")).strip()
     openai_project = str(args.meta_project or config.get("meta_project", "")).strip()
-    safety_identifier = config.get("safety_identifier", None)
     safety_identifier = config.get('safety_identifier', None)
     api_log = resolve_bool_option(
         args.no_api_log,
@@ -5136,6 +5726,15 @@ def main() -> int:
         config=config,
         config_key='patch_system_prompt',
         default=DEFAULT_PATCH_SYSTEM_PROMPT,
+        prompt_expansion_enabled=prompt_expansion_enabled,
+        strip_configured_result=True,
+    )
+    shell_system_prompt = resolve_prompt_setting(
+        explicit_value=args.shell_system_prompt,
+        prompt_file=None,
+        config=config,
+        config_key='shell_system_prompt',
+        default=DEFAULT_SHELL_SYSTEM_PROMPT,
         prompt_expansion_enabled=prompt_expansion_enabled,
         strip_configured_result=True,
     )
@@ -5243,7 +5842,16 @@ def main() -> int:
         json_schema = PATCH_MANIFEST_SCHEMA
         system_prompt = system_prompt + "\n" + patch_system_prompt
         add_line_numbers = True
-
+    if shell_mode:
+        response_format = "schema"
+        json_schema = SHELL_COMMAND_SCHEMA
+        system_prompt = system_prompt + "\n" + shell_system_prompt
+    if response_format not in ("text", "json", "schema"):
+        print(
+            "ERROR: Invalid response format; choose text, json, or schema.",
+            file=sys.stderr,
+        )
+        return 1
     stream_enabled = resolve_bool_option(
         args.stream,
         config,
@@ -5272,6 +5880,7 @@ def main() -> int:
         request_user_prompt: str,
         *,
         response_format_override: str | None = None,
+        json_schema_override: dict[str, Any] | None = None,
         stream: bool = False,
     ) -> tuple[Any, dict[str, Any] | None]:
         request_response_format = (
@@ -5280,7 +5889,9 @@ def main() -> int:
             else response_format_override
         )
         request_schema = (
-            json_schema if response_format_override is None else None
+            json_schema
+            if response_format_override is None
+            else json_schema_override
         )
         return call_openai(
             api_key=api_key,
@@ -5307,12 +5918,10 @@ def main() -> int:
             stream=stream,
         )
 
-    api_key = resolve_api_key(config)
-    if not api_key:
-        print(f"ERROR: api_key missing in {CONFIG_FILE} or OPENAI_API_KEY", file=sys.stderr)
-        print("\nRun:")
-        print("  mince --init")
-        return 1
+    if args.estimate_only and not tree_mode:
+        api_key = ""
+    else:
+        api_key = resolve_api_key(config)
 
     log_enabled = tree_mode or (
         args.log
@@ -5325,6 +5934,7 @@ def main() -> int:
     session_stem = f"{base_profile}-{session_timestamp}-{session_rand_part}"
     reuse_session_name: str | None = None
     reused_patch_history: str | None = None
+    reused_shell_history: str | None = None
     reused_file_records: list[tuple[str, str]] = []
     if args.reuse_session is not None:
         try:
@@ -5351,6 +5961,11 @@ def main() -> int:
                         file_names = reused_file_names
                     if patch_mode:
                         reused_patch_history = load_reused_session_patch_history(
+                            state_session_dir,
+                            turn=reuse_session_turn,
+                        )
+                    if shell_mode:
+                        reused_shell_history = load_reused_session_shell_history(
                             state_session_dir,
                             turn=reuse_session_turn,
                         )
@@ -5395,6 +6010,54 @@ def main() -> int:
             f.write(f"<start_time>{time.ctime(session_timestamp)} [{session_timestamp}]</start_time>\n")
         if VERBOSE:
             print(f"log_file={log_path}", file=sys.stderr)
+
+    def append_log(text: str) -> None:
+        if not log_enabled or log_path is None:
+            return
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(text)
+
+    def log_model_request(
+        request_characters: int,
+        request_tokens: int,
+        request_cost_log: str,
+        request_system_prompt: str,
+        request_user_prompt: str,
+    ) -> None:
+        request_stats = (
+            f"request_characters={request_characters} "
+            f"request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+            f"reasoning={openai_reasoning} reasoning_mode={reasoning_mode} "
+            f"max_output_tokens={max_output_tokens} api_log={api_log} "
+            f"temperature={temperature} top_p={top_p} "
+            f"safety_identifier='{safety_identifier}' service_tier={openai_service_tier} "
+            f"base_url='{openai_base_url}' timeout={llm_timeout}"
+        )
+        append_log(
+            f"<request_stats>\n{request_stats}\n</request_stats>\n"
+            f"<request>\n"
+            f"<system_prompt>\n{request_system_prompt}\n</system_prompt>\n"
+            f"<user_prompt>\n{request_user_prompt}\n</user_prompt>\n"
+            "</request>\n"
+        )
+
+    def log_model_response(
+        response_text: str,
+        reasoning: str,
+        statsline: str,
+    ) -> None:
+        reasoning_block = (
+            f"<reasoning>\n{reasoning}\n</reasoning>\n"
+            if reasoning
+            else ""
+        )
+        timestamp = int(time.time())
+        append_log(
+            f"{reasoning_block}"
+            f"<response>\n{response_text}\n</response>\n"
+            f"<response_stats>\n{statsline}\n</response_stats>\n"
+            f"<end_time>{time.ctime(timestamp)} [{timestamp}]</end_time>\n"
+        )
 
     patch_save_path = None
     patch_json_save_path = None
@@ -5447,6 +6110,9 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+
+    if shell_mode:
+        add_line_numbers = bool(file_names)
 
     if tree_mode:
         try:
@@ -5588,12 +6254,16 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if reused_patch_history:
-            context = (
-                f"{context.rstrip()}\n\n{reused_patch_history}"
-                if context
-                else reused_patch_history
-            )
+        for reused_history in (
+            reused_patch_history,
+            reused_shell_history,
+        ):
+            if reused_history:
+                context = (
+                    f"{context.rstrip()}\n\n{reused_history}"
+                    if context
+                    else reused_history
+                )
         if add_line_numbers or patch_mode:
             base_full_system_prompt = (
                 system_prompt + "\n" + linenum_system_prompt
@@ -5620,7 +6290,7 @@ def main() -> int:
             for f in file_names:
                 try:
                     abs_path = Path(f).resolve()
-                    original_texts[str(abs_path)] = abs_path.read_text(encoding="utf-8")
+                    original_texts[str(abs_path)] = read_text_preserving_line_endings(abs_path)
                 except Exception as exc:
                     try:
                         restore_patch_branch()
@@ -5806,20 +6476,13 @@ def main() -> int:
 
     request_characters = len(full_system_prompt + user_prompt)
 
-    if log_enabled:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"<request_stats>\n"
-                f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
-                f"reasoning={openai_reasoning} reasoning_mode={reasoning_mode} "
-                f"max_output_tokens={max_output_tokens} api_log={api_log} temperature={temperature} top_p={top_p} "
-                f"safety_identifier='{safety_identifier}' service_tier={openai_service_tier} base_url='{openai_base_url}' "
-                f"timeout={llm_timeout}\n</request_stats>\n"
-            )
-            f.write("<request>\n")
-            f.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
-            f.write(f"<user_prompt>\n{user_prompt}\n</user_prompt>\n")
-            f.write("</request>\n")
+    log_model_request(
+        request_characters=request_characters,
+        request_tokens=request_tokens,
+        request_cost_log=request_cost_log,
+        request_system_prompt=full_system_prompt,
+        request_user_prompt=user_prompt,
+    )
 
     if VERBOSE:
         print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
@@ -5900,14 +6563,467 @@ def main() -> int:
         response_cost=response_cost,
     )
 
-    if log_enabled:
-        with open(log_path, "a", encoding="utf-8") as f:
-            if reasoning:
-                f.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
-            f.write(f"<response>\n{result}\n</response>\n")
-            f.write(f"<response_stats>\n{statsline}\n</response_stats>\n")
-            f.write(f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n")
+    log_model_response(
+        response_text=str(result or ""),
+        reasoning=reasoning,
+        statsline=statsline,
+    )
+    if shell_mode and VERBOSE:
+        print(statsline, file=sys.stderr)
 
+    shell_turn_history: list[ShellTurn] = (
+        [ShellTurn(commands=(), output=reused_shell_history)]
+        if reused_shell_history
+        else []
+    )
+    archived_shell_turns: list[ShellTurn] = []
+
+    def request_shell_revision(
+        revision_task: str,
+        shell_commands: list[ShellStep],
+    ) -> tuple[str, str, str]:
+        nonlocal state_turn, state_turn_path, task, full_system_prompt
+        previous_task = task
+        task = revision_task
+        full_system_prompt = append_task_to_system_prompt(
+            base_full_system_prompt,
+            task,
+            system_prompt_with_task,
+        )
+        revision_user_prompt = build_user_prompt(
+            task=task,
+            context=context,
+            response_format=response_format,
+            json_schema=json_schema,
+            include_task=not system_prompt_with_task,
+            additional_prompt=(
+                '<shell_revision instructions="Use the <previous_task> and <previous_commands> with the provided updated user instructions, '
+                'keep everything as-is that was not changed by the updated user instructions.">\n'
+                f'<previous_task>\n{previous_task}\n</previous_task>\n'
+                '<previous_commands>\n'
+                f'{format_shell_command_context(shell_commands)}\n'
+                '</previous_commands>\n'
+                '</shell_revision>'
+            ),
+        )
+        revision_request_tokens = (
+            estimate_request_tokens(
+                model=model,
+                system_prompt=full_system_prompt,
+                user_prompt=revision_user_prompt,
+            )
+            + tokenizer_padding
+        )
+        revision_request_characters = len(
+            full_system_prompt + revision_user_prompt
+        )
+        revision_request_cost_log = ''
+        if token_cost is not None:
+            revision_request_cost_log = (
+                f' request_cost_estimate='
+                f'{revision_request_tokens * token_cost[0] / 1_000_000:.4f}'
+            )
+        if revision_request_tokens > token_limit:
+            raise ValueError(
+                f'Estimated input token count ({revision_request_tokens}) exceeds '
+                f'token limit ({token_limit})'
+            )
+        revision_state_path = start_state_turn(
+            state_session_dir,
+            state_turn,
+            full_system_prompt,
+            task,
+            file_paths=file_paths,
+        )
+        state_turn += 1
+        log_model_request(
+            request_characters=revision_request_characters,
+            request_tokens=revision_request_tokens,
+            request_cost_log=revision_request_cost_log,
+            request_system_prompt=full_system_prompt,
+            request_user_prompt=revision_user_prompt,
+        )
+        if VERBOSE:
+            print(
+                f'request_characters={revision_request_characters} '
+                f'request_tokens_estimate={revision_request_tokens}'
+                f'{revision_request_cost_log} model={model} '
+                f'reasoning={openai_reasoning}',
+                file=sys.stderr,
+            )
+        revision_start_time = time.perf_counter()
+        try:
+            revision_response_obj, revision_usage = call_model(
+                full_system_prompt,
+                revision_user_prompt,
+            )
+            revision_result = str(
+                getattr(revision_response_obj, 'output_text', '') or ''
+            )
+        except Exception as exc:
+            complete_state_turn(
+                revision_state_path,
+                '',
+                f'ERROR: {exc}',
+            )
+            raise
+        revision_elapsed = time.perf_counter() - revision_start_time
+        revision_reasoning = response_reasoning_text(revision_response_obj)
+        complete_state_turn(
+            revision_state_path,
+            revision_reasoning,
+            revision_result,
+        )
+        state_turn_path = revision_state_path
+        revision_statsline = print_stats(
+            session_name=session_stem,
+            request_characters=revision_request_characters,
+            request_tokens=revision_request_tokens,
+            processing_time=revision_elapsed,
+            response_text=revision_result,
+            usage=revision_usage,
+            response_cost=response_cost_line(
+                token_cost, revision_usage
+            ),
+        )
+        log_model_response(
+            response_text=revision_result,
+            reasoning=revision_reasoning,
+            statsline=revision_statsline,
+        )
+        if VERBOSE:
+            print(revision_statsline, file=sys.stderr)
+        return revision_result, revision_reasoning, revision_statsline
+
+    def request_shell_followup(
+        shell_output: str,
+        shell_commands: list[ShellStep],
+    ) -> tuple[str, str]:
+        nonlocal state_turn, state_turn_path
+        followup_schema = SHELL_FOLLOWUP_SCHEMA
+        shell_turn_history.append(
+            ShellTurn(
+                commands=tuple(shell_commands),
+                output=limit_shell_output_for_context(
+                    shell_output,
+                    model,
+                    token_limit,
+                ),
+            )
+        )
+        while True:
+            followup_user_prompt = build_shell_followup_prompt(
+                task,
+                shell_output=shell_turn_history,
+                json_schema=followup_schema,
+                shell_command_archive=archived_shell_turns,
+            )
+            followup_system_prompt = (
+                full_system_prompt
+                + "\nAfter shell output, choose whether to run more commands "
+                + "or use session_end with a reason that completes the session."
+            )
+            followup_request_tokens = (
+                estimate_request_tokens(
+                    model=model,
+                    system_prompt=followup_system_prompt,
+                    user_prompt=followup_user_prompt,
+                )
+                + tokenizer_padding
+            )
+            followup_request_characters = len(
+                followup_system_prompt + followup_user_prompt
+            )
+            if followup_request_tokens <= token_limit:
+                break
+            if len(shell_turn_history) > 1:
+                removed_turn = shell_turn_history.pop(0)
+                if removed_turn.commands:
+                    archived_shell_turns.append(removed_turn)
+                continue
+
+            current_turn = shell_turn_history[-1]
+            current_output_token_count = len(
+                token_encoding_for_model(model).encode(current_turn.output)
+            )
+            if not current_turn.output or current_output_token_count == 0:
+                raise ValueError(
+                    f'Estimated shell follow-up input token count '
+                    f'({followup_request_tokens}) exceeds token limit '
+                    f'({token_limit})'
+                )
+
+            lower = 0
+            upper = current_output_token_count - 1
+            best_output: str | None = None
+            while lower <= upper:
+                midpoint = (lower + upper) // 2
+                candidate_output = truncate_text_to_tokens(
+                    current_turn.output,
+                    model,
+                    midpoint,
+                )
+                candidate_turn = ShellTurn(
+                    commands=current_turn.commands,
+                    output=candidate_output,
+                )
+                candidate_history = [
+                    *shell_turn_history[:-1],
+                    candidate_turn,
+                ]
+                candidate_user_prompt = build_shell_followup_prompt(
+                    task,
+                    shell_output=candidate_history,
+                    json_schema=followup_schema,
+                    shell_command_archive=archived_shell_turns,
+                )
+                candidate_request_tokens = (
+                    estimate_request_tokens(
+                        model=model,
+                        system_prompt=followup_system_prompt,
+                        user_prompt=candidate_user_prompt,
+                    )
+                    + tokenizer_padding
+                )
+                if candidate_request_tokens <= token_limit:
+                    best_output = candidate_output
+                    lower = midpoint + 1
+                else:
+                    upper = midpoint - 1
+
+            if best_output is None:
+                empty_turn = ShellTurn(
+                    commands=current_turn.commands,
+                    output="",
+                )
+                empty_history = [
+                    *shell_turn_history[:-1],
+                    empty_turn,
+                ]
+                empty_user_prompt = build_shell_followup_prompt(
+                    task,
+                    shell_output=empty_history,
+                    json_schema=followup_schema,
+                    shell_command_archive=archived_shell_turns,
+                )
+                empty_request_tokens = (
+                    estimate_request_tokens(
+                        model=model,
+                        system_prompt=followup_system_prompt,
+                        user_prompt=empty_user_prompt,
+                    )
+                    + tokenizer_padding
+                )
+                if empty_request_tokens > token_limit:
+                    raise ValueError(
+                        f'Estimated shell follow-up input token count '
+                        f'({empty_request_tokens}) exceeds token limit '
+                        f'({token_limit})'
+                    )
+                best_output = ""
+            shell_turn_history[-1] = ShellTurn(
+                commands=current_turn.commands,
+                output=best_output,
+            )
+            continue
+        followup_request_cost_log = (
+            f" request_cost_estimate="
+            f"{followup_request_tokens * token_cost[0] / 1_000_000:.4f}"
+            if token_cost is not None
+            else ""
+        )
+        followup_state_path = start_state_turn(
+            state_session_dir,
+            state_turn,
+            followup_system_prompt,
+            task,
+            file_paths=file_paths,
+        )
+        state_turn += 1
+        log_model_request(
+            request_characters=followup_request_characters,
+            request_tokens=followup_request_tokens,
+            request_cost_log=followup_request_cost_log,
+            request_system_prompt=followup_system_prompt,
+            request_user_prompt=followup_user_prompt,
+        )
+        followup_start_time = time.perf_counter()
+        try:
+            followup_response_obj, followup_usage = call_model(
+                followup_system_prompt,
+                followup_user_prompt,
+                response_format_override="schema",
+                json_schema_override=followup_schema,
+            )
+            followup_result = str(
+                getattr(followup_response_obj, "output_text", "") or ""
+            )
+        except Exception as exc:
+            complete_state_turn(followup_state_path, "", f"ERROR: {exc}")
+            raise
+        followup_elapsed = time.perf_counter() - followup_start_time
+        followup_reasoning = response_reasoning_text(followup_response_obj)
+        complete_state_turn(
+            followup_state_path,
+            followup_reasoning,
+            followup_result,
+        )
+        state_turn_path = followup_state_path
+        followup_statsline = print_stats(
+            session_name=session_stem,
+            request_characters=followup_request_characters,
+            request_tokens=followup_request_tokens,
+            processing_time=followup_elapsed,
+            response_text=followup_result,
+            usage=followup_usage,
+            response_cost=response_cost_line(
+                token_cost, followup_usage
+            ),
+        )
+        log_model_response(
+            response_text=followup_result,
+            reasoning=followup_reasoning,
+            statsline=followup_statsline,
+        )
+        if VERBOSE:
+            print(followup_statsline, file=sys.stderr)
+        return followup_result, followup_reasoning
+
+    def finish_shell_response(
+        response_text: str,
+        response_reasoning: str,
+    ) -> int:
+        output_str = response_text
+        if print_reasoning:
+            output_str = (
+                f"<think>\n{response_reasoning}\n</think>\n\n"
+                f"{output_str}"
+            )
+        if args.output_file:
+            try:
+                args.output_file.parent.mkdir(parents=True, exist_ok=True)
+                args.output_file.write_text(output_str, encoding="utf-8")
+            except Exception as exc:
+                print(
+                    f"ERROR: Failed to write output to file {args.output_file}: {exc}",
+                    file=sys.stderr,
+                )
+                print(output_str)
+                return 1
+        else:
+            print(output_str)
+        if args.noninteractive:
+            print(f"state_session_name={state_session_dir.name}")
+        return 0
+
+    if shell_mode:
+        try:
+            shell_steps = parse_shell_manifest(str(result or ''))
+        except Exception as exc:
+            print(f'ERROR: Failed to parse shell command manifest: {exc}', file=sys.stderr)
+            return 1
+        while True:
+            review_action, revision_task = review_shell_commands(shell_steps)
+            if review_action == 'edit':
+                if revision_task is None:
+                    try:
+                        edited_text = edit_text(
+                            build_shell_revision_editor_text(
+                                shell_steps,
+                                task,
+                            ),
+                        )
+                        revision_task = extract_patch_revision_task(
+                            edited_text
+                        )
+                    except Exception as exc:
+                        print(
+                            f'ERROR: Failed to edit shell revision: {exc}',
+                            file=sys.stderr,
+                        )
+                        continue
+                if not revision_task:
+                    continue
+                revision_task = expand_prompt_names(
+                    revision_task,
+                    prompt_expansion_enabled,
+                )
+                try:
+                    result, _, statsline = request_shell_revision(
+                        revision_task,
+                        shell_steps,
+                    )
+                except ValueError as exc:
+                    print(f'ERROR: {exc}', file=sys.stderr)
+                    return 1
+                except Exception as exc:
+                    print(f'API error: {exc}', file=sys.stderr)
+                    return 1
+                try:
+                    shell_steps = parse_shell_manifest(str(result or ''))
+                except Exception as exc:
+                    print(
+                        f'ERROR: Failed to parse shell command manifest: {exc}',
+                        file=sys.stderr,
+                    )
+                    return 1
+                continue
+            if review_action != 'accept':
+                if VERBOSE:
+                    print('Aborted.', file=sys.stderr)
+                return 0
+            shell_output = execute_shell_commands(shell_steps, llm_timeout)
+            if state_turn_path is not None:
+                try:
+                    write_state_shell_output(state_turn_path, shell_output)
+                except Exception as exc:
+                    print(f"ERROR: Failed to save shell output: {exc}", file=sys.stderr)
+                    return 1
+            if VERBOSE:
+                print("<shell_execution>", file=sys.stderr)
+                print(shell_output, file=sys.stderr)
+                print("</shell_execution>", file=sys.stderr)
+            append_log(
+                f"<shell_output>\n{shell_output}\n</shell_output>\n"
+            )
+            try:
+                result, followup_reasoning = request_shell_followup(
+                    shell_output,
+                    shell_steps,
+                )
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            except Exception as exc:
+                print(f"API error: {exc}", file=sys.stderr)
+                return 1
+            try:
+                (
+                    action,
+                    next_shell_steps,
+                    session_reason,
+                ) = parse_shell_followup_response(
+                    result
+                )
+            except Exception as exc:
+                print(f"ERROR: Failed to parse shell follow-up response: {exc}", file=sys.stderr)
+                return 1
+            if action == "commands":
+                if next_shell_steps is None:
+                    print("ERROR: Shell follow-up returned no commands", file=sys.stderr)
+                    return 1
+                shell_steps = next_shell_steps
+                continue
+            if action != "session_end":
+                print("ERROR: Shell follow-up returned an unknown action", file=sys.stderr)
+                return 1
+            if session_reason is None:
+                print("ERROR: Shell follow-up returned no session reason", file=sys.stderr)
+                return 1
+            return finish_shell_response(
+                session_reason,
+                followup_reasoning,
+            )
     def call_patch_revision_request(
         revision_user_prompt: str,
     ) -> tuple[str, str, Any, dict[str, Any] | None]:
@@ -6145,7 +7261,7 @@ def main() -> int:
                 while True:
                     patch_input = input(
                         'Apply these changes? '
-                        '[y/n/p/h/R/S/</>/e/E <prompt>]: '
+                        '[y/n/p/h/S/</>/e/E <prompt>]: '
                     )
                     patch_input, suffix_provided = process_patch_review_input(
                         patch_input,
