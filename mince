@@ -53,6 +53,7 @@ import httpx
 VERBOSE = 1
 DEBUG = 0
 NONINTERACTIVE = False
+SESSION_NAME: str | None = None
 
 
 def page_or_print(text: str) -> None:
@@ -157,7 +158,7 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
                                 "path": {"type": "string", "minLength": 1},
                                 "encoding": {"type": "string", "enum": ["utf-8"]},
                                 "line_ending": {"type": "string", "enum": ["lf", "crlf"]},
-                                "total_lines": {"type": "integer", "minimum": 1},
+                                "total_lines": {"type": "integer", "minimum": 0},
                             },
                             "required": ["path", "encoding", "line_ending", "total_lines"],
                         },
@@ -578,10 +579,10 @@ def handle_state_print_json(values: list[str]) -> int:
                 requested_turn = int(remaining[0])
             except ValueError:
                 pass
-            else:
-                remaining.pop(0)
-                if requested_turn < 0:
-                    raise ValueError("session turn must be non-negative")
+        else:
+            remaining.pop(0)
+            if requested_turn < 0:
+                raise ValueError("session turn must be non-negative")
 
         artifact_types = [
             normalize_state_artifact_type(value)
@@ -2279,6 +2280,7 @@ class PatchRange:
 def validate_patch_ranges(
     patches: list[dict[str, Any]],
     total_lines: int,
+    declared_total_lines: int | None = None,
  ) -> list[PatchRange]:
     ranges: list[PatchRange] = []
 
@@ -2292,11 +2294,22 @@ def validate_patch_ranges(
         if end_line < 1:
             raise ValueError(f'{patch_id}: end_line must be >= 1')
         if total_lines == 0:
-            if start_line != 1 or end_line != 1:
+            full_document_creation = (
+                start_line == 1
+                and declared_total_lines is not None
+                and declared_total_lines > 1
+                and end_line == declared_total_lines
+            )
+            if start_line != 1 or (
+                end_line != 1 and not full_document_creation
+            ):
                 raise ValueError(
-                    f'{patch_id}: empty documents only support line 1 insertion'
+                    f'{patch_id}: empty documents only support line 1 insertion '
+                    'or full-document creation'
                 )
-        elif end_line > total_lines:
+        elif end_line > total_lines and not (
+            start_line == end_line == total_lines + 1
+        ):
             raise ValueError(
                 f'{patch_id}: end_line cannot exceed document total_lines '
                 f'({total_lines})'
@@ -2363,24 +2376,28 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
     lines = original_text.splitlines(keepends=False)
     total_lines = len(lines)
     declared_total_lines = int(document["total_lines"])
-    if total_lines == 0:
-        total_lines_match = declared_total_lines in (0, 1)
-    else:
-        total_lines_match = declared_total_lines == total_lines
-    if not total_lines_match:
-        print(
-            f"WARNING: patch document line count ({total_lines}) does not match "
-            f"manifest total_lines ({declared_total_lines})",
-            file=sys.stderr
-        )
-    if original_text and detect_line_ending(original_text) != line_ending:
-        raise ValueError(
-            f"patch document line ending does not match manifest: "
-            f"expected {line_ending}, detected "
-            f"{detect_line_ending(original_text)}"
-        )
+#    if total_lines == 0:
+#        total_lines_match = declared_total_lines in (0, 1)
+#    else:
+#        total_lines_match = declared_total_lines == total_lines
+#    if not total_lines_match:
+#        print(
+#            f"WARNING: patch document line count ({total_lines}) does not match "
+#            f"manifest total_lines ({declared_total_lines})",
+#            file=sys.stderr
+#        )
+#    if original_text and detect_line_ending(original_text) != line_ending:
+#        raise ValueError(
+#            f"patch document line ending does not match manifest: "
+#            f"expected {line_ending}, detected "
+#            f"{detect_line_ending(original_text)}"
+#        )
 
-    validate_patch_ranges(file_manifest["patches"], total_lines)
+    validate_patch_ranges(
+        file_manifest["patches"],
+        total_lines,
+        declared_total_lines=declared_total_lines,
+    )
 
     # Apply patches in reverse order so earlier line numbers stay valid
     patches = sorted(
@@ -2397,6 +2414,7 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
     if original_text.endswith(eol):
         result += eol
     return result
+
 def patch_manifest_document_path(file_entry: dict[str, Any]) -> Path:
     document = file_entry["document"]
     path = Path(str(document["path"])).expanduser()
@@ -2828,7 +2846,6 @@ def usage_to_dict(usage: Any) -> dict[str, Any] | None:
 
 def print_stats(
     *,
-    session_name: str,
     request_characters: int,
     request_tokens: int,
     processing_time: float | None = None,
@@ -2848,7 +2865,6 @@ def print_stats(
                 stats.append(f"response_{key}={usage[key]}")
     if response_cost is not None:
         stats.append(response_cost)
-    stats.append(f"session_name={session_name}")
     return " ".join(stats)
 
 def coerce_bool(value: Any, default: bool = False) -> bool:
@@ -3911,7 +3927,6 @@ def run_tree_mode(
         response_cost_components = response_cost_amounts(token_cost, usage)
         response_cost = response_cost_line(token_cost, usage)
         statsline = print_stats(
-            session_name=tree_session_stem,
             request_characters=request_characters,
             request_tokens=request_tokens,
             processing_time=elapsed,
@@ -4923,15 +4938,24 @@ def main() -> int:
     global VERBOSE
     global DEBUG
     global NONINTERACTIVE
+    global SESSION_NAME
+
+    SESSION_NAME = None
 
     ensure_config_exists()
 
     args = parse_args()
+    if args.noninteractive:
+        args.log = True
+        args.quiet = True
+
     if args.state_print_json is not None:
         return handle_state_print_json(args.state_print_json)
+
     ask_mode = args.ask is not None or args.ask_file is not None
     if ask_mode:
         disable_ask_conflicting_options(args)
+
     patch_file_turn: int | None = None
     patch_file_print_turn: int | None = None
     for option_name in ("patch_file_apply", "patch_file_print"):
@@ -5933,6 +5957,7 @@ def main() -> int:
     session_timestamp = int(time.time())
     session_rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
     session_stem = f"{base_profile}-{session_timestamp}-{session_rand_part}"
+    SESSION_NAME = session_stem
     reuse_session_name: str | None = None
     reused_patch_history: str | None = None
     reused_shell_history: str | None = None
@@ -6162,6 +6187,7 @@ def main() -> int:
         tree_session_stem = (
             reuse_session_name if reuse_session_name is not None else session_stem
         )
+        SESSION_NAME = tree_session_stem
         tree_session_dir = APP_DIR / "trees" / tree_session_stem
         tree_state_session_dir = STATE_DIR / tree_session_stem
         combined_tree_path = tree_session_dir / f"{tree_session_stem}.md"
@@ -6172,8 +6198,6 @@ def main() -> int:
             print(f"ERROR: Failed to create tree output/state directory {tree_session_dir}: {exc}", file=sys.stderr)
             return 1
         max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
-        if VERBOSE:
-            print(f"tree_session_name={tree_session_stem}")
         return run_tree_mode(
             file_paths=tree_file_paths,
             relative_paths=tree_relative_paths,
@@ -6392,7 +6416,6 @@ def main() -> int:
             return 1
         plan_response_cost = response_cost_line(token_cost, plan_usage)
         plan_statsline = print_stats(
-            session_name=session_stem,
             request_characters=plan_request_characters,
             request_tokens=plan_request_tokens,
             processing_time=plan_elapsed,
@@ -6555,7 +6578,6 @@ def main() -> int:
         )
 
     statsline = print_stats(
-        session_name=session_stem,
         request_characters=request_characters,
         request_tokens=request_tokens,
         processing_time=elapsed,
@@ -6677,7 +6699,6 @@ def main() -> int:
         )
         state_turn_path = revision_state_path
         revision_statsline = print_stats(
-            session_name=session_stem,
             request_characters=revision_request_characters,
             request_tokens=revision_request_tokens,
             processing_time=revision_elapsed,
@@ -6871,7 +6892,6 @@ def main() -> int:
         )
         state_turn_path = followup_state_path
         followup_statsline = print_stats(
-            session_name=session_stem,
             request_characters=followup_request_characters,
             request_tokens=followup_request_tokens,
             processing_time=followup_elapsed,
@@ -7125,7 +7145,6 @@ def main() -> int:
         )
         state_turn_path = revision_state_turn_path
         revision_statsline = print_stats(
-            session_name=session_stem,
             request_characters=revision_request_characters,
             request_tokens=revision_request_tokens,
             processing_time=revision_elapsed,
@@ -7455,8 +7474,12 @@ try:
     rv = main()
 except KeyboardInterrupt:
     print(f"\nStopped.", file=sys.stderr)
-    sys.exit(130)
 except Exception as e:
     print(e, file=sys.stderr)
 finally:
+    if SESSION_NAME is not None:
+        if VERBOSE and not NONINTERACTIVE:
+            print(f"session_name={SESSION_NAME}", file=sys.stderr)
+        elif NONINTERACTIVE:
+            print(f"session_name={SESSION_NAME}")
     sys.exit(rv)
