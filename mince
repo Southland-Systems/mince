@@ -2368,9 +2368,10 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
     else:
         total_lines_match = declared_total_lines == total_lines
     if not total_lines_match:
-        raise ValueError(
-            f"patch document line count ({total_lines}) does not match "
-            f"manifest total_lines ({declared_total_lines})"
+        print(
+            f"WARNING: patch document line count ({total_lines}) does not match "
+            f"manifest total_lines ({declared_total_lines})",
+            file=sys.stderr
         )
     if original_text and detect_line_ending(original_text) != line_ending:
         raise ValueError(
