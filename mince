@@ -579,10 +579,10 @@ def handle_state_print_json(values: list[str]) -> int:
                 requested_turn = int(remaining[0])
             except ValueError:
                 pass
-        else:
-            remaining.pop(0)
-            if requested_turn < 0:
-                raise ValueError("session turn must be non-negative")
+            else:
+                remaining.pop(0)
+                if requested_turn < 0:
+                    raise ValueError("session turn must be non-negative")
 
         artifact_types = [
             normalize_state_artifact_type(value)
@@ -1870,12 +1870,17 @@ def handle_patch_branch_remove(branch_name: str) -> int:
     print(f'patch_branch_removed={branch_name}')
     return 0
 
-def generate_unified_diff(original: str, updated: str, path: str) -> str:
+def generate_unified_diff(
+    original: str,
+    updated: str,
+    path: str,
+    original_exists: bool = True,
+) -> str:
     original_lines = original.splitlines(keepends=True)
     updated_lines = updated.splitlines(keepends=True)
 
-    fromfile = path if original else "/dev/null"
-    tofile = path if updated else "/dev/null"
+    fromfile = path if original_exists else "/dev/null"
+    tofile = path
 
     diff_lines = list(
         difflib.unified_diff(
@@ -2280,32 +2285,34 @@ class PatchRange:
 def validate_patch_ranges(
     patches: list[dict[str, Any]],
     total_lines: int,
-    declared_total_lines: int | None = None,
- ) -> list[PatchRange]:
+) -> list[PatchRange]:
     ranges: list[PatchRange] = []
 
-    for patch in patches:
-        patch_id = str(patch["patch_id"])
-        start_line = int(patch["start_line"])
-        end_line = int(patch["end_line"])
+    for index, patch in enumerate(patches, start=1):
+        if not isinstance(patch, dict):
+            raise ValueError(f"patch {index}: patch must be an object")
+        patch_id = patch.get("patch_id")
+        if not isinstance(patch_id, str) or not patch_id:
+            raise ValueError(
+                f"patch {index}: patch_id must be a non-empty string"
+            )
+        start_line = patch.get("start_line")
+        end_line = patch.get("end_line")
+        if isinstance(start_line, bool) or not isinstance(start_line, int):
+            raise ValueError(f"{patch_id}: start_line must be an integer")
+        if isinstance(end_line, bool) or not isinstance(end_line, int):
+            raise ValueError(f"{patch_id}: end_line must be an integer")
 
         if start_line < 1:
             raise ValueError(f'{patch_id}: start_line must be >= 1')
         if end_line < 1:
             raise ValueError(f'{patch_id}: end_line must be >= 1')
+        if start_line > end_line:
+            raise ValueError(f'{patch_id}: start_line cannot be greater than end_line')
         if total_lines == 0:
-            full_document_creation = (
-                start_line == 1
-                and declared_total_lines is not None
-                and declared_total_lines > 1
-                and end_line == declared_total_lines
-            )
-            if start_line != 1 or (
-                end_line != 1 and not full_document_creation
-            ):
+            if start_line != 1 or end_line != 1:
                 raise ValueError(
-                    f'{patch_id}: empty documents only support line 1 insertion '
-                    'or full-document creation'
+                    f'{patch_id}: empty documents only support line 1 insertion'
                 )
         elif end_line > total_lines and not (
             start_line == end_line == total_lines + 1
@@ -2314,8 +2321,6 @@ def validate_patch_ranges(
                 f'{patch_id}: end_line cannot exceed document total_lines '
                 f'({total_lines})'
             )
-        if start_line > end_line:
-            raise ValueError(f'{patch_id}: start_line cannot be greater than end_line')
 
         ranges.append(
             PatchRange(
@@ -2366,49 +2371,77 @@ def apply_combined_patch_manifest(
     return updated_texts
 
 def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any]) -> str:
-    if not file_manifest.get("patches"):
+    patches_value = file_manifest.get("patches")
+    if patches_value is None:
         return original_text
+    if not isinstance(patches_value, list):
+        raise ValueError("patch document patches must be an array")
+    if not patches_value:
+        return original_text
+    patches = patches_value
 
-    document = file_manifest["document"]
-    line_ending = document["line_ending"]
+    document = file_manifest.get("document")
+    if not isinstance(document, dict):
+        raise ValueError("patch document metadata must be an object")
+    if document.get("encoding") != "utf-8":
+        raise ValueError("patch document encoding must be utf-8")
+    line_ending = document.get("line_ending")
+    if line_ending not in ("lf", "crlf"):
+        raise ValueError("patch document line_ending must be lf or crlf")
     eol = eol_for(line_ending)
 
     lines = original_text.splitlines(keepends=False)
     total_lines = len(lines)
-    declared_total_lines = int(document["total_lines"])
-#    if total_lines == 0:
-#        total_lines_match = declared_total_lines in (0, 1)
-#    else:
-#        total_lines_match = declared_total_lines == total_lines
-#    if not total_lines_match:
-#        print(
-#            f"WARNING: patch document line count ({total_lines}) does not match "
-#            f"manifest total_lines ({declared_total_lines})",
-#            file=sys.stderr
-#        )
-#    if original_text and detect_line_ending(original_text) != line_ending:
-#        raise ValueError(
-#            f"patch document line ending does not match manifest: "
-#            f"expected {line_ending}, detected "
-#            f"{detect_line_ending(original_text)}"
-#        )
+    declared_total_lines = document.get("total_lines")
+    # edge case: single line patch with no line ending
+    total_lines = declared_total_lines if total_lines == 0 else total_lines
 
-    validate_patch_ranges(
-        file_manifest["patches"],
-        total_lines,
-        declared_total_lines=declared_total_lines,
-    )
+    if (
+        isinstance(declared_total_lines, bool)
+        or not isinstance(declared_total_lines, int)
+    ):
+        raise ValueError("patch document total_lines must be an integer")
+    if declared_total_lines != total_lines:
+        raise ValueError(
+            "patch document total_lines does not match source: "
+            f"expected {total_lines}, got {declared_total_lines}"
+        )
+    if original_text:
+        detected_line_ending = detect_line_ending(original_text)
+        if detected_line_ending == "mixed":
+            raise ValueError(
+                "patch document uses mixed line endings, which are unsupported"
+            )
+        if detected_line_ending != line_ending:
+            raise ValueError(
+                "patch document line ending does not match source: "
+                f"expected {detected_line_ending}, got {line_ending}"
+            )
+
+    validate_patch_ranges(patches, total_lines)
+    for patch in patches:
+        content_lines = patch.get("content_line_array")
+        if not isinstance(content_lines, list) or any(
+            not isinstance(line, str) for line in content_lines
+        ):
+            raise ValueError(
+                f"{patch['patch_id']}: content_line_array must be an array of strings"
+            )
+        if any("\r" in line or "\n" in line for line in content_lines):
+            raise ValueError(
+                f"{patch['patch_id']}: content lines must not contain line endings"
+            )
 
     # Apply patches in reverse order so earlier line numbers stay valid
     patches = sorted(
-        file_manifest["patches"],
-        key=lambda p: int(p["start_line"]),
+        patches,
+        key=lambda patch: patch["start_line"],
         reverse=True,
     )
 
     for patch in patches:
-        start_line = int(patch["start_line"])
-        end_line = int(patch["end_line"])
+        start_line = patch["start_line"]
+        end_line = patch["end_line"]
         lines[start_line - 1 : end_line] = patch["content_line_array"]
     result = eol.join(lines)
     if original_text.endswith(eol):
@@ -2452,7 +2485,12 @@ def build_patch_changes(
         if updated_text == original_text:
             continue
         changed_items.append((path, updated_text))
-        diff = generate_unified_diff(original_text, updated_text, path)
+        diff = generate_unified_diff(
+            original_text,
+            updated_text,
+            path,
+            original_exists=path in original_texts,
+        )
         if diff:
             diffs.append(diff)
     return updated_texts, "\n".join(diffs), changed_items
@@ -2529,7 +2567,6 @@ def load_patch_original_texts(
         if path_text in original_texts:
             raise ValueError(f"patch contains duplicate document path: {path}")
         if not path.exists():
-            original_texts[path_text] = ""
             continue
         if not path.is_file():
             raise ValueError(f"patch document path is not a file: {path}")
@@ -3116,6 +3153,8 @@ def build_context(
                 continue
 
             content = read_file(path)
+        content_line_ending = detect_line_ending(content)
+        content_total_lines = len(content.splitlines())
         if add_line_numbers:
             numbered_content = number_lines(content)
         else:
@@ -3127,7 +3166,9 @@ def build_context(
             else "\n"
         )
         sections.append(
-            f"<file path='{context_path}' encoding='utf-8'>\n"
+            f"<file path='{context_path}' encoding='utf-8' "
+            f"line_ending='{content_line_ending}' "
+            f"total_lines='{content_total_lines}'>\n"
             f"{numbered_content}{context_ending}</file>".strip()
         )
 
@@ -7473,8 +7514,17 @@ rv = 0
 try:
     rv = main()
 except KeyboardInterrupt:
+    rv = 130
     print(f"\nStopped.", file=sys.stderr)
+except SystemExit as exc:
+    if exc.code is None:
+        rv = 0
+    elif isinstance(exc.code, int):
+        rv = exc.code
+    else:
+        rv = 1
 except Exception as e:
+    rv = 1
     print(e, file=sys.stderr)
 finally:
     if SESSION_NAME is not None:
