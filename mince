@@ -759,29 +759,48 @@ def load_reused_session_task(
             f"cannot read reused session task from {turn_dir} ({exc})"
         ) from exc
 
+@dataclass(frozen=True)
+class ReusedPatchTurn:
+    turn_dir: Path
+    task: str
+    response: str
+
+
+def load_reused_session_patch_turn(
+    state_session_dir: Path,
+    turn: int | None = None,
+) -> ReusedPatchTurn:
+    turn_dir = last_completed_state_turn(state_session_dir, turn)
+    request_task_path = turn_dir / "request_task"
+    response_path = turn_dir / "response"
+    required_paths = (request_task_path, response_path)
+    if any(path.is_symlink() or not path.is_file() for path in required_paths):
+        raise ValueError(
+            "completed patch turn has no request_task or response: "
+            f"{turn_dir}"
+        )
+    return ReusedPatchTurn(
+        turn_dir=turn_dir,
+        task=read_state_artifact(request_task_path),
+        response=read_state_artifact(response_path),
+    )
+
+
 def load_reused_session_patch_history(
     state_session_dir: Path,
     turn: int | None = None,
 ) -> str:
-    turn_dir = last_completed_state_turn(state_session_dir, turn)
-    response_path = turn_dir / "response"
-    request_task_path = turn_dir / "request_task"
-    if not request_task_path.is_file():
-        raise ValueError(f"completed turn has no request_task: {turn_dir}")
-    try:
-        previous_task = request_task_path.read_text(encoding="utf-8")
-        previous_response = response_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        raise ValueError(
-            f"cannot read reused patch history from {turn_dir} ({exc})"
-        ) from exc
+    patch_turn = load_reused_session_patch_turn(
+        state_session_dir,
+        turn,
+    )
     return (
         "<previous_turn>\n"
         "<request_task>\n"
-        f"{previous_task}\n"
+        f"{patch_turn.task}\n"
         "</request_task>\n"
         "<response>\n"
-        f"{previous_response}\n"
+        f"{patch_turn.response}\n"
         "</response>\n"
         "</previous_turn>"
     )
@@ -4522,8 +4541,7 @@ def parse_args() -> argparse.Namespace:
         metavar=("SESSION_NAME", "TURN"),
         help=(
             "Load context and task from the last completed turn of an "
-            "existing session (optionally at TURN). With --shell or --patch, "
-            "a supplied task revises the previous task during confirmation."
+            "existing session (optionally at TURN). Can be used with --shell and --patch"
         ),
     )
 
@@ -5906,13 +5924,20 @@ def main() -> int:
         return 1
     if (
         patch_mode
+        and args.reuse_session is not None
+        and args.task is None
+    ):
+        print(
+            "ERROR: --patch with --reuse-session requires --task",
+            file=sys.stderr,
+        )
+        return 1
+    if (
+        patch_mode
         and args.reuse_session is None
         and not (args.task or args.task_file)
     ):
         print("ERROR: --patch requires --task or --task-file", file=sys.stderr)
-        return 1
-    if patch_mode and (args.ask or args.ask_file):
-        print("ERROR: --patch only supports --task or --task-file", file=sys.stderr)
         return 1
     if patch_mode and "-" in file_names:
         print("ERROR: --patch does not support STDIN in --files", file=sys.stderr)
@@ -6201,10 +6226,10 @@ def main() -> int:
     )
     state_enabled = not ask_mode
     reuse_session_name: str | None = None
-    reused_patch_history: str | None = None
+    reused_patch_turn: ReusedPatchTurn | None = None
     reused_shell_turn: ReusedShellTurn | None = None
     reused_file_records: list[tuple[str, str]] = []
-    reuse_session_revision_task: str | None = None
+    shell_revision_task: str | None = None
     if args.reuse_session is not None:
         try:
             reuse_session_name = validate_session_name(args.reuse_session)
@@ -6218,6 +6243,7 @@ def main() -> int:
     else:
         state_session_dir = STATE_DIR / session_stem
     state_turn = 0
+
     if state_enabled:
         if reuse_session_name is not None:
             try:
@@ -6225,55 +6251,66 @@ def main() -> int:
                     state_session_dir
                 )
                 if not tree_mode:
+                    task_supplied = (
+                        args.task is not None or args.task_file is not None
+                    )
                     if shell_mode:
                         reused_shell_turn = load_reused_session_shell_turn(
                             state_session_dir,
                             turn=reuse_session_turn,
                         )
                         reused_task = reused_shell_turn.task
+                        if task_supplied:
+                            if not task:
+                                raise ValueError(
+                                    "reused session revision task cannot be empty"
+                                )
+                            shell_revision_task = task
+                        task = expand_prompt_names(
+                            reused_task,
+                            prompt_expansion_enabled,
+                        )
+                        if shell_revision_task is not None:
+                            reused_shell_turn = (
+                                load_reused_session_shell_command_turn(
+                                    state_session_dir,
+                                    turn=reuse_session_turn,
+                                )
+                            )
+                            task = expand_prompt_names(
+                                reused_shell_turn.task,
+                                prompt_expansion_enabled,
+                            )
+                    elif patch_mode:
+                        if not task:
+                            raise ValueError(
+                                "reused session revision task cannot be empty"
+                            )
+                        reused_patch_turn = load_reused_session_patch_turn(
+                            state_session_dir,
+                            turn=reuse_session_turn,
+                        )
                     else:
                         reused_task = load_reused_session_task(
                             state_session_dir,
                             turn=reuse_session_turn,
                         )
-                    task_supplied = (
-                        args.task is not None or args.task_file is not None
-                    )
-                    if task_supplied and (patch_mode or shell_mode):
-                        if not task:
-                            raise ValueError(
-                                "reused session revision task cannot be empty"
+                        if not task_supplied:
+                            task = expand_prompt_names(
+                                reused_task,
+                                prompt_expansion_enabled,
                             )
-                        reuse_session_revision_task = task
-                    if not task_supplied or patch_mode or shell_mode:
-                        task = expand_prompt_names(
-                            reused_task,
-                            prompt_expansion_enabled,
-                        )
-                    if (
-                        shell_mode
-                        and reuse_session_revision_task is not None
-                    ):
-                        reused_shell_turn = (
-                            load_reused_session_shell_command_turn(
-                                state_session_dir,
-                                turn=reuse_session_turn,
-                            )
-                        )
-                        task = expand_prompt_names(
-                            reused_shell_turn.task,
-                            prompt_expansion_enabled,
-                        )
                     reused_file_names = [
                         path for path, _ in reused_file_records
                     ]
                     if not file_names:
                         file_names = reused_file_names
-                    if patch_mode:
-                        reused_patch_history = load_reused_session_patch_history(
-                            state_session_dir,
-                            turn=reuse_session_turn,
-                        )
+            except ValueError as exc:
+                print(
+                    f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
+                    file=sys.stderr,
+                )
+                return 1
             except ValueError as exc:
                 print(
                     f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
@@ -6561,12 +6598,6 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if reused_patch_history:
-            context = (
-                f"{context.rstrip()}\n\n{reused_patch_history}"
-                if context
-                else reused_patch_history
-            )
         if add_line_numbers or patch_mode:
             base_full_system_prompt = (
                 system_prompt + "\n" + linenum_system_prompt
@@ -6583,8 +6614,25 @@ def main() -> int:
             context=context,
             response_format=response_format,
             json_schema=json_schema,
+            json_patch_responses=(
+                [reused_patch_turn.response]
+                if reused_patch_turn is not None
+                else None
+            ),
+            json_patch_task=(
+                reused_patch_turn.task
+                if reused_patch_turn is not None
+                else None
+            ),
             include_task=not system_prompt_with_task,
         )
+        if reused_patch_turn is not None:
+            user_prompt += "\n" + patch_system_prompt
+        if patch_mode:
+            if not file_names:
+                print("ERROR: Patch mode requires readable input files.", file=sys.stderr)
+                return 1
+            original_texts: dict[str, str] = {}
         if patch_mode:
             if not file_names:
                 print("ERROR: Patch mode requires readable input files.", file=sys.stderr)
@@ -6758,7 +6806,7 @@ def main() -> int:
     )
     complete_reused_shell_turn_after_execution = (
         resume_reused_shell_turn
-        and reuse_session_revision_task is not None
+        and shell_revision_task is not None
     )
     if (
         resume_reused_shell_turn
@@ -7258,7 +7306,7 @@ def main() -> int:
             print(f'ERROR: Failed to parse shell command manifest: {exc}', file=sys.stderr)
             return 1
         shell_response_reasoning = reasoning
-        pending_shell_revision_task = reuse_session_revision_task
+        pending_shell_revision_task = shell_revision_task
         while True:
             if pending_shell_revision_task is not None:
                 review_action = 'edit'
@@ -7525,7 +7573,6 @@ def main() -> int:
         ]
         patch_state_turn_history: list[Path | None] = [state_turn_path]
         patch_turn_index = 0
-        pending_patch_revision_task = reuse_session_revision_task
 
         def request_patch_revision(revision_task: str) -> None:
             nonlocal task, result, statsline, response_obj, usage
@@ -7623,15 +7670,6 @@ def main() -> int:
                     )
                     return 1
 
-            if pending_patch_revision_task is not None:
-                revision_task = pending_patch_revision_task
-                pending_patch_revision_task = None
-                try:
-                    request_patch_revision(revision_task)
-                except Exception as exc:
-                    print(f'API error: {exc}', file=sys.stderr)
-                    return 1
-                continue
 
             if not changed_items:
                 if VERBOSE:
