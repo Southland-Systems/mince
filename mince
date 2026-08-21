@@ -8,6 +8,7 @@ An assistant for turning local files into useful answers.
 from __future__ import annotations
 
 import os
+import signal
 import hashlib
 import argparse
 import json
@@ -74,11 +75,12 @@ DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a text block based patch using the provi
 DEFAULT_PLAN_SYSTEM_PROMPT = "Create a clear, self-contained AI prompt for the next step and design it only for the provided context and task. Return only the prompt, without commentary or code fences."
 DEFAULT_SHELL_SYSTEM_PROMPT = (
     "Generate safe, necessary shell commands for the task. Return commands "
-    "using the shell command JSON Schema. Each command has a command string and a concise, non-empty "
-    "reason describing why it is needed. A script has the same command "
-    "string plus lines containing its script input. Commands are reviewed "
-    "before execution. After command output, use action=commands for more "
-    "work or action=session_end with a reason that completes the session."
+    "using the shell command JSON Schema. Each command has a command string "
+    "and a concise, non-empty reason describing why it is needed. Use a lines "
+    "array only when the command needs standard input; its entries are sent in "
+    "order. Commands are reviewed before execution. After command output, use "
+    "action=commands for more work or action=session_end with an empty commands "
+    "array and a non-empty reason that completes the session."
  )
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -635,6 +637,48 @@ def handle_state_print_json(values: list[str]) -> int:
         return 1
     return 0
 
+def handle_shell_session_print_json(values: list[str]) -> int:
+    try:
+        if len(values) not in (1, 2):
+            raise ValueError(
+                '--shell-session-print-json requires SESSION and optional TURN'
+            )
+        session_name = validate_session_name(values[0])
+        requested_turn: int | None = None
+        if len(values) == 2:
+            try:
+                requested_turn = int(values[1])
+            except ValueError as exc:
+                raise ValueError(
+                    '--shell-session-print-json TURN must be an integer'
+                ) from exc
+            if requested_turn < 0:
+                raise ValueError(
+                    '--shell-session-print-json TURN must be non-negative'
+                )
+        state_session_dir = STATE_DIR / session_name
+        if not state_session_dir.is_dir() or state_session_dir.is_symlink():
+            raise ValueError(
+                f'state session does not exist: {state_session_dir}'
+            )
+        turn_dir = last_completed_state_turn(
+            state_session_dir,
+            requested_turn,
+        )
+        response = read_state_artifact(turn_dir / 'response')
+        response_json = json.loads(clean_json_response(response))
+        if not isinstance(response_json, dict):
+            raise ValueError('shell session response must be a JSON object')
+        print(json.dumps(response_json, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        print(
+            f'ERROR: Failed to print shell session JSON: {exc}',
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def file_checksum(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -700,10 +744,25 @@ def verify_reused_session_files(
             + "; ".join(mismatches)
         )
 
+def load_reused_session_task(
+    state_session_dir: Path,
+    turn: int | None = None,
+) -> str:
+    turn_dir = last_completed_state_turn(state_session_dir, turn)
+    request_task_path = turn_dir / "request_task"
+    if not request_task_path.is_file():
+        raise ValueError(f"completed turn has no request_task: {turn_dir}")
+    try:
+        return request_task_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError(
+            f"cannot read reused session task from {turn_dir} ({exc})"
+        ) from exc
+
 def load_reused_session_patch_history(
     state_session_dir: Path,
     turn: int | None = None,
- ) -> str:
+) -> str:
     turn_dir = last_completed_state_turn(state_session_dir, turn)
     response_path = turn_dir / "response"
     request_task_path = turn_dir / "request_task"
@@ -727,46 +786,101 @@ def load_reused_session_patch_history(
         "</previous_turn>"
     )
 
-def load_reused_session_shell_history(
+@dataclass(frozen=True)
+class ReusedShellTurn:
+    turn_dir: Path
+    system_prompt: str
+    task: str
+    response: str
+    reasoning: str
+    shell_output: str | None
+
+
+def load_reused_session_shell_turn(
     state_session_dir: Path,
     turn: int | None = None,
- ) -> str:
+) -> ReusedShellTurn:
     turn_dir = last_completed_state_turn(state_session_dir, turn)
+    system_prompt_path = turn_dir / "request_system_prompt"
     request_task_path = turn_dir / "request_task"
     response_path = turn_dir / "response"
+    required_paths = (
+        system_prompt_path,
+        request_task_path,
+        response_path,
+    )
+    if any(path.is_symlink() or not path.is_file() for path in required_paths):
+        raise ValueError(
+            "completed shell turn has no request_system_prompt, "
+            f"request_task, or response: {turn_dir}"
+        )
+
+    reasoning_path = turn_dir / "response_reasoning"
     shell_output_path = turn_dir / "response_shell_output"
-    if not request_task_path.is_file() or not response_path.is_file():
-        raise ValueError(
-            f"completed shell turn has no request_task or response: {turn_dir}"
-        )
-    try:
-        previous_task = request_task_path.read_text(encoding="utf-8")
-        previous_response = response_path.read_text(encoding="utf-8")
-        previous_shell_output = (
-            shell_output_path.read_text(encoding="utf-8")
-            if shell_output_path.is_file()
-            else ""
-        )
-    except Exception as exc:
-        raise ValueError(
-            f"cannot read reused shell history from {turn_dir} ({exc})"
-        ) from exc
-    shell_output_block = (
-        f"<shell_output>\n{previous_shell_output}\n</shell_output>\n"
-        if previous_shell_output
+    reasoning = (
+        read_state_artifact(reasoning_path)
+        if reasoning_path.exists() or reasoning_path.is_symlink()
         else ""
     )
-    return (
-        "<previous_turn>\n"
-        "<request_task>\n"
-        f"{previous_task}\n"
-        "</request_task>\n"
-        "<response>\n"
-        f"{previous_response}\n"
-        "</response>\n"
-        f"{shell_output_block}"
-        "</previous_turn>"
+    shell_output = (
+        read_state_artifact(shell_output_path)
+        if shell_output_path.exists() or shell_output_path.is_symlink()
+        else None
     )
+    return ReusedShellTurn(
+        turn_dir=turn_dir,
+        system_prompt=read_state_artifact(system_prompt_path),
+        task=read_state_artifact(request_task_path),
+        response=read_state_artifact(response_path),
+        reasoning=reasoning,
+        shell_output=shell_output,
+    )
+
+
+def load_reused_session_shell_command_turn(
+    state_session_dir: Path,
+    turn: int | None = None,
+) -> ReusedShellTurn:
+    selected_turn_dir = last_completed_state_turn(
+        state_session_dir,
+        turn,
+    )
+    selected_turn = int(selected_turn_dir.name)
+    candidate_turns: list[int] = []
+    for entry in state_session_dir.iterdir():
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            candidate_turn = int(entry.name)
+        except ValueError:
+            continue
+        response_path = entry / "response"
+        if (
+            0 <= candidate_turn <= selected_turn
+            and response_path.is_file()
+            and not response_path.is_symlink()
+        ):
+            candidate_turns.append(candidate_turn)
+
+    for candidate_turn in sorted(candidate_turns, reverse=True):
+        try:
+            shell_turn = load_reused_session_shell_turn(
+                state_session_dir,
+                candidate_turn,
+            )
+            commands, _ = parse_reused_shell_response(
+                shell_turn.response
+            )
+        except ValueError:
+            continue
+        if commands is not None:
+            return shell_turn
+
+    raise ValueError(
+        "completed shell session has no reusable command turn: "
+        f"{state_session_dir}"
+    )
+
 
 def start_state_turn(
     state_session_dir: Path,
@@ -1316,6 +1430,27 @@ def format_config_lines(config: dict[str, Any]) -> list[str]:
         format_config_line(config_name, value)
         for config_name, value in config.items()
     ]
+
+
+def format_log_settings(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> str:
+    logged_config = config.copy()
+    if "api_key" in logged_config:
+        logged_config["api_key"] = mask_api_key(
+            logged_config["api_key"]
+        )
+    return (
+        "<settings>\n"
+        f"<configuration path=\"{CONFIG_FILE}\">\n"
+        f"{json.dumps(logged_config, separators=(", ", ": "), ensure_ascii=False, default=str)}\n"
+        "</configuration>\n"
+        "<arguments>\n"
+        f"{json.dumps(vars(args), separators=(", ", ": "), ensure_ascii=False, default=str)}\n"
+        "</arguments>\n"
+        "</settings>\n"
+    )
 
 
 def prompt_config_value(
@@ -1931,36 +2066,34 @@ class ShellTurn:
 SHELL_OUTPUT_TOKEN_FRACTION = 0.8
 
 def _shell_step_from_value(value: Any, index: int) -> ShellStep:
-    if isinstance(value, str):
-        command = value.strip()
-        if not command:
-            raise ValueError(f"shell command {index} cannot be empty")
-        return ShellStep(command)
     if not isinstance(value, dict):
-        raise ValueError(f"shell command {index} must be an object or string")
-    allowed_keys = {"command", "lines", "script", "reason"}
+        raise ValueError(f"shell command {index} must be an object")
+    allowed_keys = {"command", "lines", "reason"}
     unexpected = set(value) - allowed_keys
     if unexpected:
         raise ValueError(
             f"shell command {index} has unexpected fields: "
             + ", ".join(sorted(unexpected))
         )
-    command_value = value.get("command", value.get("script"))
+    command_value = value.get("command")
     if not isinstance(command_value, str) or not command_value.strip():
         raise ValueError(f"shell command {index} requires a non-empty command")
+    command = command_value.strip()
+    if "\x00" in command:
+        raise ValueError(f"shell command {index} cannot contain a null byte")
     reason_value = value.get("reason")
     if not isinstance(reason_value, str) or not reason_value.strip():
         raise ValueError(f"shell command {index} requires a non-empty reason")
     reason = reason_value.strip()
     if "lines" not in value:
-        return ShellStep(command=command_value.strip(), reason=reason)
+        return ShellStep(command=command, reason=reason)
     raw_lines = value["lines"]
     if not isinstance(raw_lines, list) or not raw_lines:
         raise ValueError(f"shell script {index} requires a non-empty lines array")
     if any(not isinstance(line, str) for line in raw_lines):
         raise ValueError(f"shell script {index} lines must be strings")
     return ShellStep(
-        command=command_value.strip(),
+        command=command,
         lines=tuple(raw_lines),
         reason=reason,
     )
@@ -1974,39 +2107,75 @@ def normalize_shell_commands(values: Any) -> list[ShellStep]:
     ]
 
 
-def parse_shell_manifest(raw: str) -> list[ShellStep]:
-    try:
-        manifest = json.loads(clean_json_response(raw))
-    except json.JSONDecodeError:
-        raise
+def _parse_shell_response_json(raw: str) -> Any:
+    return json.loads(clean_json_response(raw))
+
+
+def _parse_shell_manifest_value(manifest: Any) -> list[ShellStep]:
     if not isinstance(manifest, dict):
         raise ValueError("shell manifest must contain a JSON object")
     if set(manifest) != {"commands"}:
         raise ValueError("shell manifest must contain only a commands field")
     return normalize_shell_commands(manifest["commands"])
 
-def parse_shell_followup_response(
-    raw: str,
+
+def parse_shell_manifest(raw: str) -> list[ShellStep]:
+    return _parse_shell_manifest_value(_parse_shell_response_json(raw))
+
+
+def _parse_shell_followup_value(
+    response: Any,
  ) -> tuple[str, list[ShellStep] | None, str | None]:
-    try:
-        response = json.loads(clean_json_response(raw))
-    except json.JSONDecodeError:
-        raise
     if not isinstance(response, dict):
         raise ValueError("shell follow-up response must contain a JSON object")
     if set(response) != {"action", "commands", "reason"}:
         raise ValueError("shell follow-up response must contain only action, commands, and reason")
-    action = response.get("action")
+    action = response["action"]
     if action not in ("commands", "session_end"):
         raise ValueError("shell follow-up action must be commands or session_end")
     reason = response["reason"]
     if not isinstance(reason, str):
         raise ValueError("shell follow-up reason must be a string")
+    commands_value = response["commands"]
+    if not isinstance(commands_value, list):
+        raise ValueError("shell follow-up commands must be an array")
     if action == "session_end":
         if not reason.strip():
             raise ValueError("shell follow-up session_end reason cannot be empty")
+        if commands_value:
+            raise ValueError("shell follow-up session_end commands must be empty")
         return action, None, reason
-    return action, normalize_shell_commands(response["commands"]), None
+    return action, normalize_shell_commands(commands_value), None
+
+
+def parse_shell_followup_response(
+    raw: str,
+ ) -> tuple[str, list[ShellStep] | None, str | None]:
+    return _parse_shell_followup_value(_parse_shell_response_json(raw))
+
+
+def parse_reused_shell_response(
+    raw: str,
+ ) -> tuple[list[ShellStep] | None, str | None]:
+    response = _parse_shell_response_json(raw)
+    if isinstance(response, dict) and "action" in response:
+        action, commands, reason = _parse_shell_followup_value(response)
+        if action == "session_end":
+            return None, reason
+        if commands is None:
+            raise ValueError("shell follow-up returned no commands")
+        return commands, None
+    return _parse_shell_manifest_value(response), None
+
+def shell_heredoc_delimiter(lines: tuple[str, ...]) -> str:
+    input_lines = set("\n".join(lines).splitlines())
+    delimiter = "MINCE_SCRIPT"
+    suffix = 1
+    while delimiter in input_lines:
+        delimiter = f"MINCE_SCRIPT_{suffix}"
+        suffix += 1
+    return delimiter
+
 
 def format_shell_commands(commands: list[ShellStep]) -> str:
     blocks: list[str] = []
@@ -2017,24 +2186,27 @@ def format_shell_commands(commands: list[ShellStep]) -> str:
             else ""
         )
         if step.lines:
+            delimiter = shell_heredoc_delimiter(step.lines)
             block = (
-                f"{reason_prefix}[{index}] $ {step.command} <<'MINCE_SCRIPT'\n"
+                f"{reason_prefix}[{index}] $ {step.command} <<'{delimiter}'\n"
                 + "\n".join(step.lines)
-                + "\nMINCE_SCRIPT"
+                + f"\n{delimiter}"
             )
         else:
             block = f"{reason_prefix}[{index}] $ {step.command}"
         blocks.append(block)
     return "\n\n".join(blocks)
 
+
 def format_shell_command_context(commands: list[ShellStep]) -> str:
     blocks: list[str] = []
     for index, step in enumerate(commands, start=1):
         if step.lines:
+            delimiter = shell_heredoc_delimiter(step.lines)
             block = (
-                f"[{index}] $ {step.command} <<'MINCE_SCRIPT'\n"
+                f"[{index}] $ {step.command} <<'{delimiter}'\n"
                 + "\n".join(step.lines)
-                + "\nMINCE_SCRIPT"
+                + f"\n{delimiter}"
             )
         else:
             block = f"[{index}] $ {step.command}"
@@ -2072,12 +2244,19 @@ def process_shell_review_input(
         return None
     return choice
 
-def review_shell_commands(commands: list[ShellStep]) -> tuple[str, str | None]:
+def review_shell_commands(
+    commands: list[ShellStep],
+    accept_noninteractive: bool = False,
+) -> tuple[str, str | None]:
     command_text = format_shell_commands(commands)
-    print()
-    print(command_text)
+    if not NONINTERACTIVE:
+        print()
+        print(command_text)
     if NONINTERACTIVE:
-        return 'accept', None
+        return (
+            'accept' if accept_noninteractive else 'save',
+            None,
+        )
     while True:
         choice = process_shell_review_input(
             input('Run these shell commands? [y/n/p/h/e/E <prompt>]: '),
@@ -2109,6 +2288,20 @@ def _shell_text(value: Any) -> str:
         return value.decode("utf-8", errors="replace")
     return str(value or "")
 
+
+def _terminate_shell_process(process: Any) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if process.poll() is None:
+        process.kill()
+
+
 def execute_shell_commands(
     commands: list[ShellStep],
     timeout: int,
@@ -2120,26 +2313,44 @@ def execute_shell_commands(
         if step.lines:
             script_input = "\n".join(step.lines) + "\n"
         try:
-            completed = subprocess.run(
+            popen_kwargs: dict[str, Any] = {}
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            process = subprocess.Popen(
                 step.command,
                 shell=True,
-                input=script_input,
+                stdin=subprocess.PIPE,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                check=False,
-                timeout=command_timeout,
+                **popen_kwargs,
             )
-            status = str(completed.returncode)
-            stdout = _shell_text(completed.stdout)
-            stderr = _shell_text(completed.stderr)
-        except subprocess.TimeoutExpired as exc:
-            status = "timeout"
-            stdout = _shell_text(getattr(exc, "stdout", ""))
-            stderr = _shell_text(getattr(exc, "stderr", ""))
-            stderr = (stderr + "\n" if stderr else "") + (
-                f"command exceeded timeout of {command_timeout} seconds"
-            )
+            try:
+                stdout, stderr = process.communicate(
+                    script_input,
+                    timeout=command_timeout,
+                )
+                status = str(process.returncode)
+            except subprocess.TimeoutExpired:
+                _terminate_shell_process(process)
+                stdout, stderr = process.communicate()
+                status = "timeout"
+                stderr = (
+                    _shell_text(stderr) + "\n"
+                    if stderr
+                    else ""
+                ) + (
+                    f"command exceeded timeout of {command_timeout} seconds"
+                )
+            except BaseException:
+                _terminate_shell_process(process)
+                try:
+                    process.communicate()
+                except Exception:
+                    pass
+                raise
+            stdout = _shell_text(stdout)
+            stderr = _shell_text(stderr)
         except Exception as exc:
             status = "error"
             stdout = ""
@@ -2202,9 +2413,9 @@ def build_shell_followup_prompt(
         "Their actual output is below.\n"
         f"{archive_block}{shell_turn_blocks}\n"
         "Decide whether more commands are needed or end the session. Use "
-        "action=commands with commands when more shell work is needed; "
-        "otherwise use action=session_end with a reason that completes the session.\n"
-        f"{schema_block}"
+        "action=commands with a non-empty commands array when more shell work is "
+        "needed; otherwise use action=session_end with an empty commands array and "
+        f"a non-empty reason that completes the session.\n{schema_block}"
     )
 
 PATCH_REVISION_HEADING = (
@@ -2545,8 +2756,7 @@ def resolve_patch_file_argument(
                 ).is_file():
                     raise ValueError(
                         "response_schema_patch_applied already exists in "
-                        f"patch session {state_session_dir} "
-                        f"(turn {applied_turn})"
+                        f"patch session {state_session_dir}/{applied_turn}"
                     )
         turn_dir = last_completed_state_turn(
             state_session_dir,
@@ -2577,6 +2787,24 @@ def load_patch_original_texts(
     return original_texts
 
 
+def write_patch_files(
+    changed_items: list[tuple[str, str]],
+    target_paths: list[Path],
+) -> list[str]:
+    if len(changed_items) != len(target_paths):
+        raise ValueError(
+            "patch changed items and target paths must have equal lengths"
+        )
+    written_paths: list[str] = []
+    for (_, updated_text), target_path in zip(changed_items, target_paths):
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_preserving_line_endings(target_path, updated_text)
+        written_paths.append(str(target_path))
+        if VERBOSE:
+            print(f"file_written={target_path}")
+    return written_paths
+
+
 def write_patch_changes(
     changed_items: list[tuple[str, str]],
     all_paths: list[Path],
@@ -2585,8 +2813,7 @@ def write_patch_changes(
     suffix_provided: bool,
     patch_branch_setting: str | None,
     patch_commit_message: str,
- ) -> list[str]:
-    written_paths: list[str] = []
+) -> list[str]:
     if patch_branch_setting is not None:
         branch_name = resolve_patch_branch_name(patch_branch_setting)
         repo_root = git_repository_root()
@@ -2601,37 +2828,29 @@ def write_patch_changes(
         for path_text, _ in changed_items:
             git_relative_path(repo_root, Path(path_text))
         prepare_patch_branch(repo_root, branch_name)
-        for path_text, updated_text in changed_items:
-            target_path = Path(path_text)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            write_text_preserving_line_endings(target_path, updated_text)
-            written_paths.append(str(target_path))
+        target_paths = [
+            Path(path_text) for path_text, _ in changed_items
+        ]
+        written_paths = write_patch_files(changed_items, target_paths)
         git_commit_patch(
             repo_root,
-            [Path(path_text) for path_text, _ in changed_items],
+            target_paths,
             patch_commit_message,
         )
-        for path_text, _ in changed_items:
-            print(f"file_written={path_text}")
-        print(f"patch_branch={branch_name}")
+        if VERBOSE:
+            print(f"patch_branch={branch_name}")
         return written_paths
 
-    for path_text, updated_text in changed_items:
-        original_path = Path(path_text)
-        use_suffix = not patch_review or suffix_provided
-        target_path = (
-            append_suffix_to_path(original_path, patch_suffix)
+    use_suffix = not patch_review or suffix_provided
+    target_paths = [
+        (
+            append_suffix_to_path(Path(path_text), patch_suffix)
             if use_suffix
-            else original_path
+            else Path(path_text)
         )
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_preserving_line_endings(target_path, updated_text)
-        written_paths.append(str(target_path))
-        print(
-            f"file_written="
-            f"{str(target_path) if use_suffix else path_text}"
-        )
-    return written_paths
+        for path_text, _ in changed_items
+    ]
+    return write_patch_files(changed_items, target_paths)
 
 
 def handle_patch_file_apply(
@@ -4224,14 +4443,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--shell-confirm",
-        action="store_true",
-        help=(
-            "Accept a reused shell session in noninteractive mode; "
-            "requires --shell, --reuse-session, and --noninteractive"
-        ),
-    )
-    parser.add_argument(
         '--patch-branch',
         nargs='?',
         const=PATCH_BRANCH_DEFAULT_NAME,
@@ -4310,8 +4521,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         metavar=("SESSION_NAME", "TURN"),
         help=(
-            "Load context from the last completed turn of an existing "
-            "session (optionally at TURN)"
+            "Load context and task from the last completed turn of an "
+            "existing session (optionally at TURN). With --shell or --patch, "
+            "a supplied task revises the previous task during confirmation."
         ),
     )
 
@@ -4914,6 +5126,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        '--shell-session-print-json',
+        nargs='+',
+        metavar=('SESSION', 'TURN'),
+        help=(
+            'Print a shell session response as JSON, optionally for TURN'
+        ),
+    )
+
     session_view_group.add_argument(
         "--remove-expired-data",
         nargs="?",
@@ -4935,7 +5156,6 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "plan_system_prompt": None,
         "patch": False,
         "shell": False,
-        "shell_confirm": False,
         "patch_review": False,
         "patch_branch": False,
         "patch_branch_remove": None,
@@ -4990,9 +5210,12 @@ def main() -> int:
         args.log = True
         args.quiet = True
 
+    if args.shell_session_print_json is not None:
+        return handle_shell_session_print_json(
+            args.shell_session_print_json
+        )
     if args.state_print_json is not None:
         return handle_state_print_json(args.state_print_json)
-
     ask_mode = args.ask is not None or args.ask_file is not None
     if ask_mode:
         disable_ask_conflicting_options(args)
@@ -5064,9 +5287,7 @@ def main() -> int:
             ("--plan", args.plan is not None),
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
-            ("--noninteractive", args.noninteractive),
             ("--shell", args.shell is not None),
-            ("--shell-confirm", args.shell_confirm),
             ("--reuse-session", args.reuse_session is not None),
             ("--tree-files", args.tree_files is not None),
             ("--tree-files-list", args.tree_files_list is not None),
@@ -5473,22 +5694,10 @@ def main() -> int:
             return 1
         return 0
 
+    tree_mode = (
+        args.tree_files is not None or args.tree_files_list is not None
+    )
 
-    state_enabled = not ask_mode
-    tree_mode = args.tree_files is not None or args.tree_files_list is not None
-    if args.reuse_session is not None:
-        if ask_mode:
-            print(
-                "ERROR: --reuse-session requires --task or --task-file",
-                file=sys.stderr,
-            )
-            return 1
-        if not tree_mode and args.task is None and args.task_file is None:
-            print(
-                "ERROR: --reuse-session requires --task or --task-file",
-                file=sys.stderr,
-            )
-            return 1
     tree_exclude_git = (
         args.tree_exclude_git
         if args.tree_exclude_git is not None
@@ -5535,14 +5744,10 @@ def main() -> int:
             task = read_prompt_argument(args.task)
         elif args.task_file:
             task = read_prompt_files(args.task_file).strip()
+        elif args.reuse_session is not None:
+            task = ""
         else:
             print("ERROR: --ask or --task required (--help for help)", file=sys.stderr)
-            return 1
-        if args.reuse_session is not None and not task:
-            print(
-                "ERROR: --reuse-session requires a non-empty task",
-                file=sys.stderr,
-            )
             return 1
 
         if args.files_list:
@@ -5648,23 +5853,6 @@ def main() -> int:
         return 1
 
     patch_branch_mode = patch_branch_setting is not None
-    if args.shell_confirm and (
-        not shell_mode
-        or args.reuse_session is None
-        or not args.noninteractive
-    ):
-        print(
-            "ERROR: --shell-confirm requires --shell, --reuse-session, "
-            "and --noninteractive",
-            file=sys.stderr,
-        )
-        return 1
-    if shell_mode and args.reuse_session is not None and args.noninteractive and not args.shell_confirm:
-        print(
-            "ERROR: noninteractive shell reuse requires --shell-confirm",
-            file=sys.stderr,
-        )
-        return 1
     patch_save_enabled = args.noninteractive or resolve_bool_option(
         args.patch_save,
         config,
@@ -5703,7 +5891,11 @@ def main() -> int:
     if patch_mode and shell_mode:
         print("ERROR: --shell cannot be combined with --patch", file=sys.stderr)
         return 1
-    if shell_mode and not (args.task or args.task_file):
+    if (
+        shell_mode
+        and args.reuse_session is None
+        and not (args.task or args.task_file)
+    ):
         print("ERROR: --shell requires --task or --task-file", file=sys.stderr)
         return 1
     if shell_mode and (args.ask or args.ask_file):
@@ -5712,7 +5904,11 @@ def main() -> int:
     if plan_mode and ask_mode:
         print("ERROR: --plan only supports --task or --task-file", file=sys.stderr)
         return 1
-    if patch_mode and not (args.task or args.task_file):
+    if (
+        patch_mode
+        and args.reuse_session is None
+        and not (args.task or args.task_file)
+    ):
         print("ERROR: --patch requires --task or --task-file", file=sys.stderr)
         return 1
     if patch_mode and (args.ask or args.ask_file):
@@ -5923,7 +6119,10 @@ def main() -> int:
         config,
         'stream',
     )
-    if stream_enabled and response_format != 'text':
+    suppress_response_output = args.noninteractive and not ask_mode
+    if stream_enabled and (
+        response_format != 'text' or suppress_response_output
+    ):
         stream_enabled = False
 
     if response_format == "schema" and json_schema is None:
@@ -5997,18 +6196,23 @@ def main() -> int:
     log_path = None
     session_timestamp = int(time.time())
     session_rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
-    session_stem = f"{base_profile}-{session_timestamp}-{session_rand_part}"
-    SESSION_NAME = session_stem
+    generated_session_stem = (
+        f"{base_profile}-{session_timestamp}-{session_rand_part}"
+    )
+    state_enabled = not ask_mode
     reuse_session_name: str | None = None
     reused_patch_history: str | None = None
-    reused_shell_history: str | None = None
+    reused_shell_turn: ReusedShellTurn | None = None
     reused_file_records: list[tuple[str, str]] = []
+    reuse_session_revision_task: str | None = None
     if args.reuse_session is not None:
         try:
             reuse_session_name = validate_session_name(args.reuse_session)
         except ValueError as exc:
             print(f"ERROR: Invalid reuse session name: {exc}", file=sys.stderr)
             return 1
+    session_stem = reuse_session_name or generated_session_stem
+    SESSION_NAME = session_stem
     if reuse_session_name is not None:
         state_session_dir = STATE_DIR / reuse_session_name
     else:
@@ -6021,6 +6225,45 @@ def main() -> int:
                     state_session_dir
                 )
                 if not tree_mode:
+                    if shell_mode:
+                        reused_shell_turn = load_reused_session_shell_turn(
+                            state_session_dir,
+                            turn=reuse_session_turn,
+                        )
+                        reused_task = reused_shell_turn.task
+                    else:
+                        reused_task = load_reused_session_task(
+                            state_session_dir,
+                            turn=reuse_session_turn,
+                        )
+                    task_supplied = (
+                        args.task is not None or args.task_file is not None
+                    )
+                    if task_supplied and (patch_mode or shell_mode):
+                        if not task:
+                            raise ValueError(
+                                "reused session revision task cannot be empty"
+                            )
+                        reuse_session_revision_task = task
+                    if not task_supplied or patch_mode or shell_mode:
+                        task = expand_prompt_names(
+                            reused_task,
+                            prompt_expansion_enabled,
+                        )
+                    if (
+                        shell_mode
+                        and reuse_session_revision_task is not None
+                    ):
+                        reused_shell_turn = (
+                            load_reused_session_shell_command_turn(
+                                state_session_dir,
+                                turn=reuse_session_turn,
+                            )
+                        )
+                        task = expand_prompt_names(
+                            reused_shell_turn.task,
+                            prompt_expansion_enabled,
+                        )
                     reused_file_names = [
                         path for path, _ in reused_file_records
                     ]
@@ -6028,11 +6271,6 @@ def main() -> int:
                         file_names = reused_file_names
                     if patch_mode:
                         reused_patch_history = load_reused_session_patch_history(
-                            state_session_dir,
-                            turn=reuse_session_turn,
-                        )
-                    if shell_mode:
-                        reused_shell_history = load_reused_session_shell_history(
                             state_session_dir,
                             turn=reuse_session_turn,
                         )
@@ -6073,8 +6311,18 @@ def main() -> int:
         LOG_DIR = APP_DIR / "logs"
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = LOG_DIR / f"{session_stem}.txt"
-        with open(log_path, "w", encoding="utf-8") as f:
+        append_to_existing_log = (
+            reuse_session_name is not None and log_path.exists()
+        )
+        with open(
+            log_path,
+            "a" if reuse_session_name is not None else "w",
+            encoding="utf-8",
+        ) as f:
+            if append_to_existing_log:
+                f.write("\n")
             f.write(f"<start_time>{time.ctime(session_timestamp)} [{session_timestamp}]</start_time>\n")
+            f.write(format_log_settings(config, args))
         if VERBOSE:
             print(f"log_file={log_path}", file=sys.stderr)
 
@@ -6093,12 +6341,7 @@ def main() -> int:
     ) -> None:
         request_stats = (
             f"request_characters={request_characters} "
-            f"request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
-            f"reasoning={openai_reasoning} reasoning_mode={reasoning_mode} "
-            f"max_output_tokens={max_output_tokens} api_log={api_log} "
-            f"temperature={temperature} top_p={top_p} "
-            f"safety_identifier='{safety_identifier}' service_tier={openai_service_tier} "
-            f"base_url='{openai_base_url}' timeout={llm_timeout}"
+            f"request_tokens_estimate={request_tokens}{request_cost_log}"
         )
         append_log(
             f"<request_stats>\n{request_stats}\n</request_stats>\n"
@@ -6178,8 +6421,6 @@ def main() -> int:
             )
             return 1
 
-    if shell_mode:
-        add_line_numbers = bool(file_names)
 
     if tree_mode:
         try:
@@ -6320,16 +6561,12 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        for reused_history in (
-            reused_patch_history,
-            reused_shell_history,
-        ):
-            if reused_history:
-                context = (
-                    f"{context.rstrip()}\n\n{reused_history}"
-                    if context
-                    else reused_history
-                )
+        if reused_patch_history:
+            context = (
+                f"{context.rstrip()}\n\n{reused_patch_history}"
+                if context
+                else reused_patch_history
+            )
         if add_line_numbers or patch_mode:
             base_full_system_prompt = (
                 system_prompt + "\n" + linenum_system_prompt
@@ -6471,7 +6708,6 @@ def main() -> int:
         if args.noninteractive:
             if VERBOSE:
                 print(plan_statsline, file=sys.stderr)
-            print(f"state_session_name={state_session_dir.name}")
             return 0
         while True:
             print()
@@ -6515,6 +6751,21 @@ def main() -> int:
             json_schema=json_schema,
             include_task=not system_prompt_with_task,
         )
+    resume_reused_shell_turn = (
+        shell_mode
+        and args.noninteractive
+        and reused_shell_turn is not None
+    )
+    complete_reused_shell_turn_after_execution = (
+        resume_reused_shell_turn
+        and reuse_session_revision_task is not None
+    )
+    if (
+        resume_reused_shell_turn
+        and reused_shell_turn.system_prompt
+    ):
+        full_system_prompt = reused_shell_turn.system_prompt
+
     request_tokens = estimate_request_tokens(
         model=model,
         system_prompt=full_system_prompt,
@@ -6535,88 +6786,95 @@ def main() -> int:
         print(request_tokens)
         return 0
 
-    if request_tokens > token_limit:
+    if not resume_reused_shell_turn and request_tokens > token_limit:
         print(f"ERROR: Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
         return 1
 
     request_characters = len(full_system_prompt + user_prompt)
 
-    log_model_request(
-        request_characters=request_characters,
-        request_tokens=request_tokens,
-        request_cost_log=request_cost_log,
-        request_system_prompt=full_system_prompt,
-        request_user_prompt=user_prompt,
-    )
-
-    if VERBOSE:
-        print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
-
-    state_turn_path: Path | None = None
-    if state_enabled:
-        state_task = task
-        state_turn_path = start_state_turn(
-            state_session_dir,
-            state_turn,
-            full_system_prompt,
-            state_task,
-            file_paths=file_paths,
+    if not resume_reused_shell_turn:
+        log_model_request(
+            request_characters=request_characters,
+            request_tokens=request_tokens,
+            request_cost_log=request_cost_log,
+            request_system_prompt=full_system_prompt,
+            request_user_prompt=user_prompt,
         )
-        state_turn += 1
+
+        if VERBOSE:
+            print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
+
     start_time = time.perf_counter()
-    stream_file = None
+    state_turn_path: Path | None = None
     stream_output_emitted = False
-    stream_sink = None
-
-    try:
-        if stream_enabled and not print_reasoning:
-            if args.output_file:
-                args.output_file.parent.mkdir(parents=True, exist_ok=True)
-                stream_file = args.output_file.open("w", encoding="utf-8")
-
-            def emit_stream_text(delta: str) -> None:
-                if stream_file is not None:
-                    stream_file.write(delta)
-                    stream_file.flush()
-                else:
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
-
-            stream_sink = emit_stream_text
-
-        response_obj, usage = call_model(
-            full_system_prompt,
-            user_prompt,
-            stream=stream_enabled,
-        )
-        if stream_enabled:
-            result, usage, completed_response = consume_response_stream(
-                response_obj, stream_sink
+    if resume_reused_shell_turn:
+        result = reused_shell_turn.response
+        reasoning = reused_shell_turn.reasoning
+        response_obj = None
+        usage = None
+        elapsed = 0.0
+        state_turn_path = reused_shell_turn.turn_dir
+    else:
+        if state_enabled:
+            state_task = task
+            state_turn_path = start_state_turn(
+                state_session_dir,
+                state_turn,
+                full_system_prompt,
+                state_task,
+                file_paths=file_paths,
             )
-            if completed_response is not None:
-                response_obj = completed_response
-            stream_output_emitted = stream_sink is not None
-        else:
-            result = getattr(response_obj, "output_text", "")
-    except Exception as exc:
+            state_turn += 1
+        stream_file = None
+        stream_sink = None
+
+        try:
+            if stream_enabled and not print_reasoning:
+                if args.output_file:
+                    args.output_file.parent.mkdir(parents=True, exist_ok=True)
+                    stream_file = args.output_file.open("w", encoding="utf-8")
+
+                def emit_stream_text(delta: str) -> None:
+                    if stream_file is not None:
+                        stream_file.write(delta)
+                        stream_file.flush()
+                    else:
+                        sys.stdout.write(delta)
+                        sys.stdout.flush()
+
+                stream_sink = emit_stream_text
+
+            response_obj, usage = call_model(
+                full_system_prompt,
+                user_prompt,
+                stream=stream_enabled,
+            )
+            if stream_enabled:
+                result, usage, completed_response = consume_response_stream(
+                    response_obj, stream_sink
+                )
+                if completed_response is not None:
+                    response_obj = completed_response
+                stream_output_emitted = stream_sink is not None
+            else:
+                result = getattr(response_obj, "output_text", "")
+        except Exception as exc:
+            if state_turn_path is not None:
+                complete_state_turn(state_turn_path, "", f"ERROR: {exc}")
+            print(f"API error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if stream_file is not None:
+                stream_file.close()
+
+        elapsed = time.perf_counter() - start_time
+        reasoning = response_reasoning_text(response_obj)
         if state_turn_path is not None:
-            complete_state_turn(state_turn_path, "", f"ERROR: {exc}")
-        print(f"API error: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        if stream_file is not None:
-            stream_file.close()
-
-    elapsed = time.perf_counter() - start_time
-    response_cost = response_cost_line(token_cost, usage)
-
-    reasoning = response_reasoning_text(response_obj)
-    if state_turn_path is not None:
-        complete_state_turn(
-            state_turn_path,
-            reasoning,
-            str(result or ""),
-        )
+            complete_state_turn(
+                state_turn_path,
+                reasoning,
+                str(result or ""),
+            )
 
     statsline = print_stats(
         request_characters=request_characters,
@@ -6624,23 +6882,25 @@ def main() -> int:
         processing_time=elapsed,
         response_text=result,
         usage=usage,
-        response_cost=response_cost,
+        response_cost=response_cost_line(token_cost, usage),
     )
 
-    log_model_response(
-        response_text=str(result or ""),
-        reasoning=reasoning,
-        statsline=statsline,
-    )
+    if not resume_reused_shell_turn:
+        log_model_response(
+            response_text=str(result or ""),
+            reasoning=reasoning,
+            statsline=statsline,
+        )
     if shell_mode and VERBOSE:
         print(statsline, file=sys.stderr)
 
-    shell_turn_history: list[ShellTurn] = (
-        [ShellTurn(commands=(), output=reused_shell_history)]
-        if reused_shell_history
-        else []
-    )
+    shell_turn_history: list[ShellTurn] = []
     archived_shell_turns: list[ShellTurn] = []
+    pending_reused_shell_output = (
+        reused_shell_turn.shell_output
+        if resume_reused_shell_turn and reused_shell_turn is not None
+        else None
+    )
 
     def request_shell_revision(
         revision_task: str,
@@ -6804,7 +7064,9 @@ def main() -> int:
                 if removed_turn.commands:
                     archived_shell_turns.append(removed_turn)
                 continue
-
+            if archived_shell_turns:
+                archived_shell_turns.pop(0)
+                continue
             current_turn = shell_turn_history[-1]
             current_output_token_count = len(
                 token_encoding_for_model(model).encode(current_turn.output)
@@ -6970,23 +7232,45 @@ def main() -> int:
                     f"ERROR: Failed to write output to file {args.output_file}: {exc}",
                     file=sys.stderr,
                 )
-                print(output_str)
+                if not suppress_response_output:
+                    print(output_str)
                 return 1
-        else:
+        elif not suppress_response_output:
             print(output_str)
-        if args.noninteractive:
-            print(f"state_session_name={state_session_dir.name}")
         return 0
 
     if shell_mode:
         try:
-            shell_steps = parse_shell_manifest(str(result or ''))
+            if resume_reused_shell_turn:
+                shell_steps, reused_session_end_reason = (
+                    parse_reused_shell_response(str(result or ''))
+                )
+                if reused_session_end_reason is not None:
+                    return finish_shell_response(
+                        reused_session_end_reason,
+                        reasoning,
+                    )
+                if shell_steps is None:
+                    raise ValueError("reused shell turn returned no commands")
+            else:
+                shell_steps = parse_shell_manifest(str(result or ''))
         except Exception as exc:
             print(f'ERROR: Failed to parse shell command manifest: {exc}', file=sys.stderr)
             return 1
+        shell_response_reasoning = reasoning
+        pending_shell_revision_task = reuse_session_revision_task
         while True:
-            review_action, revision_task = review_shell_commands(shell_steps)
+            if pending_shell_revision_task is not None:
+                review_action = 'edit'
+                revision_task = pending_shell_revision_task
+                pending_shell_revision_task = None
+            else:
+                review_action, revision_task = review_shell_commands(
+                    shell_steps,
+                    accept_noninteractive=resume_reused_shell_turn,
+                )
             if review_action == 'edit':
+                pending_reused_shell_output = None
                 if revision_task is None:
                     try:
                         edited_text = edit_text(
@@ -7011,7 +7295,7 @@ def main() -> int:
                     prompt_expansion_enabled,
                 )
                 try:
-                    result, _, statsline = request_shell_revision(
+                    result, shell_response_reasoning, statsline = request_shell_revision(
                         revision_task,
                         shell_steps,
                     )
@@ -7030,24 +7314,43 @@ def main() -> int:
                     )
                     return 1
                 continue
+            if review_action == 'save':
+                return finish_shell_response(
+                    str(result or ''),
+                    shell_response_reasoning,
+                )
             if review_action != 'accept':
                 if VERBOSE:
                     print('Aborted.', file=sys.stderr)
                 return 0
-            shell_output = execute_shell_commands(shell_steps, llm_timeout)
-            if state_turn_path is not None:
-                try:
-                    write_state_shell_output(state_turn_path, shell_output)
-                except Exception as exc:
-                    print(f"ERROR: Failed to save shell output: {exc}", file=sys.stderr)
-                    return 1
+            shell_output_is_new = pending_reused_shell_output is None
+            if shell_output_is_new:
+                shell_output = execute_shell_commands(shell_steps, llm_timeout)
+                if state_turn_path is not None:
+                    try:
+                        write_state_shell_output(state_turn_path, shell_output)
+                    except Exception as exc:
+                        print(f"ERROR: Failed to save shell output: {exc}", file=sys.stderr)
+                        return 1
+            else:
+                shell_output = pending_reused_shell_output
+                pending_reused_shell_output = None
+
             if VERBOSE:
                 print("<shell_execution>", file=sys.stderr)
                 print(shell_output, file=sys.stderr)
                 print("</shell_execution>", file=sys.stderr)
-            append_log(
-                f"<shell_output>\n{shell_output}\n</shell_output>\n"
-            )
+            if (
+                reuse_session_name is not None
+                and (
+                    not resume_reused_shell_turn
+                    or complete_reused_shell_turn_after_execution
+                )
+            ):
+                return finish_shell_response(
+                    "Shell command turn completed.",
+                    shell_response_reasoning,
+                )
             try:
                 result, followup_reasoning = request_shell_followup(
                     shell_output,
@@ -7222,6 +7525,40 @@ def main() -> int:
         ]
         patch_state_turn_history: list[Path | None] = [state_turn_path]
         patch_turn_index = 0
+        pending_patch_revision_task = reuse_session_revision_task
+
+        def request_patch_revision(revision_task: str) -> None:
+            nonlocal task, result, statsline, response_obj, usage
+            nonlocal json_patch_task, json_patch_responses, patch_turn_index
+
+            if VERBOSE:
+                print(statsline, file=sys.stderr)
+            json_patch_task = task
+            task = expand_prompt_names(
+                revision_task, prompt_expansion_enabled
+            )
+            json_patch_responses = [result]
+            revision_user_prompt = build_user_prompt(
+                task=task,
+                context=context,
+                response_format=response_format,
+                json_schema=json_schema,
+                json_patch_responses=json_patch_responses,
+                json_patch_task=json_patch_task,
+                include_task=not system_prompt_with_task,
+            )
+            revision_user_prompt = (
+                revision_user_prompt + '\n' + patch_system_prompt
+            )
+            result, statsline, response_obj, usage = (
+                call_patch_revision_request(revision_user_prompt)
+            )
+            del patch_turn_history[patch_turn_index + 1:]
+            del patch_state_turn_history[patch_turn_index + 1:]
+            patch_turn_history.append((task, str(result or ""), statsline))
+            patch_state_turn_history.append(state_turn_path)
+            patch_turn_index += 1
+
         while True:
             try:
                 if not result or not result.strip():
@@ -7286,12 +7623,20 @@ def main() -> int:
                     )
                     return 1
 
+            if pending_patch_revision_task is not None:
+                revision_task = pending_patch_revision_task
+                pending_patch_revision_task = None
+                try:
+                    request_patch_revision(revision_task)
+                except Exception as exc:
+                    print(f'API error: {exc}', file=sys.stderr)
+                    return 1
+                continue
+
             if not changed_items:
                 if VERBOSE:
                     print('No changes.', file=sys.stderr)
                     print(statsline, file=sys.stderr)
-                if args.noninteractive:
-                    print(f'state_session_name={state_session_dir.name}')
                 return 0
             if patch_save_path is not None:
                 try:
@@ -7310,7 +7655,6 @@ def main() -> int:
                 if args.noninteractive:
                     if VERBOSE:
                         print(statsline, file=sys.stderr)
-                    print(f'state_session_name={state_session_dir.name}')
                     return 0
             if VERBOSE or patch_review:
                 print()
@@ -7395,33 +7739,11 @@ def main() -> int:
                         print(statsline, file=sys.stderr)
                     return 0
                 if revision_task is not None and patch_choice not in ('y', 'yes'):
-                    if VERBOSE:
-                        print(statsline, file=sys.stderr)
-                    json_patch_task = task
-                    task = expand_prompt_names(
-                        revision_task, prompt_expansion_enabled
-                    )
-                    json_patch_responses = [result]
-                    user_prompt = build_user_prompt(
-                        task=task,
-                        context=context,
-                        response_format=response_format,
-                        json_schema=json_schema,
-                        json_patch_responses=json_patch_responses,
-                        json_patch_task=json_patch_task,
-                        include_task=not system_prompt_with_task,
-                    )
-                    user_prompt = user_prompt + '\n' + patch_system_prompt
                     try:
-                        (result, statsline, response_obj, usage) = call_patch_revision_request(user_prompt)
+                        request_patch_revision(revision_task)
                     except Exception as exc:
                         print(f'API error: {exc}', file=sys.stderr)
                         return 1
-                    patch_turn_history = patch_turn_history[:patch_turn_index + 1]
-                    patch_state_turn_history = patch_state_turn_history[:patch_turn_index + 1]
-                    patch_turn_history.append((task, str(result or ""), statsline))
-                    patch_state_turn_history.append(state_turn_path)
-                    patch_turn_index += 1
                     continue
 
             try:
@@ -7485,14 +7807,15 @@ def main() -> int:
                 args.output_file.write_text(output_str, encoding="utf-8")
             except Exception as exc:
                 print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
-                print(output_str)
+                if not suppress_response_output:
+                    print(output_str)
                 if VERBOSE:
                     print(statsline, file=sys.stderr)
                 return 1
     elif stream_output_emitted:
         if not result or not result.endswith("\n"):
             print()
-    else:
+    elif not suppress_response_output:
         print(output_str)
 
     if VERBOSE:
@@ -7511,11 +7834,12 @@ def main() -> int:
 # -------------------------------------------------------------------
 
 rv = 0
+err = None
 try:
     rv = main()
 except KeyboardInterrupt:
     rv = 130
-    print(f"\nStopped.", file=sys.stderr)
+    err = "\nStopped."
 except SystemExit as exc:
     if exc.code is None:
         rv = 0
@@ -7525,11 +7849,17 @@ except SystemExit as exc:
         rv = 1
 except Exception as e:
     rv = 1
-    print(e, file=sys.stderr)
+    err = e
+#    import traceback
+#    traceback.print_exc()
 finally:
     if SESSION_NAME is not None:
         if VERBOSE and not NONINTERACTIVE:
             print(f"session_name={SESSION_NAME}", file=sys.stderr)
         elif NONINTERACTIVE:
-            print(f"session_name={SESSION_NAME}")
+            print(f"{SESSION_NAME}")
+
+    if err is not None:
+        print(f"{err}", file=sys.stderr)
     sys.exit(rv)
+

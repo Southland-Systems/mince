@@ -253,6 +253,24 @@ class OfflineTests:
             )
         return completed
 
+    def shell_session_response(self, session_name: str) -> dict[str, Any]:
+        result = self.run(
+            "--shell-session-print-json",
+            session_name,
+        )
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TestFailure(
+                "shell session JSON response could not be decoded: "
+                f"{exc}"
+            ) from exc
+        require(
+            isinstance(response, dict),
+            "shell session JSON response was not an object",
+        )
+        return response
+
     def test_default_config(self) -> None:
         result = self.run("--print-default-config")
         config = json.loads(result.stdout)
@@ -381,11 +399,10 @@ class OfflineTests:
             any("1 alpha" in value for value in request_inputs),
             "tree request omitted numbered file context",
         )
-        session_name = re_search(
-            r"tree_session_name=(\S+)",
-            result.stdout,
+        session_name = session_name_from_result(
+            result,
+            noninteractive=False,
         )
-        require(session_name is not None, "tree session name was not printed")
         combined = (
             self.home / ".local/state/mince/trees" / session_name
             / f"{session_name}.md"
@@ -608,6 +625,73 @@ class OfflineTests:
             mock.requests[0].get("stream") is True,
             "streaming was not requested from the API",
         )
+
+    def test_streaming_text_response_to_output_file(self) -> None:
+        output_file = self.work / "streamed-output.txt"
+        with MockResponsesAPI(["offline streamed file response"]) as mock:
+            result = self.run(
+                "--ask",
+                "Stream the offline response to a file.",
+                "--stream",
+                "--output-file",
+                output_file,
+                "--model",
+                "offline-test-model",
+                "--base-url",
+                mock.url,
+                "--log",
+                "off",
+                "--no-api-log",
+            )
+        require(
+            result.stdout == "",
+            "streamed output was unexpectedly also written to stdout",
+        )
+        require(
+            output_file.read_text(encoding="utf-8")
+            == "offline streamed file response",
+            "streamed response text was not written correctly to the output file",
+        )
+        require(len(mock.requests) == 1, "expected one streaming request")
+        require(
+            mock.requests[0].get("stream") is True,
+            "streaming was not requested for the output file response",
+        )
+
+    def test_streaming_from_configuration(self) -> None:
+        profile_name = "streaming"
+        self.run(
+            "--profile",
+            profile_name,
+            "--set-config",
+            "stream=on",
+        )
+        try:
+            with MockResponsesAPI(["offline configured streamed response"]) as mock:
+                result = self.run(
+                    "--profile",
+                    profile_name,
+                    "--ask",
+                    "Stream the configured offline response.",
+                    "--model",
+                    "offline-test-model",
+                    "--base-url",
+                    mock.url,
+                    "--log",
+                    "off",
+                    "--no-api-log",
+                )
+            require(
+                result.stdout == "offline configured streamed response\n",
+                "configured streamed response text was not emitted correctly",
+            )
+            require(
+                len(mock.requests) == 1
+                and mock.requests[0].get("stream") is True,
+                "configured streaming was not requested from the API",
+            )
+        finally:
+            self.run("--remove-profile", profile_name)
 
     @staticmethod
     def _patch_file_entry(
@@ -1085,13 +1169,9 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
-            session_name = re_search(
-                r"state_session_name=(\S+)",
-                initial.stdout,
-            )
-            require(
-                session_name is not None,
-                "initial patch did not report its state session",
+            session_name = session_name_from_result(
+                initial,
+                noninteractive=True,
             )
             target.write_text("changed\n", encoding="utf-8")
             failed = self.run(
@@ -1160,9 +1240,16 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
+        session_name = session_name_from_result(
+            result,
+            noninteractive=True,
+        )
+        shell_response = self.shell_session_response(session_name)
         require(
-            "Offline shell session completed" in result.stdout,
-            "shell session reason was not printed",
+            shell_response.get("action") == "session_end"
+            and shell_response.get("reason")
+            == "Offline shell session completed",
+            "shell session completion reason was not saved",
         )
         require(
             len(mock.requests) == 2,
@@ -1177,14 +1264,9 @@ class OfflineTests:
             "offline-shell" in followup_input,
             "script output was not sent to follow-up",
         )
-        state_match = re_search(
-            r"state_session_name=(\S+)",
-            result.stdout,
-        )
-        require(state_match is not None, "shell state session name was not printed")
         state = self.run(
             "--state-print-json",
-            state_match,
+            session_name,
             "0",
             "response_shell_output",
         )
@@ -1241,9 +1323,16 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
+        session_name = session_name_from_result(
+            result,
+            noninteractive=True,
+        )
+        shell_response = self.shell_session_response(session_name)
         require(
-            "Shell failure output was inspected" in result.stdout,
-            "shell follow-up session did not finish",
+            shell_response.get("action") == "session_end"
+            and shell_response.get("reason")
+            == "Shell failure output was inspected",
+            "shell follow-up completion reason was not saved",
         )
         require(len(mock.requests) == 3, "expected three shell API requests")
         followup_input = str(mock.requests[2].get("input", ""))
@@ -1292,9 +1381,16 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
+        session_name = session_name_from_result(
+            result,
+            noninteractive=True,
+        )
+        shell_response = self.shell_session_response(session_name)
         require(
-            "Shell timeout output was inspected" in result.stdout,
-            "shell timeout session did not finish",
+            shell_response.get("action") == "session_end"
+            and shell_response.get("reason")
+            == "Shell timeout output was inspected",
+            "shell timeout completion reason was not saved",
         )
         require(len(mock.requests) == 2, "expected initial and follow-up requests")
         followup_input = str(mock.requests[1].get("input", ""))
@@ -1684,23 +1780,6 @@ class OfflineTests:
                     "reason": "First shell session completed",
                 }
             },
-            {
-                "output": {
-                    "commands": [
-                        {
-                            "command": "printf second-shell",
-                            "reason": "Produce the reused shell output",
-                        }
-                    ]
-                }
-            },
-            {
-                "output": {
-                    "action": "session_end",
-                    "commands": [],
-                    "reason": "Reused shell session completed",
-                }
-            },
         ]
         with MockResponsesAPI(responses) as mock:
             first = self.run(
@@ -1716,16 +1795,12 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
-            session_name = re_search(
-                r"state_session_name=(\S+)",
-                first.stdout,
+            session_name = session_name_from_result(
+                first,
+                noninteractive=True,
             )
-            require(session_name is not None, "initial shell session name was not printed")
             second = self.run(
-                "--task",
-                "Run the reused offline shell session.",
                 "--shell",
-                "--shell-confirm",
                 "--reuse-session",
                 session_name,
                 "--noninteractive",
@@ -1737,26 +1812,34 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
-        require(
-            "Reused shell session completed" in second.stdout,
-            "reused shell session did not finish",
+        reused_session_name = session_name_from_result(
+            second,
+            noninteractive=True,
         )
-        require(len(mock.requests) == 4, "expected two requests per shell session")
-        reused_input = str(mock.requests[2].get("input", ""))
         require(
-            "<previous_turn>" in reused_input
-            and "First shell session completed" in reused_input,
-            "completed shell history was not included in the reused request",
+            reused_session_name == session_name,
+            "reused shell session reported a different session name",
+        )
+        shell_response = self.shell_session_response(session_name)
+        require(
+            shell_response.get("action") == "session_end"
+            and shell_response.get("reason")
+            == "First shell session completed",
+            "completed shell session reason was not retained",
+        )
+        require(
+            len(mock.requests) == 2,
+            "reusing a completed shell session made an unexpected API request",
         )
         state = self.run(
             "--state-print-json",
             session_name,
-            "2",
+            "0",
             "response_shell_output",
         )
         require(
-            "second-shell" in state.stdout,
-            "reused shell output was not saved in state",
+            "first-shell" in state.stdout,
+            "original shell output was not retained for session reuse",
         )
 
     def test_patch_branch_merge_and_remove(self) -> None:
@@ -1831,6 +1914,33 @@ def re_search(pattern: str, text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def session_name_from_result(
+    result: subprocess.CompletedProcess[str],
+    *,
+    noninteractive: bool,
+ ) -> str:
+    if noninteractive:
+        session_name = re_search(
+            r"(?m)^([^=\s]+)$",
+            result.stdout,
+        )
+    else:
+        session_name = re_search(
+            r"(?m)^session_name=(\S+)$",
+            result.stderr,
+        )
+    expected_output = (
+        "a plain session name"
+        if noninteractive
+        else "session_name=SESSION"
+    )
+    require(
+        session_name is not None,
+        f"{expected_output} was not printed",
+    )
+    return str(session_name)
+
+
 def main() -> int:
     tests = [
         ("prints the built-in configuration offline", "test_default_config"),
@@ -1848,6 +1958,8 @@ def main() -> int:
         ("reviews patches interactively without a suffix", "test_patch_review_without_suffix"),
         ("handles text and JSON responses from a local API", "test_text_and_json_api_responses"),
         ("handles streamed text responses", "test_streaming_text_response"),
+        ("streams text responses to an output file", "test_streaming_text_response_to_output_file"),
+        ("enables text streaming from configuration", "test_streaming_from_configuration"),
         ("preserves prompt placement and line-number overrides", "test_prompt_placement_and_line_number_override"),
         ("handles custom JSON-schema responses", "test_custom_schema_response"),
         ("validates and writes an API patch response", "test_api_patch"),
@@ -1857,7 +1969,7 @@ def main() -> int:
         ("executes shell scripts and saves state offline", "test_shell_script_and_state"),
         ("handles shell follow-up commands and failures", "test_shell_followup_commands_and_failures"),
         ("reports shell command timeouts", "test_shell_timeout_is_reported"),
-        ("reuses completed shell sessions with confirmation", "test_successful_shell_session_reuse"),
+        ("reuses completed shell sessions without an extra request", "test_successful_shell_session_reuse"),
         ("writes and commits patch changes on a git branch", "test_patch_branch_writes_and_commits"),
         ("merges and removes patch branches", "test_patch_branch_merge_and_remove"),
     ]
