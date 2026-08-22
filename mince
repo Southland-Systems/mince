@@ -1193,9 +1193,10 @@ def handle_prompt_print(
 
 def handle_prompt_assign(
     values: list[str],
+    profile: str,
     assignment_mode: str = "prepend",
 ) -> int:
-    name, profile, prompt_type = values
+    name, prompt_type = values
     try:
         prompt_path = prompt_file_path(name)
         if not prompt_path.is_file():
@@ -1208,6 +1209,11 @@ def handle_prompt_assign(
         config = read_config_document(profile_path, missing_ok=True)
         prompt_reference = f"./{prompt_path.name}"
         existing = config.get(config_key)
+        if (
+            config_key not in config
+            and _inherit_profile_name(config, profile_path) is not None
+        ):
+            existing = merged_config(profile_path).get(config_key)
         if assignment_mode == "string":
             config[config_key] = prompt_path.read_text(
                 encoding="utf-8"
@@ -1243,22 +1249,25 @@ def handle_prompt_assign(
     return 0
 
 
-def handle_prompt_unassign(values: list[str]) -> int:
-    if len(values) not in (2, 3):
+def handle_prompt_unassign(
+    values: list[str],
+    profile: str,
+) -> int:
+    if len(values) not in (1, 2):
         print(
-            "ERROR: --prompt-unassign requires NAME PROFILE and optional TYPE",
+            "ERROR: --prompt-unassign requires NAME and optional TYPE",
             file=sys.stderr,
         )
         return 1
-    name, profile = values[:2]
+    name = values[0]
     try:
         prompt_path = prompt_file_path(name)
         profile = validate_prompt_profile_name(profile)
         profile_path = get_profile_path(profile)
         config = read_config_document(profile_path)
         keys = (
-            (prompt_type_key(values[2]),)
-            if len(values) == 3
+            (prompt_type_key(values[1]),)
+            if len(values) == 2
             else PROMPT_CONFIG_KEYS
         )
         changed = unassign_prompt_from_config(config, prompt_path, keys)
@@ -5057,31 +5066,30 @@ def parse_args() -> argparse.Namespace:
 
     profile_action_group.add_argument(
         "--prompt-assign",
-        nargs=3,
-        metavar=("NAME", "PROFILE", "TYPE"),
-        help="Add prompt NAME to PROFILE prompt TYPE (types: system, linenum, patch, plan, shell)",
+        nargs=2,
+        metavar=("NAME", "TYPE"),
+        help="Add prompt NAME to the current profile prompt TYPE (types: system, linenum, patch, plan, shell)",
     )
 
     profile_action_group.add_argument(
         "--prompt-assign-text",
-        nargs=3,
-        metavar=("NAME", "PROFILE", "TYPE"),
-        help="Replace PROFILE prompt TYPE with text content of prompt NAME",
+        nargs=2,
+        metavar=("NAME", "TYPE"),
+        help="Replace the current profile prompt TYPE with text content of prompt NAME",
     )
 
     profile_action_group.add_argument(
         "--prompt-assign-replace",
-        nargs=3,
-        metavar=("NAME", "PROFILE", "TYPE"),
-        help="Replace PROFILE prompt TYPE with prompt NAME",
+        nargs=2,
+        metavar=("NAME", "TYPE"),
+        help="Replace the current profile prompt TYPE with prompt NAME",
     )
 
     profile_action_group.add_argument(
         "--prompt-unassign",
         nargs="+",
-        metavar=("NAME PROFILE", "TYPE"),
-        help="Remove prompt NAME from PROFILE with optional prompt TYPE",
-
+        metavar=("NAME", "TYPE"),
+        help="Remove prompt NAME from the current profile with optional prompt TYPE",
     )
 
     profile_action_group.add_argument(
@@ -5461,6 +5469,8 @@ def main() -> int:
         init_config_interactive()
         return 0
 
+    base_profile = args.profile or "config"
+
     if args.prompt_list:
         return handle_prompt_list()
     if args.prompt_print_json is not None:
@@ -5470,17 +5480,19 @@ def main() -> int:
     if args.prompt_edit is not None:
         return handle_prompt_edit(args.prompt_edit)
     if args.prompt_assign is not None:
-        return handle_prompt_assign(args.prompt_assign)
+        return handle_prompt_assign(args.prompt_assign, base_profile)
     if args.prompt_assign_text is not None:
-        return handle_prompt_assign(args.prompt_assign_text, "string")
+        return handle_prompt_assign(
+            args.prompt_assign_text, base_profile, "string"
+        )
     if args.prompt_assign_replace is not None:
-        return handle_prompt_assign(args.prompt_assign_replace, "replace")
+        return handle_prompt_assign(
+            args.prompt_assign_replace, base_profile, "replace"
+        )
     if args.prompt_unassign is not None:
-        return handle_prompt_unassign(args.prompt_unassign)
+        return handle_prompt_unassign(args.prompt_unassign, base_profile)
     if args.prompt_remove is not None:
         return handle_prompt_remove(args.prompt_remove)
-
-    base_profile = args.profile or "config"
 
     if not base_profile.isidentifier():
         print(f"ERROR: Invalid profile name '{base_profile}'.", file=sys.stderr)
