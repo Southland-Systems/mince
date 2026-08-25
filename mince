@@ -81,8 +81,22 @@ DEFAULT_SHELL_SYSTEM_PROMPT = (
     "order. Commands are reviewed before execution. After command output, use "
     "action=commands for more work or action=session_end with an empty commands "
     "array and a non-empty reason that completes the session."
+)
+DEFAULT_AGENT_SYSTEM_PROMPT = (
+    "Run an agent session using the provided controller tools. Every "
+    "controller response must call exactly one tool and must not answer with "
+    "plain text. Available tools are `patch`, `shell`, `agent`, `session`, "
+    "and `context`. `patch` directly accepts the `line_replace_manifest` "
+    "arguments used by --patch, and `shell` directly accepts the "
+    "`shell_commands` arguments used by --shell; do not delegate either to "
+    "a separate worker. `agent` starts the next controller turn with a "
+    "non-empty task and optional context; use it instead of a no-op "
+    "continuation. `session` uses action=end with a non-empty reason to "
+    "complete the session. `context` uses action=pin with a visible file path "
+    "or prior agent turn such as `turn:2` to retain context. Use a non-empty "
+    "task for `agent`; include context only when useful. Do not duplicate "
+    "work, and call `patch` or `shell` directly for file changes or commands."
  )
-
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.6-luna",
     "api_key": "",
@@ -528,7 +542,8 @@ STATE_TURN_ARTIFACTS = (
     "response_diff_patch",
     "response_schema_patch_applied",
     "response_shell_output",
- )
+    "response_agent_tool_output",
+)
 STATE_ARTIFACT_TYPES = (
     STATE_SESSION_ARTIFACT,
     *STATE_TURN_ARTIFACTS,
@@ -982,9 +997,18 @@ def write_state_shell_output(
         output,
         encoding="utf-8",
     )
+
+def write_state_agent_tool_output(
+    turn_dir: Path,
+    output: str,
+ ) -> None:
+    (turn_dir / "response_agent_tool_output").write_text(
+        output,
+        encoding="utf-8",
+    )
+
 def prompt_file_path(name: str) -> Path:
     return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
-
 
 def validate_prompt_profile_name(name: str) -> str:
     name = name.strip()
@@ -1472,10 +1496,10 @@ def format_log_settings(
     return (
         "<settings>\n"
         f"<configuration path=\"{CONFIG_FILE}\">\n"
-        f"{json.dumps(logged_config, separators=(", ", ": "), ensure_ascii=False, default=str)}\n"
+        f"{json.dumps(logged_config, separators=(', ', ': '), ensure_ascii=False, default=str)}\n"
         "</configuration>\n"
         "<arguments>\n"
-        f"{json.dumps(vars(args), separators=(", ", ": "), ensure_ascii=False, default=str)}\n"
+        f"{json.dumps(vars(args), separators=(', ', ': '), ensure_ascii=False, default=str)}\n"
         "</arguments>\n"
         "</settings>\n"
     )
@@ -3030,10 +3054,24 @@ def token_encoding_for_model(model: str) -> Any:
     except Exception:
         return tiktoken.get_encoding("o200k_base")
 
-def estimate_request_tokens(model: str, system_prompt: str, user_prompt: str) -> int:
+def estimate_request_tokens(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
     encoding = token_encoding_for_model(model)
 
     request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+    if tools:
+        request_text += (
+            "\n\nTOOLS:\n"
+            + json.dumps(
+                tools,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     return len(encoding.encode(request_text))
 
 def truncate_text_to_tokens(text: str, model: str, max_tokens: int) -> str:
@@ -3366,36 +3404,42 @@ def read_files_list(
             files.append(line)
     return files
 
-def build_context(
+def build_context_sections(
     file_paths: list[Path],
     max_file_size_kb: int,
     add_line_numbers: bool = True,
     stdin_content: str | None = None,
-) -> str:
-    sections = []
+) -> list[tuple[str, str]]:
+    sections: list[tuple[str, str]] = []
     max_bytes = max_file_size_kb * 1024
 
     for path in file_paths:
         context_path = "/proc/self/stdin" if path == Path("-") else str(path)
         if path == Path("-"):
             if stdin_content is None:
-                sections.append(f"[MISSING FILE: {context_path}]")
+                sections.append((context_path, f"[MISSING FILE: {context_path}]"))
                 continue
             stdin_size = len(stdin_content.encode("utf-8"))
             if stdin_size > max_bytes:
                 sections.append(
-                    f"[SKIPPED LARGE FILE: {context_path} ({stdin_size} bytes)]"
+                    (
+                        context_path,
+                        f"[SKIPPED LARGE FILE: {context_path} ({stdin_size} bytes)]",
+                    )
                 )
                 continue
             content = stdin_content
         else:
             if not path.exists():
-                sections.append(f"[MISSING FILE: {context_path}]")
+                sections.append((context_path, f"[MISSING FILE: {context_path}]"))
                 continue
 
             if path.stat().st_size > max_bytes:
                 sections.append(
-                    f"[SKIPPED LARGE FILE: {context_path} ({path.stat().st_size} bytes)]"
+                    (
+                        context_path,
+                        f"[SKIPPED LARGE FILE: {context_path} ({path.stat().st_size} bytes)]",
+                    )
                 )
                 continue
 
@@ -3412,14 +3456,32 @@ def build_context(
             if numbered_content.endswith(("\r", "\n"))
             else "\n"
         )
-        sections.append(
+        section = (
             f"<file path='{context_path}' encoding='utf-8' "
             f"line_ending='{content_line_ending}' "
             f"total_lines='{content_total_lines}'>\n"
-            f"{numbered_content}{context_ending}</file>".strip()
-        )
+            f"{numbered_content}{context_ending}</file>"
+        ).strip()
+        sections.append((context_path, section))
 
-    return "\n".join(sections)
+    return sections
+
+
+def build_context(
+    file_paths: list[Path],
+    max_file_size_kb: int,
+    add_line_numbers: bool = True,
+    stdin_content: str | None = None,
+) -> str:
+    return "\n".join(
+        section
+        for _, section in build_context_sections(
+            file_paths=file_paths,
+            max_file_size_kb=max_file_size_kb,
+            add_line_numbers=add_line_numbers,
+            stdin_content=stdin_content,
+        )
+    )
 
 
 
@@ -3532,6 +3594,1193 @@ def build_user_prompt(
 {schema_block}{json_patch_block}{additional_prompt_block}
 """.strip()
 
+AGENT_TOOL_NAMES = (
+    "patch",
+    "shell",
+    "agent",
+    "session",
+    "context",
+)
+AGENT_PATCH_TOOL = "patch"
+AGENT_SHELL_TOOL = "shell"
+AGENT_AGENT_TOOL = "agent"
+AGENT_SESSION_TOOL = "session"
+AGENT_CONTEXT_TOOL = "context"
+
+AGENT_AGENT_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task": {"type": "string", "minLength": 1},
+        "context": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["task", "context", "reason"],
+}
+AGENT_SESSION_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["end"]},
+        "reason": {"type": "string", "minLength": 1},
+    },
+    "required": ["action", "reason"],
+}
+AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["pin"]},
+        "context_id": {"type": "string", "minLength": 1},
+        "reason": {"type": "string"},
+    },
+    "required": ["action", "context_id", "reason"],
+}
+AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    AGENT_PATCH_TOOL: PATCH_MANIFEST_SCHEMA["schema"],
+    AGENT_SHELL_TOOL: SHELL_COMMAND_SCHEMA["schema"],
+    AGENT_AGENT_TOOL: AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
+    AGENT_SESSION_TOOL: AGENT_SESSION_CALL_ARGUMENT_SCHEMA,
+    AGENT_CONTEXT_TOOL: AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA,
+}
+AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
+    AGENT_PATCH_TOOL: (
+        "Apply a file modification manifest. Arguments must match the "
+        "line_replace_manifest schema used by --patch."
+    ),
+    AGENT_SHELL_TOOL: (
+        "Generate commands for review and execution. Arguments must match "
+        "the shell_commands schema used by --shell."
+    ),
+    AGENT_AGENT_TOOL: (
+        "Start the next controller turn with a new non-empty task and optional "
+        "context."
+    ),
+    AGENT_SESSION_TOOL: (
+        "End the agent session with a non-empty reason that completes the task."
+    ),
+    AGENT_CONTEXT_TOOL: (
+        "Pin a currently visible file or prior agent turn so it remains in the "
+        "controller context window."
+    ),
+}
+AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": tool,
+        "description": AGENT_TOOL_DESCRIPTIONS[tool],
+        "parameters": argument_schema,
+        "strict": True,
+    }
+    for tool, argument_schema in AGENT_TOOL_ARGUMENT_SCHEMAS.items()
+ ]
+ 
+AGENT_TOOL_ARGUMENT_FIELDS: dict[str, frozenset[str]] = {
+    tool: frozenset(argument_schema["properties"])
+    for tool, argument_schema in AGENT_TOOL_ARGUMENT_SCHEMAS.items()
+}
+ 
+ 
+@dataclass(frozen=True)
+class AgentToolCall:
+    tool: str
+    reason: str = ""
+    task: str = ""
+    context: str = ""
+    context_id: str = ""
+    action: str = ""
+    arguments: dict[str, Any] | None = None
+ 
+    def as_dict(self) -> dict[str, Any]:
+        if self.arguments is not None:
+            return {"tool": self.tool, **self.arguments}
+        value: dict[str, Any] = {"tool": self.tool}
+        for name in AGENT_TOOL_ARGUMENT_SCHEMAS[self.tool]["properties"]:
+            value[name] = getattr(self, name)
+        return value
+ 
+ 
+@dataclass(frozen=True)
+class AgentTurn:
+    task: str
+    context: str
+    tool_call: AgentToolCall
+    output: str
+ 
+ 
+@dataclass(frozen=True)
+class AgentToolExecution:
+    output: str
+    revision_instruction: str | None = None
+ 
+ 
+@dataclass(frozen=True)
+class AgentModelSettings:
+    model: str
+    api_key: str
+    openai_base_url: str
+    openai_proxy: str
+    openai_organization: str
+    openai_project: str
+    response_verbosity: str
+    temperature: float | None
+    top_p: float | None
+    max_output_tokens: int
+    openai_service_tier: str
+    openai_reasoning: str | None
+    reasoning_mode: str
+    extra_body: dict[str, Any]
+    llm_timeout: int
+    safety_identifier: Any
+    api_log: bool
+ 
+ 
+@dataclass
+class AgentRunSettings:
+    model_settings: AgentModelSettings
+    token_limit: int
+    token_cost: tuple[float, float] | None
+    state_session_dir: Path
+    state_turn: int
+    file_paths: list[Path]
+    log_enabled: bool
+    log_path: Path | None
+    task: str
+    context: str
+    context_sections: list[tuple[str, str]] | None
+    agent_system_prompt: str
+    worker_system_prompt: str
+    linenum_system_prompt: str
+    shell_system_prompt: str
+    patch_system_prompt: str
+    system_prompt_with_task: bool
+    add_line_numbers: bool
+    max_file_size_kb: int
+    patch_suffix: str
+    suffix_provided: bool
+    patch_review: bool
+    agent_auto: bool
+    output_file: Path | None
+    print_reasoning: bool
+    suppress_response_output: bool
+
+
+@dataclass(frozen=True)
+class AgentModelResult:
+    response: str
+    reasoning: str
+    statsline: str
+    turn_dir: Path
+    tool_calls: tuple[AgentToolCall, ...] = ()
+
+
+def parse_agent_tool_arguments(
+    tool: str,
+    value: Any,
+) -> AgentToolCall:
+    if tool not in AGENT_TOOL_NAMES:
+        raise ValueError(f"unknown agent tool: {tool}")
+    if not isinstance(value, dict):
+        raise ValueError(f"agent {tool} arguments must be a JSON object")
+ 
+    if tool == AGENT_PATCH_TOOL:
+        if set(value) != {"files", "commit_message"}:
+            raise ValueError(
+                "agent patch arguments must contain only files and "
+                "commit_message"
+            )
+        if not isinstance(value["files"], list) or not value["files"]:
+            raise ValueError(
+                "agent patch arguments require a non-empty files array"
+            )
+        commit_message = value["commit_message"]
+        if (
+            not isinstance(commit_message, str)
+            or not commit_message.strip()
+        ):
+            raise ValueError(
+                "agent patch arguments require a non-empty commit_message"
+            )
+        return AgentToolCall(tool=tool, arguments=value)
+ 
+    if tool == AGENT_SHELL_TOOL:
+        try:
+            _parse_shell_manifest_value(value)
+        except ValueError as exc:
+            raise ValueError(f"agent shell arguments are invalid: {exc}") from exc
+        return AgentToolCall(tool=tool, arguments=value)
+ 
+    expected_fields = set(AGENT_TOOL_ARGUMENT_FIELDS[tool])
+    actual_fields = set(value)
+    if actual_fields != expected_fields:
+        missing_fields = sorted(expected_fields - actual_fields)
+        unexpected_fields = sorted(actual_fields - expected_fields)
+        details: list[str] = []
+        if missing_fields:
+            details.append("missing " + ", ".join(missing_fields))
+        if unexpected_fields:
+            details.append("unexpected " + ", ".join(unexpected_fields))
+        raise ValueError(
+            f"agent {tool} arguments must contain exactly the tool schema "
+            "fields (" + "; ".join(details) + ")"
+        )
+    for name in expected_fields:
+        if not isinstance(value[name], str):
+            raise ValueError(f"agent {tool} field {name} must be a string")
+ 
+    tool_call = AgentToolCall(
+        tool=tool,
+        reason=value.get("reason", "").strip(),
+        task=value.get("task", "").strip(),
+        context=value.get("context", "").strip(),
+        context_id=value.get("context_id", "").strip(),
+        action=value.get("action", "").strip(),
+    )
+    if tool == AGENT_AGENT_TOOL:
+        if not tool_call.task:
+            raise ValueError("agent agent tool requires a non-empty task")
+    elif tool == AGENT_SESSION_TOOL:
+        if tool_call.action != "end":
+            raise ValueError("agent session tool requires action=end")
+        if not tool_call.reason:
+            raise ValueError("agent session tool requires a non-empty reason")
+    elif tool == AGENT_CONTEXT_TOOL:
+        if tool_call.action != "pin":
+            raise ValueError("agent context tool requires action=pin")
+        if not tool_call.context_id:
+            raise ValueError(
+                "agent context tool requires a non-empty context_id"
+            )
+    return tool_call
+
+
+def normalize_agent_tool_calls(
+    tool_calls: list[AgentToolCall],
+) -> list[AgentToolCall]:
+    if len(tool_calls) != 1:
+        raise ValueError("agent responses require exactly one tool call")
+    return tool_calls
+
+
+def response_agent_tool_calls(response_obj: Any) -> list[AgentToolCall]:
+    output_text = str(getattr(response_obj, "output_text", "") or "")
+    if output_text.strip():
+        raise ValueError(
+            "agent controller response must contain only a tool call"
+        )
+    output_items = (
+        response_obj.get("output", [])
+        if isinstance(response_obj, dict)
+        else getattr(response_obj, "output", [])
+    )
+    tool_calls: list[AgentToolCall] = []
+    for item in output_items:
+        item_type = (
+            item.get("type")
+            if isinstance(item, dict)
+            else getattr(item, "type", None)
+        )
+        if item_type != "function_call":
+            continue
+        tool = (
+            item.get("name")
+            if isinstance(item, dict)
+            else getattr(item, "name", None)
+        )
+        arguments = (
+            item.get("arguments")
+            if isinstance(item, dict)
+            else getattr(item, "arguments", None)
+        )
+        if isinstance(arguments, str):
+            try:
+                argument_value = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"agent {tool} arguments must be valid JSON"
+                ) from exc
+        elif isinstance(arguments, dict):
+            argument_value = arguments
+        else:
+            raise ValueError(f"agent {tool} arguments must be JSON")
+        try:
+            tool_calls.append(
+                parse_agent_tool_arguments(str(tool or ""), argument_value)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"agent tool call {len(tool_calls) + 1}: {exc}"
+            ) from exc
+    return normalize_agent_tool_calls(tool_calls)
+
+
+def format_agent_tool_call(tool_call: AgentToolCall) -> str:
+    return json.dumps(tool_call.as_dict(), indent=2, ensure_ascii=False)
+
+
+def format_agent_tool_calls(tool_calls: list[AgentToolCall]) -> str:
+    normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
+    return format_agent_tool_call(normalized_tool_calls[0])
+
+
+def format_agent_tool_outputs(
+    tool_calls: list[AgentToolCall],
+    tool_outputs: list[str],
+) -> str:
+    normalize_agent_tool_calls(tool_calls)
+    if len(tool_outputs) != 1:
+        raise ValueError("agent tool calls and outputs must have equal lengths")
+    return tool_outputs[0]
+
+
+def format_agent_history(
+    turns: list[AgentTurn],
+    turn_numbers: list[int] | None = None,
+) -> str:
+    if turn_numbers is None:
+        turn_numbers = list(range(1, len(turns) + 1))
+    if len(turn_numbers) != len(turns):
+        raise ValueError("agent turn numbers must match agent turns")
+    blocks: list[str] = []
+    for turn_number, turn in zip(turn_numbers, turns):
+        blocks.append(
+            f"<agent_turn index='{turn_number}'>\n"
+            f"<task>\n{turn.task}\n</task>\n"
+            f"<context>\n{turn.context}\n</context>\n"
+            f"<tool_call>\n{format_agent_tool_call(turn.tool_call)}\n"
+            "</tool_call>\n"
+            f"<tool_output>\n{turn.output}\n</tool_output>\n"
+            "</agent_turn>"
+        )
+    return "\n\n".join(blocks)
+
+
+def agent_context_file_sections(
+    settings: AgentRunSettings,
+ ) -> list[tuple[str, str]]:
+    if settings.context_sections is not None:
+        return settings.context_sections
+    if not settings.context:
+        return []
+    return [("<files>", settings.context)]
+
+
+def agent_context_path_matches(context_id: str, path: str) -> bool:
+    if context_id == path:
+        return True
+    if path == "/proc/self/stdin":
+        return False
+    try:
+        candidate = Path(context_id).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        return candidate.resolve() == Path(path).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def resolve_agent_context_pin(
+    context_id: str,
+    file_contexts: list[tuple[str, str]],
+    turns: list[AgentTurn],
+) -> tuple[str, str | int]:
+    for path, _ in file_contexts:
+        if agent_context_path_matches(context_id, path):
+            return "file", path
+
+    turn_match = re.fullmatch(
+        r"(?:turn(?:\s*:\s*|\s+))?(\d+)",
+        context_id,
+        flags=re.IGNORECASE,
+    )
+    if turn_match is not None:
+        turn_number = int(turn_match.group(1))
+        if 1 <= turn_number <= len(turns):
+            return "turn", turn_number
+        raise ValueError(f"agent turn does not exist: turn:{turn_number}")
+
+    raise ValueError(
+        "context_id must name an available context file or prior agent turn"
+    )
+
+
+def format_agent_context_pin_targets(
+    file_contexts: list[tuple[str, str]],
+    visible_file_indexes: set[int],
+    turns: list[AgentTurn],
+    visible_turn_numbers: set[int],
+    pinned_paths: set[str],
+    pinned_turn_numbers: set[int],
+) -> str:
+    targets: list[str] = []
+    for index, (path, _) in enumerate(file_contexts):
+        if index not in visible_file_indexes:
+            continue
+        pinned_attribute = " pinned='true'" if path in pinned_paths else ""
+        targets.append(
+            f"<file_context path={json.dumps(path, ensure_ascii=False)}"
+            f"{pinned_attribute}/>"
+        )
+    for turn_number in sorted(visible_turn_numbers):
+        if turn_number > len(turns):
+            continue
+        pinned_attribute = (
+            " pinned='true'"
+            if turn_number in pinned_turn_numbers
+            else ""
+        )
+        targets.append(
+            f"<turn_context id='turn:{turn_number}'{pinned_attribute}/>"
+        )
+    if not targets:
+        return ""
+    return (
+        "<agent_context_pin_targets>\n"
+        "Use context_id with a listed file path or turn id to retain that "
+        "context before it falls out of the window.\n"
+        + "\n".join(targets)
+        + "\n</agent_context_pin_targets>"
+    )
+
+
+def build_agent_context_window_prompt(
+    *,
+    model: str,
+    token_limit: int,
+    system_prompt: str,
+    task: str,
+    file_contexts: list[tuple[str, str]],
+    turns: list[AgentTurn],
+    active_context: str,
+    pinned_paths: set[str],
+    pinned_turn_numbers: set[int],
+    revision_instruction: str = "",
+) -> str:
+    visible_file_indexes = set(range(len(file_contexts)))
+    visible_turn_numbers = set(range(1, len(turns) + 1))
+    visible_active_context = active_context
+
+    while True:
+        ordered_file_indexes = sorted(visible_file_indexes)
+        ordered_turn_numbers = sorted(visible_turn_numbers)
+        visible_context = "\n".join(
+            file_contexts[index][1] for index in ordered_file_indexes
+        )
+        visible_turns = [
+            turns[turn_number - 1] for turn_number in ordered_turn_numbers
+        ]
+        user_prompt = build_agent_followup_prompt(
+            task=task,
+            context=visible_context,
+            turns=visible_turns,
+            turn_numbers=ordered_turn_numbers,
+            active_context=visible_active_context,
+            revision_instruction=revision_instruction,
+            context_pin_targets=format_agent_context_pin_targets(
+                file_contexts,
+                visible_file_indexes,
+                turns,
+                visible_turn_numbers,
+                pinned_paths,
+                pinned_turn_numbers,
+            ),
+        )
+        request_tokens = estimate_request_tokens(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            tools=AGENT_TOOL_SCHEMAS,
+        )
+        if request_tokens <= token_limit:
+            return user_prompt
+
+        removable_turn_numbers = sorted(
+            turn_number
+            for turn_number in visible_turn_numbers
+            if turn_number not in pinned_turn_numbers
+        )
+        if removable_turn_numbers:
+            visible_turn_numbers.remove(removable_turn_numbers[0])
+            continue
+
+        removable_file_indexes = [
+            index
+            for index in visible_file_indexes
+            if file_contexts[index][0] not in pinned_paths
+        ]
+        if removable_file_indexes:
+            visible_file_indexes.remove(
+                max(
+                    removable_file_indexes,
+                    key=lambda index: len(file_contexts[index][1]),
+                )
+            )
+            continue
+
+        if visible_active_context:
+            visible_active_context = ""
+            continue
+
+        raise ValueError(
+            f"Estimated agent input token count ({request_tokens}) exceeds "
+            f"token limit ({token_limit}) after removing all unpinned context; "
+            "reduce pinned context or increase the token limit"
+        )
+
+
+def format_agent_tool_schema_context() -> str:
+    return (
+        "<agent_tool_json_schemas instructions='These are the exact JSON "
+        "schemas for the available controller tool calls. Call exactly one "
+        "tool with arguments matching its parameters schema.'>\n"
+        f"{json.dumps(AGENT_TOOL_SCHEMAS, indent=2, ensure_ascii=False)}\n"
+        "</agent_tool_json_schemas>"
+    )
+
+
+def build_agent_followup_prompt(
+    task: str,
+    context: str,
+    turns: list[AgentTurn],
+    active_context: str,
+    revision_instruction: str = "",
+    context_pin_targets: str = "",
+    turn_numbers: list[int] | None = None,
+ ) -> str:
+    additional_parts: list[str] = [
+        format_agent_tool_schema_context(),
+    ]
+    if context_pin_targets:
+        additional_parts.append(context_pin_targets)
+    if active_context:
+        additional_parts.append(
+            f"<agent_context>\n{active_context}\n</agent_context>"
+        )
+    history = format_agent_history(turns, turn_numbers)
+    if history:
+        additional_parts.append(
+            f"<agent_history>\n{history}\n</agent_history>"
+        )
+    if revision_instruction:
+        additional_parts.append(
+            "<agent_revision instructions='Replace the previous tool call with "
+            "one that follows this user instruction.'>\n"
+            f"{revision_instruction}\n</agent_revision>"
+        )
+    return build_user_prompt(
+        task=task,
+        context=context,
+        response_format="text",
+        additional_prompt="\n\n".join(additional_parts),
+    )
+
+
+def agent_review_usage() -> str:
+    return "Usage: [y]es, [n]o, [p]ager, [h]elp, [e]dit, E <prompt>"
+
+
+def review_agent_tool_calls(
+    tool_calls: list[AgentToolCall],
+    accept_automatically: bool,
+ ) -> tuple[str, str | None]:
+    tool_text = format_agent_tool_calls(tool_calls)
+    if accept_automatically:
+        return "accept", None
+    if NONINTERACTIVE:
+        return "save", None
+    print()
+    print(tool_text)
+    while True:
+        choice = input(
+            "Run these agent tool calls? [y/n/p/h/e/E <prompt>]: "
+        ).strip()
+        normalized_choice = choice.lower()
+        if not choice or normalized_choice == "h":
+            print(agent_review_usage())
+            continue
+        if normalized_choice == "p":
+            page_or_print(tool_text)
+            continue
+        if normalized_choice in ("y", "yes"):
+            return "accept", None
+        if normalized_choice in ("n", "no"):
+            return "reject", None
+        if normalized_choice == "e":
+            return "edit", None
+        if (
+            choice.startswith("E")
+            and len(choice) > 1
+            and choice[1].isspace()
+        ):
+            revision_task = choice[1:].strip()
+            if revision_task:
+                return "edit", revision_task
+            print("Revision task cannot be empty.")
+            continue
+        print("Please answer y, n, p, h, e, or E followed by a prompt.")
+
+
+def review_agent_tool_call(
+    tool_call: AgentToolCall,
+    accept_automatically: bool,
+ ) -> tuple[str, str | None]:
+    return review_agent_tool_calls([tool_call], accept_automatically)
+
+def review_agent_patch_changes(
+    diff_text: str,
+    suffix_provided: bool,
+    accept_automatically: bool,
+ ) -> tuple[str, str | None, bool]:
+    if accept_automatically:
+        return "accept", None, suffix_provided
+    if NONINTERACTIVE:
+        return "save", None, suffix_provided
+    print()
+    print(diff_text)
+    while True:
+        patch_input = input(
+            "Apply this agent patch? [y/n/p/h/S/e/E <prompt>]: "
+        )
+        patch_input, suffix_provided = process_patch_review_input(
+            patch_input,
+            diff_text,
+            suffix_provided,
+            allow_navigation=True,
+        )
+        if patch_input is None:
+            continue
+        patch_choice = patch_input.lower()
+        if patch_choice in ("y", "yes"):
+            return "accept", None, suffix_provided
+        if patch_choice in ("n", "no"):
+            return "reject", None, suffix_provided
+        if patch_choice == "e":
+            return "edit", None, suffix_provided
+        if (
+            patch_input.startswith("E")
+            and len(patch_input) > 1
+            and patch_input[1].isspace()
+        ):
+            revision_task = patch_input[1:].strip()
+            if revision_task:
+                return "edit", revision_task, suffix_provided
+            print("Revision task cannot be empty.")
+            continue
+        print("Please answer y, n, p, h, S, e, or E followed by a prompt.")
+
+
+def append_agent_log(settings: AgentRunSettings, text: str) -> None:
+    if not settings.log_enabled or settings.log_path is None:
+        return
+    with settings.log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(text)
+
+
+def request_agent_model(
+    settings: AgentRunSettings,
+    system_prompt: str,
+    user_prompt: str,
+    task: str,
+    json_schema: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+ ) -> AgentModelResult:
+    request_tokens = estimate_request_tokens(
+        model=settings.model_settings.model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        tools=tools,
+    )
+    if request_tokens > settings.token_limit:
+        raise ValueError(
+            f"Estimated agent input token count ({request_tokens}) exceeds "
+            f"token limit ({settings.token_limit})"
+        )
+    tool_schema_text = (
+        json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+        if tools
+        else ""
+    )
+    request_characters = len(system_prompt + user_prompt + tool_schema_text)
+    request_cost_log = (
+        f" request_cost_estimate="
+        f"{request_tokens * settings.token_cost[0] / 1_000_000:.4f}"
+        if settings.token_cost is not None
+        else ""
+    )
+    turn_dir = start_state_turn(
+        settings.state_session_dir,
+        settings.state_turn,
+        system_prompt,
+        task,
+        settings.file_paths,
+    )
+    settings.state_turn += 1
+    append_agent_log(
+        settings,
+        "<agent_request>\n"
+        f"<request_stats>\nrequest_characters={request_characters} "
+        f"request_tokens_estimate={request_tokens}{request_cost_log}"
+        "\n</request_stats>\n"
+        f"<system_prompt>\n{system_prompt}\n</system_prompt>\n"
+        f"<user_prompt>\n{user_prompt}\n</user_prompt>\n"
+        "</agent_request>\n",
+    )
+    if VERBOSE:
+        print(
+            f"request_characters={request_characters} "
+            f"request_tokens_estimate={request_tokens}{request_cost_log} "
+            f"model={settings.model_settings.model} "
+            f"reasoning={settings.model_settings.openai_reasoning} session_name={SESSION_NAME}",
+            file=sys.stderr,
+        )
+    start_time = time.perf_counter()
+    model_settings = settings.model_settings
+    parsed_tool_calls: tuple[AgentToolCall, ...] = ()
+    try:
+        response_obj, usage = call_openai(
+            api_key=model_settings.api_key,
+            openai_base_url=model_settings.openai_base_url,
+            openai_proxy=model_settings.openai_proxy,
+            openai_organization=model_settings.openai_organization,
+            openai_project=model_settings.openai_project,
+            model=model_settings.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_format=("schema" if json_schema is not None else "text"),
+            json_schema=json_schema,
+            response_verbosity=model_settings.response_verbosity,
+            temperature=model_settings.temperature,
+            top_p=model_settings.top_p,
+            max_output_tokens=model_settings.max_output_tokens,
+            openai_service_tier=model_settings.openai_service_tier,
+            openai_reasoning=model_settings.openai_reasoning,
+            reasoning_mode=model_settings.reasoning_mode,
+            extra_body=model_settings.extra_body,
+            llm_timeout=model_settings.llm_timeout,
+            safety_identifier=model_settings.safety_identifier,
+            store=model_settings.api_log,
+            tools=tools,
+            tool_choice="required" if tools else None,
+            parallel_tool_calls=False if tools else None,
+        )
+        if tools:
+            parsed_tool_calls = tuple(
+                response_agent_tool_calls(response_obj)
+            )
+            response = format_agent_tool_calls(list(parsed_tool_calls))
+        else:
+            response = str(getattr(response_obj, "output_text", "") or "")
+        reasoning = response_reasoning_text(response_obj)
+    except Exception as exc:
+        complete_state_turn(turn_dir, "", f"ERROR: {exc}")
+        raise
+    elapsed = time.perf_counter() - start_time
+    complete_state_turn(turn_dir, reasoning, response)
+    statsline = print_stats(
+        request_characters=request_characters,
+        request_tokens=request_tokens,
+        processing_time=elapsed,
+        response_text=response,
+        usage=usage,
+        response_cost=response_cost_line(settings.token_cost, usage),
+    )
+    append_agent_log(
+        settings,
+        f"<agent_response>\n{response}\n</agent_response>\n"
+        f"<agent_response_reasoning>\n{reasoning}\n"
+        "</agent_response_reasoning>\n"
+        f"<agent_response_stats>\n{statsline}\n"
+        "</agent_response_stats>\n",
+    )
+    if VERBOSE:
+        print(statsline, file=sys.stderr)
+    return AgentModelResult(
+        response=response,
+        reasoning=reasoning,
+        statsline=statsline,
+        turn_dir=turn_dir,
+        tool_calls=parsed_tool_calls,
+    )
+
+
+def run_agent_shell_tool(
+    settings: AgentRunSettings,
+    commands: list[ShellStep],
+    turn_dir: Path,
+    previous_task: str,
+) -> AgentToolExecution:
+    if settings.agent_auto:
+        review_action, revision_task = "accept", None
+    else:
+        review_action, revision_task = review_shell_commands(commands)
+    if review_action == "edit":
+        if revision_task is None:
+            try:
+                edited_text = edit_text(
+                    build_shell_revision_editor_text(
+                        commands,
+                        previous_task,
+                    ),
+                )
+                revision_task = extract_patch_revision_task(edited_text)
+            except Exception as exc:
+                return AgentToolExecution(
+                    f"ERROR: Failed to edit shell tool task: {exc}"
+                )
+        if revision_task:
+            return AgentToolExecution(
+                "Shell command revision was requested.",
+                revision_task,
+            )
+        return AgentToolExecution("Shell command revision was abandoned.")
+    if review_action == "save":
+        return AgentToolExecution(
+            "Shell commands were saved without execution.\n"
+            f"<shell_commands>\n{format_shell_command_context(commands)}\n"
+            "</shell_commands>"
+        )
+    if review_action != "accept":
+        return AgentToolExecution(
+            "Shell commands were rejected and were not run."
+        )
+    shell_output = execute_shell_commands(
+        commands,
+        settings.model_settings.llm_timeout,
+    )
+    try:
+        write_state_shell_output(turn_dir, shell_output)
+    except Exception as exc:
+        return AgentToolExecution(
+            f"ERROR: Failed to save shell tool output: {exc}"
+        )
+    return AgentToolExecution(shell_output)
+ 
+ 
+def run_agent_patch_tool(
+    settings: AgentRunSettings,
+    manifest: dict[str, Any],
+    turn_dir: Path,
+    previous_task: str,
+) -> AgentToolExecution:
+    suffix_provided = settings.suffix_provided
+    try:
+        manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+        original_texts = load_patch_original_texts(manifest)
+        updated_texts, diff_text, changed_items = build_patch_changes(
+            original_texts,
+            manifest,
+        )
+        write_state_schema_patch(turn_dir, manifest_text)
+        write_state_diff_patch(turn_dir, diff_text)
+    except Exception as exc:
+        return AgentToolExecution(f"ERROR: Patch tool failed: {exc}")
+ 
+    if not changed_items:
+        return AgentToolExecution("Patch tool completed without changes.")
+ 
+    review_action, revision_task, suffix_provided = review_agent_patch_changes(
+        diff_text,
+        suffix_provided,
+        settings.agent_auto,
+    )
+    if review_action == "edit":
+        if revision_task is None:
+            try:
+                edited_text = edit_text(
+                    build_patch_revision_editor_text(
+                        diff_text,
+                        previous_task,
+                    ),
+                )
+                revision_task = extract_patch_revision_task(edited_text)
+            except Exception as exc:
+                return AgentToolExecution(
+                    f"ERROR: Failed to edit patch tool task: {exc}"
+                )
+        if revision_task:
+            return AgentToolExecution(
+                "Patch revision was requested.",
+                revision_task,
+            )
+        return AgentToolExecution("Patch tool revision was abandoned.")
+    if review_action == "save":
+        return AgentToolExecution(
+            "Patch manifest was saved in the session without writing files.\n"
+            f"<patch_diff>\n{diff_text}\n</patch_diff>"
+        )
+    if review_action != "accept":
+        return AgentToolExecution(
+            "Patch changes were rejected and were not written."
+        )
+    try:
+        written_paths = write_patch_changes(
+            changed_items=changed_items,
+            all_paths=[Path(path) for path in updated_texts],
+            patch_review=settings.patch_review,
+            patch_suffix=settings.patch_suffix,
+            suffix_provided=suffix_provided,
+            patch_branch_setting=None,
+            patch_commit_message=str(
+                manifest.get("commit_message", "Agent patch")
+            ).strip() or "Agent patch",
+        )
+        write_state_schema_patch_applied(
+            turn_dir,
+            written_paths,
+        )
+    except Exception as exc:
+        return AgentToolExecution(
+            f"ERROR: Failed to write patch tool changes: {exc}"
+        )
+    written_paths_text = "\n".join(written_paths)
+    return AgentToolExecution(
+        "Patch changes were written.\n"
+        f"<patch_diff>\n{diff_text}\n</patch_diff>\n"
+        f"<written_paths>\n{written_paths_text}\n</written_paths>"
+    )
+
+
+def finish_agent_response(
+    settings: AgentRunSettings,
+    response_text: str,
+    reasoning: str,
+ ) -> int:
+    output_text = response_text
+    if settings.print_reasoning:
+        output_text = f"<think>\n{reasoning}\n</think>\n\n{output_text}"
+    if settings.output_file is not None:
+        try:
+            settings.output_file.parent.mkdir(parents=True, exist_ok=True)
+            settings.output_file.write_text(output_text, encoding="utf-8")
+        except Exception as exc:
+            print(
+                f"ERROR: Failed to write output to file "
+                f"{settings.output_file}: {exc}",
+                file=sys.stderr,
+            )
+            if not settings.suppress_response_output:
+                print(output_text)
+            return 1
+    elif not settings.suppress_response_output:
+        print(output_text)
+    return 0
+
+
+def run_agent_mode(settings: AgentRunSettings) -> int:
+    turns: list[AgentTurn] = []
+    file_contexts = agent_context_file_sections(settings)
+    pinned_paths: set[str] = set()
+    pinned_turn_numbers: set[int] = set()
+    active_task = settings.task
+    active_context = ""
+
+    def request_next(revision_instruction: str = "") -> AgentModelResult:
+        full_system_prompt = append_task_to_system_prompt(
+            settings.agent_system_prompt,
+            active_task,
+            settings.system_prompt_with_task,
+        )
+        user_prompt = build_agent_context_window_prompt(
+            model=settings.model_settings.model,
+            token_limit=settings.token_limit,
+            system_prompt=full_system_prompt,
+            task=active_task,
+            file_contexts=file_contexts,
+            turns=turns,
+            active_context=active_context,
+            pinned_paths=pinned_paths,
+            pinned_turn_numbers=pinned_turn_numbers,
+            revision_instruction=revision_instruction,
+        )
+        return request_agent_model(
+            settings,
+            full_system_prompt,
+            user_prompt,
+            active_task,
+            tools=AGENT_TOOL_SCHEMAS,
+        )
+
+    try:
+        model_result = request_next()
+    except Exception as exc:
+        print(f"API error: {exc}", file=sys.stderr)
+        return 1
+    while True:
+        tool_calls = list(model_result.tool_calls)
+        if len(tool_calls) != 1:
+            print(
+                "ERROR: Agent controller returned no executable tool call",
+                file=sys.stderr,
+            )
+            return 1
+        review_action, revision_task = review_agent_tool_calls(
+            tool_calls,
+            settings.agent_auto,
+        )
+        if review_action == "save":
+            return finish_agent_response(
+                settings,
+                model_result.response,
+                model_result.reasoning,
+            )
+        if review_action == "reject":
+            if VERBOSE:
+                print("Aborted.", file=sys.stderr)
+            return 0
+        if review_action == "edit":
+            if revision_task is None:
+                try:
+                    edited_text = edit_text(
+                        build_patch_revision_editor_text(
+                            format_agent_tool_calls(tool_calls),
+                            active_task,
+                        ),
+                    )
+                    revision_task = extract_patch_revision_task(edited_text)
+                except Exception as exc:
+                    print(
+                        f"ERROR: Failed to edit agent revision: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+            if not revision_task:
+                continue
+            try:
+                model_result = request_next(revision_task)
+            except Exception as exc:
+                print(f"API error: {exc}", file=sys.stderr)
+                return 1
+            continue
+
+        executed_tool_calls: list[AgentToolCall] = []
+        tool_outputs: list[str] = []
+        tool_revision_instruction = ""
+ 
+        def save_tool_outputs() -> bool:
+            if not executed_tool_calls:
+                return True
+            try:
+                write_state_agent_tool_output(
+                    model_result.turn_dir,
+                    format_agent_tool_outputs(
+                        executed_tool_calls,
+                        tool_outputs,
+                    ),
+                )
+            except Exception as exc:
+                print(
+                    f"ERROR: Failed to save agent tool output: {exc}",
+                    file=sys.stderr,
+                )
+                return False
+            return True
+ 
+        for tool_call in tool_calls:
+            if tool_call.tool == AGENT_SESSION_TOOL:
+                if not save_tool_outputs():
+                    return 1
+                return finish_agent_response(
+                    settings,
+                    tool_call.reason,
+                    model_result.reasoning,
+                )
+            turn_task = active_task
+            tool_context = "\n\n".join(
+                value for value in (active_context, tool_call.context) if value
+            )
+            if tool_call.tool == AGENT_CONTEXT_TOOL:
+                try:
+                    target_type, target = resolve_agent_context_pin(
+                        tool_call.context_id,
+                        file_contexts,
+                        turns,
+                    )
+                except ValueError as exc:
+                    tool_output = f"ERROR: Failed to pin context: {exc}"
+                else:
+                    if target_type == "file":
+                        path = str(target)
+                        already_pinned = path in pinned_paths
+                        pinned_paths.add(path)
+                        tool_output = (
+                            f"Context file was {'already ' if already_pinned else ''}"
+                            f"pinned: {path}"
+                        )
+                    else:
+                        turn_number = int(target)
+                        already_pinned = turn_number in pinned_turn_numbers
+                        pinned_turn_numbers.add(turn_number)
+                        tool_output = (
+                            f"Agent turn was {'already ' if already_pinned else ''}"
+                            f"pinned: turn:{turn_number}"
+                        )
+            elif tool_call.tool == AGENT_PATCH_TOOL:
+                manifest = tool_call.arguments
+                if manifest is None:
+                    tool_output = "ERROR: Patch tool received no manifest."
+                else:
+                    execution = run_agent_patch_tool(
+                        settings,
+                        manifest,
+                        model_result.turn_dir,
+                        turn_task,
+                    )
+                    tool_output = execution.output
+                    tool_revision_instruction = (
+                        execution.revision_instruction or ""
+                    )
+            elif tool_call.tool == AGENT_SHELL_TOOL:
+                arguments = tool_call.arguments
+                if arguments is None:
+                    tool_output = "ERROR: Shell tool received no command manifest."
+                else:
+                    try:
+                        commands = _parse_shell_manifest_value(arguments)
+                    except ValueError as exc:
+                        tool_output = (
+                            f"ERROR: Shell tool received invalid commands: {exc}"
+                        )
+                    else:
+                        execution = run_agent_shell_tool(
+                            settings,
+                            commands,
+                            model_result.turn_dir,
+                            turn_task,
+                        )
+                        tool_output = execution.output
+                        tool_revision_instruction = (
+                            execution.revision_instruction or ""
+                        )
+            elif tool_call.tool == AGENT_AGENT_TOOL:
+                active_task = tool_call.task
+                active_context = tool_call.context
+                tool_output = (
+                    "Started the requested agent task for the next turn."
+                )
+            else:
+                print(
+                    f"ERROR: Unknown agent tool: {tool_call.tool}",
+                    file=sys.stderr,
+                )
+                return 1
+            turns.append(
+                AgentTurn(
+                    task=turn_task,
+                    context=tool_context,
+                    tool_call=tool_call,
+                    output=tool_output,
+                )
+            )
+            executed_tool_calls.append(tool_call)
+            tool_outputs.append(tool_output)
+        if not save_tool_outputs():
+            return 1
+        try:
+            model_result = request_next(tool_revision_instruction)
+        except Exception as exc:
+            print(f"API error: {exc}", file=sys.stderr)
+            return 1
+
 
 # -------------------------------------------------------------------
 # OpenAI-compatible request
@@ -3596,6 +4845,9 @@ def call_openai(
     safety_identifier: str | None = None,
     store: bool = True,
     stream: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
     if openai_proxy:
@@ -3618,6 +4870,19 @@ def call_openai(
         "extra_body": extra_body or {},
         "store": store,
     }
+
+    if tools is not None:
+        if not tools:
+            raise ValueError("tools must be a non-empty array")
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        if not tools:
+            raise ValueError("tool_choice requires tools")
+        kwargs["tool_choice"] = tool_choice
+    if parallel_tool_calls is not None:
+        if not tools:
+            raise ValueError("parallel_tool_calls requires tools")
+        kwargs["parallel_tool_calls"] = parallel_tool_calls
 
     if safety_identifier is not None and str(safety_identifier).strip():
         kwargs["safety_identifier"] = str(safety_identifier).strip()
@@ -4418,6 +5683,18 @@ def parse_args() -> argparse.Namespace:
         help="Create an AI prompt for review before using it as the task",
     )
 
+    parser.add_argument(
+        "--agent",
+        action="store_true",
+        help="Run a confirmed multi-turn AI agent tool-call session",
+    )
+
+    parser.add_argument(
+        "--agent-auto",
+        action="store_true",
+        help="Automatically confirm agent tool calls and agent worker actions",
+    )
+
     files_group = parser.add_mutually_exclusive_group()
     files_group.add_argument(
         "-f",
@@ -5180,6 +6457,8 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "files_list": None,
         "plan": False,
         "plan_system_prompt": None,
+        "agent": False,
+        "agent_auto": False,
         "patch": False,
         "shell": False,
         "patch_review": False,
@@ -5311,8 +6590,12 @@ def main() -> int:
             ("--files-list", args.files_list is not None),
             ("--patch", args.patch is not None),
             ("--plan", args.plan is not None),
+            ("--agent", args.agent),
+            ("--agent-auto", args.agent_auto),
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
+            ("--shell", args.shell is not None),
+            ("--reuse-session", args.reuse_session is not None),
             ("--shell", args.shell is not None),
             ("--reuse-session", args.reuse_session is not None),
             ("--tree-files", args.tree_files is not None),
@@ -5822,6 +7105,8 @@ def main() -> int:
         config,
         'shell',
     )
+    agent_mode = args.agent
+    agent_auto = args.agent_auto
     if (
         not tree_mode
         and not ask_mode
@@ -5833,7 +7118,7 @@ def main() -> int:
             file_names = parse_config_files(
                 config.get("files", DEFAULT_CONFIG["files"])
             )
-        if not file_names and not shell_mode:
+        if not file_names and not shell_mode and not agent_mode:
             print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
             return 1
 
@@ -5915,11 +7200,20 @@ def main() -> int:
         patch_suffix = ''
         suffix_provided = False
 
-    if tree_mode and (plan_mode or patch_mode or shell_mode):
-        print("ERROR: tree mode cannot be combined with --plan, --patch, or --shell", file=sys.stderr)
+    if tree_mode and (plan_mode or patch_mode or shell_mode or agent_mode):
+        print("ERROR: tree mode cannot be combined with --plan, --patch, --shell, or --agent", file=sys.stderr)
         return 1
     if patch_mode and shell_mode:
         print("ERROR: --shell cannot be combined with --patch", file=sys.stderr)
+        return 1
+    if agent_auto and not agent_mode:
+        print("ERROR: --agent-auto requires --agent", file=sys.stderr)
+        return 1
+    if agent_mode and (patch_mode or shell_mode):
+        print("ERROR: --agent cannot be combined with --patch or --shell", file=sys.stderr)
+        return 1
+    if agent_mode and (args.ask or args.ask_file):
+        print("ERROR: --agent only supports --task or --task-file", file=sys.stderr)
         return 1
     if (
         shell_mode
@@ -5930,6 +7224,13 @@ def main() -> int:
         return 1
     if shell_mode and (args.ask or args.ask_file):
         print("ERROR: --shell only supports --task or --task-file", file=sys.stderr)
+        return 1
+    if (
+        agent_mode
+        and args.reuse_session is None
+        and not (args.task or args.task_file)
+    ):
+        print("ERROR: --agent requires --task or --task-file", file=sys.stderr)
         return 1
     if plan_mode and ask_mode:
         print("ERROR: --plan only supports --task or --task-file", file=sys.stderr)
@@ -5964,7 +7265,6 @@ def main() -> int:
         except (OSError, ValueError) as exc:
             print(f'ERROR: {exc}', file=sys.stderr)
             return 1
-
     llm_timeout = (
         args.llm_timeout
         if args.llm_timeout is not None
@@ -6136,6 +7436,7 @@ def main() -> int:
         else config.get("response_verbosity", "off")
     ).lower()
 
+    agent_worker_system_prompt = system_prompt
     if patch_mode:
         response_format = "schema"
         json_schema = PATCH_MANIFEST_SCHEMA
@@ -6145,7 +7446,16 @@ def main() -> int:
         response_format = "schema"
         json_schema = SHELL_COMMAND_SCHEMA
         system_prompt = system_prompt + "\n" + shell_system_prompt
+    if agent_mode:
+        response_format = "text"
+        json_schema = None
+        system_prompt = system_prompt + "\n" + DEFAULT_AGENT_SYSTEM_PROMPT
     if response_format not in ("text", "json", "schema"):
+        print(
+            "ERROR: Invalid response format; choose text, json, or schema.",
+            file=sys.stderr,
+        )
+        return 1
         print(
             "ERROR: Invalid response format; choose text, json, or schema.",
             file=sys.stderr,
@@ -6372,8 +7682,6 @@ def main() -> int:
                 f.write("\n")
             f.write(f"<start_time>{time.ctime(session_timestamp)} [{session_timestamp}]</start_time>\n")
             f.write(format_log_settings(config, args))
-        if VERBOSE:
-            print(f"log_file={log_path}", file=sys.stderr)
 
     def append_log(text: str) -> None:
         if not log_enabled or log_path is None:
@@ -6571,6 +7879,7 @@ def main() -> int:
             tree_session_stem=tree_session_stem,
         )
 
+    context_sections: list[tuple[str, str]] = []
     if ask_mode:
         context = ""
         if args.ask is not None:
@@ -6594,11 +7903,14 @@ def main() -> int:
             stdin_content = (
                 sys.stdin.read() if "-" in file_names else None
             )
-            context = build_context(
+            context_sections = build_context_sections(
                 file_paths=file_paths,
                 max_file_size_kb=max_file_size_kb,
                 add_line_numbers=add_line_numbers,
                 stdin_content=stdin_content,
+            )
+            context = "\n".join(
+                section for _, section in context_sections
             )
         except Exception as exc:
             try:
@@ -6678,6 +7990,9 @@ def main() -> int:
                 return 1
 
     if plan_mode:
+        plan_system_base = (
+            agent_worker_system_prompt if agent_mode else system_prompt
+        )
         plan_user_prompt = build_user_prompt(
             task=task,
             context=context,
@@ -6685,9 +8000,12 @@ def main() -> int:
             json_schema=None,
             include_task=not system_prompt_with_task,
         )
-        plan_full_system_prompt = system_prompt + "\n" + plan_system_prompt
+        plan_full_system_prompt = plan_system_base + "\n" + plan_system_prompt
         if add_line_numbers or patch_mode:
-            plan_full_system_prompt = (system_prompt + "\n" + linenum_system_prompt + "\n" + plan_system_prompt)
+            plan_full_system_prompt = (
+                plan_system_base + "\n" + linenum_system_prompt + "\n"
+                + plan_system_prompt
+            )
         if patch_mode:
             plan_full_system_prompt = (plan_full_system_prompt + "\n" +
                 "Design the prompt with the understanding that a patch will be generated but do not include language to indicate this explicitly.")
@@ -6732,7 +8050,7 @@ def main() -> int:
                 f.write(f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n")
                 f.write("</plan_request>\n")
         if VERBOSE:
-            print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
+            print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} session_name={session_stem}", file=sys.stderr)
         plan_start_time = time.perf_counter()
         plan_response_obj: Any = None
         try:
@@ -6811,6 +8129,55 @@ def main() -> int:
             json_schema=json_schema,
             include_task=not system_prompt_with_task,
         )
+    if agent_mode:
+        agent_settings = AgentRunSettings(
+            model_settings=AgentModelSettings(
+                model=model,
+                api_key=api_key,
+                openai_base_url=openai_base_url,
+                openai_proxy=openai_proxy,
+                openai_organization=openai_organization,
+                openai_project=openai_project,
+                response_verbosity=response_verbosity,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_output_tokens,
+                openai_service_tier=openai_service_tier,
+                openai_reasoning=openai_reasoning,
+                reasoning_mode=reasoning_mode,
+                extra_body=extra_body,
+                llm_timeout=llm_timeout,
+                safety_identifier=safety_identifier,
+                api_log=api_log,
+            ),
+            token_limit=token_limit,
+            token_cost=token_cost,
+            state_session_dir=state_session_dir,
+            state_turn=state_turn,
+            file_paths=file_paths,
+            log_enabled=log_enabled,
+            log_path=log_path,
+            task=task,
+            context=context,
+            context_sections=context_sections,
+            agent_system_prompt=base_full_system_prompt,
+            worker_system_prompt=agent_worker_system_prompt,
+            linenum_system_prompt=linenum_system_prompt,
+            shell_system_prompt=shell_system_prompt,
+            patch_system_prompt=patch_system_prompt,
+            system_prompt_with_task=system_prompt_with_task,
+            add_line_numbers=add_line_numbers,
+            max_file_size_kb=max_file_size_kb,
+            patch_suffix=patch_suffix,
+            suffix_provided=suffix_provided,
+            patch_review=patch_review,
+            agent_auto=agent_auto,
+            output_file=args.output_file,
+            print_reasoning=print_reasoning,
+            suppress_response_output=suppress_response_output,
+        )
+        return run_agent_mode(agent_settings)
+
     resume_reused_shell_turn = (
         shell_mode
         and args.noninteractive
@@ -6862,7 +8229,7 @@ def main() -> int:
         )
 
         if VERBOSE:
-            print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning}", file=sys.stderr)
+            print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning} session_name={session_stem}", file=sys.stderr)
 
     start_time = time.perf_counter()
     state_turn_path: Path | None = None
@@ -7449,6 +8816,7 @@ def main() -> int:
                 session_reason,
                 followup_reasoning,
             )
+
     def call_patch_revision_request(
         revision_user_prompt: str,
     ) -> tuple[str, str, Any, dict[str, Any] | None]:

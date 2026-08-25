@@ -2,6 +2,8 @@ MAKEFLAGS    += --silent
 
 PROGRAM      ?= mince
 SOURCE       ?= mince
+CONTAIN_PROGRAM ?= mince-contain
+CONTAIN_SOURCE  ?= mince-contain
 PYTHON       ?= python3
 SUDO         ?= sudo
 
@@ -9,11 +11,13 @@ USER_PREFIX  := $(HOME)/.local
 USER_DIR     := $(USER_PREFIX)/share/$(PROGRAM)
 USER_BIN     := $(USER_PREFIX)/bin
 USER_LAUNCH  := $(USER_BIN)/$(PROGRAM)
+USER_CONTAIN_LAUNCH := $(USER_BIN)/$(CONTAIN_PROGRAM)
 USER_VENV    := $(USER_DIR)/.venv
 
 GLOBAL_DIR   := /opt/$(PROGRAM)
 GLOBAL_BIN   := /usr/local/bin
 GLOBAL_LAUNCH:= $(GLOBAL_BIN)/$(PROGRAM)
+GLOBAL_CONTAIN_LAUNCH := $(GLOBAL_BIN)/$(CONTAIN_PROGRAM)
 GLOBAL_VENV  := $(GLOBAL_DIR)/.venv
 
 ifeq ($(shell id -u),0)
@@ -25,10 +29,10 @@ endif
 help:
 	@printf '%s\n' \
 	  'Targets:' \
-	  '  install-user      Install to ~/.local/share/mince and ~/.local/bin/mince' \
+	  '  install-user      Install mince and mince-contain to ~/.local/share/mince and ~/.local/bin' \
 	  '  uninstall-user    Remove the user install' \
 	  '  update-user       Refresh the user install' \
-	  '  install-global    Install to /opt/mince and /usr/local/bin/mince' \
+	  '  install-global    Install mince and mince-contain to /opt/mince and /usr/local/bin' \
 	  '  uninstall-global  Remove the global install' \
 	  '  update-global     Refresh the global install' \
 	  '  install           Alias for install-user' \
@@ -46,15 +50,19 @@ install-user:
 	fi; \
 	cp -f "$(SOURCE)" "$(USER_DIR)/$(PROGRAM)"; \
 	chmod 755 "$(USER_DIR)/$(PROGRAM)"; \
+	cp -f "$(CONTAIN_SOURCE)" "$(USER_DIR)/$(CONTAIN_PROGRAM)"; \
+	chmod 755 "$(USER_DIR)/$(CONTAIN_PROGRAM)"; \
 	if [ ! -x "$(USER_VENV)/bin/python" ]; then \
 		"$(PYTHON)" -m venv "$(USER_VENV)"; \
 	fi; \
 	"$(USER_VENV)/bin/python" -m pip install -r requirements.txt; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
-	chmod 755 "$(USER_LAUNCH)"
+	chmod 755 "$(USER_LAUNCH)"; \
+	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
+	chmod 755 "$(USER_CONTAIN_LAUNCH)"
 
 uninstall-user:
-	@rm -f "$(USER_LAUNCH)"; \
+	@rm -f "$(USER_LAUNCH)" "$(USER_CONTAIN_LAUNCH)"; \
 	rm -rf "$(USER_DIR)"; \
 	rm -rf "$(HOME)/.local/state/$(PROGRAM)"
 
@@ -69,12 +77,16 @@ update-user:
 		fi; \
 		cp -f "$(SOURCE)" "$(USER_DIR)/$(PROGRAM)"; \
 		chmod 755 "$(USER_DIR)/$(PROGRAM)"; \
+		cp -f "$(CONTAIN_SOURCE)" "$(USER_DIR)/$(CONTAIN_PROGRAM)"; \
+		chmod 755 "$(USER_DIR)/$(CONTAIN_PROGRAM)"; \
 		if [ ! -x "$(USER_VENV)/bin/python" ]; then \
 			"$(PYTHON)" -m venv "$(USER_VENV)"; \
 		fi; \
 		"$(USER_VENV)/bin/python" -m pip install --upgrade -q pip openai tiktoken; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 		chmod 755 "$(USER_LAUNCH)"; \
+		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
+		chmod 755 "$(USER_CONTAIN_LAUNCH)"; \
 	fi
 
 install-global:
@@ -85,15 +97,19 @@ install-global:
 	fi; \
 	$(SUDO) cp -f "$(SOURCE)" "$(GLOBAL_DIR)/$(PROGRAM)"; \
 	$(SUDO) chmod 755 "$(GLOBAL_DIR)/$(PROGRAM)"; \
+	$(SUDO) cp -f "$(CONTAIN_SOURCE)" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)"; \
+	$(SUDO) chmod 755 "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)"; \
 	if [ ! -x "$(GLOBAL_VENV)/bin/python" ]; then \
 		$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 	fi; \
 	$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install -r requirements.txt; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
-	$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"
+	$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
+	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \
+	$(SUDO) chmod 755 "$(GLOBAL_CONTAIN_LAUNCH)"
 
 uninstall-global:
-	@$(SUDO) rm -f "$(GLOBAL_LAUNCH)"; \
+	@$(SUDO) rm -f "$(GLOBAL_LAUNCH)" "$(GLOBAL_CONTAIN_LAUNCH)"; \
 	$(SUDO) rm -rf "$(GLOBAL_DIR)"; \
 	rm -rf "$(HOME)/.local/state/$(PROGRAM)"
 
@@ -108,12 +124,16 @@ update-global:
 		fi; \
 		$(SUDO) cp -f "$(SOURCE)" "$(GLOBAL_DIR)/$(PROGRAM)"; \
 		$(SUDO) chmod 755 "$(GLOBAL_DIR)/$(PROGRAM)"; \
+		$(SUDO) cp -f "$(CONTAIN_SOURCE)" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)"; \
+		$(SUDO) chmod 755 "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)"; \
 		if [ ! -x "$(GLOBAL_VENV)/bin/python" ]; then \
 			$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 		fi; \
 		$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --upgrade -q pip openai tiktoken; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 		$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
+		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \
+		$(SUDO) chmod 755 "$(GLOBAL_CONTAIN_LAUNCH)"; \
 	fi
 
 install: install-user

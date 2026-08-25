@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""Run mince in a configurable systemd filesystem sandbox."""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import site
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+WRITE_PATH_OPTION = "--contain-write-path"
+READ_PATH_OPTIONS = (
+    "--contain-read-path",
+    "--contain-read-only-path",
+)
+BIND_READ_ONLY_OPTION = "--contain-bind-read-only"
+BIND_WRITE_OPTION = "--contain-bind-write"
+ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+SERVICE_ENVIRONMENT_NAMES = {
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "LISTEN_FDNAMES",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "MAINPID",
+    "MANAGERPID",
+    "NOTIFY_SOCKET",
+    "SYSTEMD_EXEC_PID",
+}
+
+
+@dataclass(frozen=True)
+class PathGrant:
+    source: Path
+    destination: Path
+
+
+@dataclass(frozen=True)
+class Binding:
+    source: Path
+    destination: Path
+
+
+@dataclass
+class WrapperOptions:
+    read_paths: list[str] = field(default_factory=list)
+    write_paths: list[str] = field(default_factory=list)
+    read_only_bindings: list[tuple[str, str]] = field(
+        default_factory=list
+    )
+    writable_bindings: list[tuple[str, str]] = field(
+        default_factory=list
+    )
+    working_directory: str | None = None
+    home_mode: str = "read-only"
+    state_mode: str = "persistent"
+    private_tmp: bool = True
+    network_mode: str = "host"
+    runtime_seconds: int | None = None
+    allow_namespaces: bool = False
+    dry_run: bool = False
+    show_help: bool = False
+
+
+def print_usage() -> None:
+    print(
+        "Usage: mince-contain [CONTAINMENT_OPTIONS...] [--] "
+        "[MINCE_ARGS...]\n\n"
+        "Run MinCE through a transient systemd user service. ProtectSystem "
+        "makes the host filesystem read-only, PrivateTmp supplies private "
+        "writable temporary directories, and only MinCE's state directory "
+        "plus explicitly granted paths remain writable.\n\n"
+        "Containment options:\n"
+        "  --contain-write-path PATH\n"
+        "      Allow writes to an existing file or directory. Repeat as "
+        "needed; grant a parent directory when MinCE must create a file.\n"
+        "  --contain-read-path PATH\n"
+        "  --contain-read-only-path PATH\n"
+        "      Expose an existing path read-only when a private home or "
+        "private /tmp would otherwise hide it. May be repeated.\n"
+        "  --contain-bind-read-only SOURCE DESTINATION\n"
+        "      Bind an existing source at a destination and keep it "
+        "read-only. May be repeated.\n"
+        "  --contain-bind-write SOURCE DESTINATION\n"
+        "      Bind an existing source at a writable destination. May be "
+        "repeated.\n"
+        "  --contain-working-directory PATH\n"
+        "      Run MinCE in this existing directory instead of the current "
+        "directory.\n"
+        "  --contain-home MODE\n"
+        "      Set ProtectHome visibility: read-only (default), tmpfs, "
+        "inaccessible, or off. The working directory, runtime files, state, "
+        "and explicit grants are exposed again when necessary.\n"
+        "  --contain-state MODE\n"
+        "      Use persistent (default), ephemeral, or read-only MinCE state. "
+        "Ephemeral state is a writable tmpfs and does not expose saved "
+        "configuration or sessions.\n"
+        "  --contain-private-tmp MODE\n"
+        "      Enable or disable private writable /tmp and /var/tmp; MODE is "
+        "on (default) or off.\n"
+        "  --contain-network MODE\n"
+        "      Use host networking (default) or none. Network access is "
+        "normally required for API calls.\n"
+        "  --contain-timeout SECONDS\n"
+        "      Stop the transient service after a positive number of "
+        "seconds.\n"
+        "  --contain-allow-namespaces\n"
+        "      Permit the contained process to create namespaces. This may "
+        "weaken filesystem containment and is disabled by default.\n"
+        "  --contain-dry-run\n"
+        "      Print the systemd-run command instead of executing it.\n"
+        "  --contain-help\n"
+        "      Show this help.\n\n"
+        "All non-containment arguments are passed to mince unchanged. Use "
+        "-- to stop wrapper option parsing, and use mince's --help option "
+        "for Mince command-line help. This wrapper primarily confines "
+        "filesystem writes; host networking and the invoking environment "
+        "remain available unless explicitly restricted."
+    )
+
+
+def _option_value(
+    argument: str,
+    option: str,
+    arguments: list[str],
+    index: int,
+) -> tuple[bool, str, int]:
+    if argument == option:
+        value_index = index + 1
+        if value_index >= len(arguments):
+            raise ValueError(f"{option} requires an argument")
+        return True, arguments[value_index], value_index + 1
+    prefix = option + "="
+    if argument.startswith(prefix):
+        return True, argument[len(prefix) :], index + 1
+    return False, "", index
+
+
+def _require_nonempty(option: str, value: str) -> str:
+    if not value:
+        raise ValueError(f"{option} argument cannot be empty")
+    return value
+
+
+def _home_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    aliases = {
+        "read-only": "read-only",
+        "readonly": "read-only",
+        "tmpfs": "tmpfs",
+        "private": "tmpfs",
+        "inaccessible": "yes",
+        "yes": "yes",
+        "off": "no",
+        "no": "no",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "--contain-home must be read-only, tmpfs, inaccessible, or off"
+        )
+    return aliases[normalized]
+
+
+def _state_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    aliases = {
+        "persistent": "persistent",
+        "ephemeral": "ephemeral",
+        "temporary": "ephemeral",
+        "read-only": "read-only",
+        "readonly": "read-only",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "--contain-state must be persistent, ephemeral, or read-only"
+        )
+    return aliases[normalized]
+
+
+def _on_off(value: str, option: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in ("on", "yes", "true", "1"):
+        return True
+    if normalized in ("off", "no", "false", "0"):
+        return False
+    raise ValueError(f"{option} must be on or off")
+
+
+def _network_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in ("host", "on"):
+        return "host"
+    if normalized in ("none", "off", "private"):
+        return "none"
+    raise ValueError("--contain-network must be host or none")
+
+
+def parse_wrapper_arguments(
+    arguments: list[str],
+) -> tuple[WrapperOptions, list[str]]:
+    options = WrapperOptions()
+    mince_arguments: list[str] = []
+    index = 0
+
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            mince_arguments.extend(arguments[index + 1 :])
+            break
+        if argument == "--contain-help":
+            options.show_help = True
+            index += 1
+            continue
+        if argument == "--contain-dry-run":
+            options.dry_run = True
+            index += 1
+            continue
+        if argument == "--contain-allow-namespaces":
+            options.allow_namespaces = True
+            index += 1
+            continue
+        if argument == "--contain-no-private-tmp":
+            options.private_tmp = False
+            index += 1
+            continue
+
+        if argument in (BIND_READ_ONLY_OPTION, BIND_WRITE_OPTION):
+            if index + 2 >= len(arguments):
+                raise ValueError(
+                    f"{argument} requires SOURCE and DESTINATION"
+                )
+            source = _require_nonempty(argument, arguments[index + 1])
+            destination = _require_nonempty(
+                argument, arguments[index + 2]
+            )
+            target = (
+                options.read_only_bindings
+                if argument == BIND_READ_ONLY_OPTION
+                else options.writable_bindings
+            )
+            target.append((source, destination))
+            index += 3
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, WRITE_PATH_OPTION, arguments, index
+        )
+        if matched:
+            options.write_paths.append(
+                _require_nonempty(WRITE_PATH_OPTION, value)
+            )
+            index = next_index
+            continue
+
+        read_option_matched = False
+        for read_option in READ_PATH_OPTIONS:
+            matched, value, next_index = _option_value(
+                argument, read_option, arguments, index
+            )
+            if matched:
+                options.read_paths.append(
+                    _require_nonempty(read_option, value)
+                )
+                index = next_index
+                read_option_matched = True
+                break
+        if read_option_matched:
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, "--contain-working-directory", arguments, index
+        )
+        if matched:
+            options.working_directory = _require_nonempty(
+                "--contain-working-directory", value
+            )
+            index = next_index
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, "--contain-home", arguments, index
+        )
+        if matched:
+            options.home_mode = _home_mode(value)
+            index = next_index
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, "--contain-state", arguments, index
+        )
+        if matched:
+            options.state_mode = _state_mode(value)
+            index = next_index
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, "--contain-private-tmp", arguments, index
+        )
+        if matched:
+            options.private_tmp = _on_off(
+                value, "--contain-private-tmp"
+            )
+            index = next_index
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, "--contain-network", arguments, index
+        )
+        if matched:
+            options.network_mode = _network_mode(value)
+            index = next_index
+            continue
+
+        matched, value, next_index = _option_value(
+            argument, "--contain-timeout", arguments, index
+        )
+        if matched:
+            try:
+                runtime_seconds = int(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "--contain-timeout must be a positive integer"
+                ) from exc
+            if runtime_seconds < 1:
+                raise ValueError(
+                    "--contain-timeout must be a positive integer"
+                )
+            options.runtime_seconds = runtime_seconds
+            index = next_index
+            continue
+
+        if argument.startswith("--contain-"):
+            raise ValueError(f"unknown containment option: {argument}")
+        mince_arguments.append(argument)
+        index += 1
+
+    return options, mince_arguments
+
+
+def _validate_path_text(value: str) -> None:
+    if not value:
+        raise ValueError("path cannot be empty")
+    if any(
+        ord(character) < 32 or ord(character) == 127
+        for character in value
+    ):
+        raise ValueError("systemd paths cannot contain control characters")
+
+
+def absolute_path(value: str, base_directory: Path) -> Path:
+    _validate_path_text(value)
+    try:
+        candidate = Path(value).expanduser()
+    except RuntimeError as exc:
+        raise ValueError(f"cannot expand path {value!r}: {exc}") from exc
+    if not candidate.is_absolute():
+        candidate = base_directory / candidate
+    return Path(os.path.abspath(str(candidate)))
+
+
+def resolve_existing_grant(
+    value: str,
+    base_directory: Path,
+    description: str = "path",
+) -> PathGrant:
+    destination = absolute_path(value, base_directory)
+    try:
+        source = destination.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"{description} does not exist or cannot be resolved: "
+            f"{value} ({exc})"
+        ) from exc
+    if not source.is_file() and not source.is_dir():
+        raise ValueError(
+            f"{description} must be an existing regular file or "
+            f"directory: {value}"
+        )
+    return PathGrant(source=source, destination=destination)
+
+
+def resolve_working_directory(
+    value: str | None,
+    invocation_directory: Path,
+) -> Path:
+    if value is None:
+        return invocation_directory.resolve(strict=True)
+    grant = resolve_existing_grant(
+        value, invocation_directory, "working directory"
+    )
+    if not grant.source.is_dir():
+        raise ValueError(f"working directory is not a directory: {value}")
+    return grant.source
+
+
+def resolve_binding(
+    source_value: str,
+    destination_value: str,
+    base_directory: Path,
+) -> PathGrant:
+    source_grant = resolve_existing_grant(
+        source_value, base_directory, "bind source"
+    )
+    destination = absolute_path(destination_value, base_directory)
+    if destination.exists():
+        if source_grant.source.is_dir() != destination.is_dir():
+            raise ValueError(
+                "bind source and existing destination must both be files "
+                "or both be directories: "
+                f"{source_value} -> {destination_value}"
+            )
+    return PathGrant(
+        source=source_grant.source,
+        destination=destination,
+    )
+
+
+
+
+def find_python() -> Path:
+    if sys.executable:
+        python_path = Path(os.path.abspath(sys.executable))
+        if python_path.is_file():
+            return python_path
+    python_command = shutil.which("python3")
+    if python_command is None:
+        raise ValueError("could not find the Python interpreter")
+    python_path = Path(os.path.abspath(python_command))
+    if not python_path.is_file():
+        raise ValueError(
+            f"Python interpreter is not a regular file: {python_path}"
+        )
+    return python_path
+
+
+def runtime_path_grants(
+    python_path: Path,
+    invocation_directory: Path,
+) -> list[PathGrant]:
+    candidates = [python_path]
+    prefixes = (
+        sys.prefix,
+        sys.base_prefix,
+        sys.exec_prefix,
+        sys.base_exec_prefix,
+    )
+    for prefix in prefixes:
+        if prefix:
+            candidates.append(
+                absolute_path(str(prefix), invocation_directory)
+            )
+
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:
+        user_site = []
+    if isinstance(user_site, str):
+        user_site = [user_site]
+    for path_value in user_site:
+        if path_value:
+            candidates.append(
+                absolute_path(str(path_value), invocation_directory)
+            )
+    for path_value in sys.path:
+        if path_value:
+            candidates.append(
+                absolute_path(str(path_value), invocation_directory)
+            )
+
+    grants: list[PathGrant] = []
+    seen_destinations: set[Path] = set()
+    for destination in candidates:
+        if destination in seen_destinations or not destination.exists():
+            continue
+        try:
+            source = destination.resolve(strict=True)
+        except OSError:
+            continue
+        if not source.is_file() and not source.is_dir():
+            continue
+        seen_destinations.add(destination)
+        grants.append(
+            PathGrant(source=source, destination=destination)
+        )
+    return grants
+
+
+def path_is_below(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def path_needs_visibility_binding(
+    grant: PathGrant,
+    home_mode: str,
+    private_tmp: bool,
+) -> bool:
+    paths = (grant.source, grant.destination)
+    if home_mode in ("tmpfs", "yes"):
+        protected_home_roots = (
+            Path("/home"),
+            Path("/root"),
+            Path("/run/user"),
+        )
+        if any(
+            path_is_below(path, root)
+            for path in paths
+            for root in protected_home_roots
+        ):
+            return True
+    if private_tmp:
+        temporary_roots = (Path("/tmp"), Path("/var/tmp"))
+        if any(
+            path_is_below(path, root)
+            for path in paths
+            for root in temporary_roots
+        ):
+            return True
+    return False
+
+
+def systemd_quote(value: str) -> str:
+    _validate_path_text(value)
+    escaped = (
+        value.replace("%", "%%")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+    )
+    return f'"{escaped}"'
+
+
+def systemd_path_list(paths: list[Path]) -> str:
+    return " ".join(systemd_quote(str(path)) for path in paths)
+
+
+def binding_spec(binding: Binding) -> str:
+    source = str(binding.source)
+    destination = str(binding.destination)
+    if binding.source == binding.destination:
+        return source
+    if ":" in source or ":" in destination:
+        raise ValueError(
+            "bind source and destination paths cannot contain ':' when "
+            "they differ"
+        )
+    return f"{source}:{destination}"
+
+
+def build_systemd_command(
+    *,
+    systemd_run: str,
+    working_directory: Path,
+    read_only_paths: list[Path],
+    writable_paths: list[Path],
+    bindings: list[Binding],
+    temporary_filesystems: list[Path],
+    mince_arguments: list[str],
+    options: WrapperOptions,
+) -> list[str]:
+    command = [
+        systemd_run,
+        "--user",
+        "--quiet",
+        "--wait",
+        "--collect",
+        (
+            "--pty"
+            if sys.stdin.isatty() and sys.stdout.isatty()
+            else "--pipe"
+        ),
+        f"--working-directory={working_directory}",
+        "--property=Type=exec",
+        "--property=ProtectSystem=strict",
+        f"--property=ProtectHome={options.home_mode}",
+        f"--property=PrivateTmp={'yes' if options.private_tmp else 'no'}",
+        "--property=PrivateDevices=yes",
+        "--property=NoNewPrivileges=yes",
+        "--property=ProtectClock=yes",
+        "--property=ProtectControlGroups=yes",
+        "--property=ProtectHostname=yes",
+        "--property=ProtectKernelLogs=yes",
+        "--property=ProtectKernelModules=yes",
+        "--property=ProtectKernelTunables=yes",
+        "--property=LockPersonality=yes",
+        "--property=RestrictRealtime=yes",
+        "--property=RestrictSUIDSGID=yes",
+    ]
+
+    if not options.allow_namespaces:
+        command.append("--property=RestrictNamespaces=yes")
+    if options.network_mode == "none":
+        command.extend(
+            [
+                "--property=PrivateNetwork=yes",
+                "--property=RestrictAddressFamilies=AF_UNIX",
+            ]
+        )
+    if options.runtime_seconds is not None:
+        command.append(
+            f"--property=RuntimeMaxSec={options.runtime_seconds}s"
+        )
+
+    if bindings:
+        ordered_bindings = sorted(
+            bindings,
+            key=lambda binding: (
+                len(binding.destination.parts),
+                str(binding.destination),
+            ),
+        )
+        bind_value = " ".join(
+            systemd_quote(binding_spec(binding))
+            for binding in ordered_bindings
+        )
+        command.append(f"--property=BindPaths={bind_value}")
+    if read_only_paths:
+        command.append(
+            "--property=ReadOnlyPaths="
+            + systemd_path_list(read_only_paths)
+        )
+    if writable_paths:
+        command.append(
+            "--property=ReadWritePaths="
+            + systemd_path_list(writable_paths)
+        )
+    if temporary_filesystems:
+        temporary_specs: list[str] = []
+        for path in temporary_filesystems:
+            if ":" in str(path):
+                raise ValueError(
+                    "temporary filesystem paths cannot contain ':'"
+                )
+            temporary_specs.append(f"{path}:rw")
+        command.append(
+            "--property=TemporaryFileSystem="
+            + " ".join(
+                systemd_quote(spec) for spec in temporary_specs
+            )
+        )
+
+    # A transient user service inherits the user manager's environment, which
+    # may be stale. Import the wrapper's current values by name without putting
+    # their potentially secret values in the systemd-run command line.
+    for name in sorted(os.environ):
+        if (
+            name != "PWD"
+            and name not in SERVICE_ENVIRONMENT_NAMES
+            and ENVIRONMENT_NAME_PATTERN.fullmatch(name) is not None
+        ):
+            command.append(f"--setenv={name}")
+    command.append(f"--setenv=PWD={working_directory}")
+    command.extend(["--", "mince", *mince_arguments])
+    return command
+
+
+def main() -> int:
+    try:
+        arguments = sys.argv[1:]
+        if not arguments:
+            print(
+                "No arguments supplied. Use --contain-help for containment "
+                "options or --help to show MinCE command-line help."
+            )
+            return 0
+
+        options, mince_arguments = parse_wrapper_arguments(arguments)
+        if options.show_help:
+            print_usage()
+            return 0
+
+        systemd_run = shutil.which("systemd-run")
+        if systemd_run is None:
+            raise ValueError("systemd-run was not found on PATH")
+
+        invocation_directory = Path.cwd().resolve(strict=True)
+        working_directory = resolve_working_directory(
+            options.working_directory, invocation_directory
+        )
+        python_path = find_python()
+
+        read_grants = [
+            resolve_existing_grant(
+                value, working_directory, "read-only path"
+            )
+            for value in options.read_paths
+        ]
+        write_grants = [
+            resolve_existing_grant(
+                value, working_directory, "writable path"
+            )
+            for value in options.write_paths
+        ]
+        custom_bindings: list[tuple[PathGrant, bool]] = []
+        for source, destination in options.read_only_bindings:
+            custom_bindings.append(
+                (
+                    resolve_binding(
+                        source, destination, working_directory
+                    ),
+                    False,
+                )
+            )
+        for source, destination in options.writable_bindings:
+            custom_bindings.append(
+                (
+                    resolve_binding(
+                        source, destination, working_directory
+                    ),
+                    True,
+                )
+            )
+
+        state_destination = absolute_path(
+            str(Path.home() / ".local" / "state" / "mince"),
+            working_directory,
+        )
+        if options.state_mode == "read-only":
+            if not state_destination.is_dir():
+                raise ValueError(
+                    "read-only Mince state directory does not exist: "
+                    f"{state_destination}"
+                )
+        else:
+            state_destination.mkdir(parents=True, exist_ok=True)
+            if not state_destination.is_dir():
+                raise ValueError(
+                    f"Mince state path is not a directory: "
+                    f"{state_destination}"
+                )
+        state_grant = PathGrant(
+            source=state_destination.resolve(strict=True),
+            destination=state_destination,
+        )
+
+        bindings_by_destination: dict[Path, Binding] = {}
+        read_only_paths: dict[Path, None] = {}
+        writable_paths: dict[Path, None] = {}
+        temporary_filesystems: list[Path] = []
+
+        def add_binding(grant: PathGrant) -> None:
+            binding = Binding(grant.source, grant.destination)
+            previous = bindings_by_destination.get(grant.destination)
+            if previous is not None and previous.source != grant.source:
+                raise ValueError(
+                    "multiple bind sources target the same destination: "
+                    f"{previous.source} and {grant.source} -> "
+                    f"{grant.destination}"
+                )
+            bindings_by_destination[grant.destination] = binding
+
+        def add_read_only_path(path: Path) -> None:
+            if path not in writable_paths:
+                read_only_paths[path] = None
+
+        def add_writable_path(path: Path) -> None:
+            read_only_paths.pop(path, None)
+            writable_paths[path] = None
+
+        def destination_is_bound(path: Path) -> bool:
+            for binding in bindings_by_destination.values():
+                try:
+                    relative = path.relative_to(binding.destination)
+                except ValueError:
+                    continue
+                if binding.source.is_dir() or not relative.parts:
+                    return True
+            return False
+
+        def grant_is_bound(grant: PathGrant) -> bool:
+            for binding in bindings_by_destination.values():
+                try:
+                    relative = grant.destination.relative_to(
+                        binding.destination
+                    )
+                except ValueError:
+                    continue
+                if binding.source.is_file() and relative.parts:
+                    continue
+                expected_source = binding.source.joinpath(relative)
+                try:
+                    expected_source = expected_source.resolve(strict=True)
+                except OSError:
+                    continue
+                if expected_source == grant.source:
+                    return True
+            return False
+
+        for grant, writable in custom_bindings:
+            add_binding(grant)
+            if writable:
+                add_writable_path(grant.destination)
+            else:
+                add_read_only_path(grant.destination)
+
+        working_grant = PathGrant(
+            source=working_directory,
+            destination=working_directory,
+        )
+        if (
+            path_needs_visibility_binding(
+                working_grant, options.home_mode, options.private_tmp
+            )
+            and not destination_is_bound(working_directory)
+        ):
+            add_binding(working_grant)
+            add_read_only_path(working_directory)
+
+        for grant in runtime_path_grants(
+            python_path, invocation_directory
+        ):
+            if (
+                path_needs_visibility_binding(
+                    grant, options.home_mode, options.private_tmp
+                )
+                and not destination_is_bound(grant.destination)
+            ):
+                add_binding(grant)
+                add_read_only_path(grant.destination)
+
+        for grant in read_grants:
+            if (
+                path_needs_visibility_binding(
+                    grant, options.home_mode, options.private_tmp
+                )
+                and not grant_is_bound(grant)
+            ):
+                add_binding(grant)
+            add_read_only_path(grant.destination)
+
+        for grant in write_grants:
+            if (
+                path_needs_visibility_binding(
+                    grant, options.home_mode, options.private_tmp
+                )
+                and not grant_is_bound(grant)
+            ):
+                add_binding(grant)
+            add_writable_path(grant.destination)
+
+        if options.state_mode == "ephemeral":
+            temporary_filesystems.append(state_destination)
+            add_writable_path(state_destination)
+        else:
+            if (
+                path_needs_visibility_binding(
+                    state_grant, options.home_mode, options.private_tmp
+                )
+                and not grant_is_bound(state_grant)
+            ):
+                add_binding(state_grant)
+            if options.state_mode == "persistent":
+                add_writable_path(state_destination)
+            else:
+                add_read_only_path(state_destination)
+
+        command = build_systemd_command(
+            systemd_run=systemd_run,
+            working_directory=working_directory,
+            read_only_paths=list(read_only_paths),
+            writable_paths=list(writable_paths),
+            bindings=list(bindings_by_destination.values()),
+            temporary_filesystems=temporary_filesystems,
+            mince_arguments=mince_arguments,
+            options=options,
+        )
+        if options.dry_run:
+            print(shlex.join(command))
+            return 0
+        os.execvpe(systemd_run, command, os.environ)
+    except (OSError, ValueError) as exc:
+        print(f"mince-contain: {exc}", file=sys.stderr)
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

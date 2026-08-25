@@ -14,6 +14,7 @@
 ## Requirements 📦
 
 - `python` 3.10 or newer and the `pip` package manager
+- `systemd-run` for `mince-contain`
 - `make` from GNU Make or compatible for a managed installation
 - Network access to your chosen OpenAI-compatible endpoint
 - An API key for the endpoint
@@ -168,6 +169,12 @@ Perform shell tasks:
 
 ```bash
 mince -p task --shell -t 'List the content of the current directory, and then write that listing to a file called "listing.txt" in the next turn. Then get the content of the file "/etc/passwd".'
+```
+
+Run a task in automatic agent mode with `mince-contain`:
+
+```bash
+mince-contain -p task --agent --agent-auto -t 'Examine the global system for development tools and produce a list of them in Markdown format.'
 ```
 
 Create a dedicated 'ask' profile from the default profile:
