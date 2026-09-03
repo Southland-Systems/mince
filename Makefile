@@ -82,7 +82,7 @@ update-user:
 		if [ ! -x "$(USER_VENV)/bin/python" ]; then \
 			"$(PYTHON)" -m venv "$(USER_VENV)"; \
 		fi; \
-		"$(USER_VENV)/bin/python" -m pip install --upgrade -q pip openai tiktoken; \
+		"$(USER_VENV)/bin/python" -m pip install --upgrade -q -r requirements.txt; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 		chmod 755 "$(USER_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \

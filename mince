@@ -7,8 +7,10 @@ An assistant for turning local files into useful answers.
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
+import socket
 import hashlib
 import argparse
 import json
@@ -50,6 +52,7 @@ from openai import (
     UnprocessableEntityError,
 )
 import httpx
+import pyseccomp as seccomp
 
 VERBOSE = 1
 DEBUG = 0
@@ -2354,9 +2357,34 @@ def _terminate_shell_process(process: Any) -> None:
         process.kill()
 
 
+def _restrict_shell_address_families() -> None:
+    seccomp_filter = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
+    denied_action = seccomp.ERRNO(errno.EAFNOSUPPORT)
+    for syscall in ("socket", "socketpair"):
+        seccomp_filter.add_rule(
+            denied_action,
+            syscall,
+            seccomp.Arg(0, seccomp.NE, socket.AF_UNIX),
+        )
+    seccomp_filter.load()
+
+
+def _shell_popen_kwargs(shell_networking: bool) -> dict[str, Any]:
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    if shell_networking:
+        return popen_kwargs
+    if sys.platform != "linux":
+        raise OSError("shell networking restrictions require Linux")
+    popen_kwargs["preexec_fn"] = _restrict_shell_address_families
+    return popen_kwargs
+
+
 def execute_shell_commands(
     commands: list[ShellStep],
     timeout: int,
+    shell_networking: bool = False,
  ) -> str:
     output_blocks: list[str] = []
     command_timeout = max(1, int(timeout))
@@ -2365,16 +2393,14 @@ def execute_shell_commands(
         if step.lines:
             script_input = "\n".join(step.lines) + "\n"
         try:
-            popen_kwargs: dict[str, Any] = {}
-            if os.name == "posix":
-                popen_kwargs["start_new_session"] = True
+            popen_kwargs = _shell_popen_kwargs(shell_networking)
             process = subprocess.Popen(
                 step.command,
                 shell=True,
-                stdin=subprocess.PIPE,
-                text=True,
+                stdin=subprocess.PIPE if script_input is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                text=True,
                 **popen_kwargs,
             )
             try:
@@ -5748,6 +5774,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--shell-networking",
+        action="store_true",
+        default=False,
+        help="Allow shell commands to use network address families other than AF_UNIX",
+    )
+
+    parser.add_argument(
         '--patch-branch',
         nargs='?',
         const=PATCH_BRANCH_DEFAULT_NAME,
@@ -6461,6 +6494,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "agent_auto": False,
         "patch": False,
         "shell": False,
+        "shell_networking": False,
         "patch_review": False,
         "patch_branch": False,
         "patch_branch_remove": None,
@@ -6595,8 +6629,7 @@ def main() -> int:
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
             ("--shell", args.shell is not None),
-            ("--reuse-session", args.reuse_session is not None),
-            ("--shell", args.shell is not None),
+            ("--shell-networking", args.shell_networking),
             ("--reuse-session", args.reuse_session is not None),
             ("--tree-files", args.tree_files is not None),
             ("--tree-files-list", args.tree_files_list is not None),
@@ -7105,6 +7138,7 @@ def main() -> int:
         config,
         'shell',
     )
+    shell_networking = args.shell_networking
     agent_mode = args.agent
     agent_auto = args.agent_auto
     if (
@@ -7200,11 +7234,20 @@ def main() -> int:
         patch_suffix = ''
         suffix_provided = False
 
-    if tree_mode and (plan_mode or patch_mode or shell_mode or agent_mode):
-        print("ERROR: tree mode cannot be combined with --plan, --patch, --shell, or --agent", file=sys.stderr)
+    if tree_mode and (
+        plan_mode or patch_mode or shell_mode or shell_networking or agent_mode
+    ):
+        print(
+            "ERROR: tree mode cannot be combined with --plan, --patch, --shell, "
+            "--shell-networking, or --agent",
+            file=sys.stderr,
+        )
         return 1
     if patch_mode and shell_mode:
         print("ERROR: --shell cannot be combined with --patch", file=sys.stderr)
+        return 1
+    if shell_networking and not shell_mode:
+        print("ERROR: --shell-networking requires --shell", file=sys.stderr)
         return 1
     if agent_auto and not agent_mode:
         print("ERROR: --agent-auto requires --agent", file=sys.stderr)
@@ -8752,7 +8795,11 @@ def main() -> int:
                 return 0
             shell_output_is_new = pending_reused_shell_output is None
             if shell_output_is_new:
-                shell_output = execute_shell_commands(shell_steps, llm_timeout)
+                shell_output = execute_shell_commands(
+                    shell_steps,
+                    llm_timeout,
+                    shell_networking=shell_networking,
+                )
                 if state_turn_path is not None:
                     try:
                         write_state_shell_output(state_turn_path, shell_output)
