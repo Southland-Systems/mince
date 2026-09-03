@@ -117,8 +117,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "system_prompt_with_task": "off",
     "line_numbers": "on",
     "prompt_expansion": "off",
-    "patch": "off",
     "shell": "off",
+    "shell_networking": "off",
+    "patch": "off",
     "patch_save": "on",
     "patch_review": "off",
     "patch_branch": "off",
@@ -1583,6 +1584,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "shell", "Shell mode (off, on)")
+    prompt_config_value(config, "shell_networking", "Allow networking for shell and agent shell tools (off, on)")
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
     prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)", parse_patch_branch_value)
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
@@ -3778,6 +3780,7 @@ class AgentRunSettings:
     worker_system_prompt: str
     linenum_system_prompt: str
     shell_system_prompt: str
+    shell_networking: bool
     patch_system_prompt: str
     system_prompt_with_task: bool
     add_line_numbers: bool
@@ -4472,6 +4475,7 @@ def run_agent_shell_tool(
     shell_output = execute_shell_commands(
         commands,
         settings.model_settings.llm_timeout,
+        shell_networking=settings.shell_networking,
     )
     try:
         write_state_shell_output(turn_dir, shell_output)
@@ -5754,16 +5758,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--patch",
-        nargs="?",
-        const=True,
-        default=None,
-        type=parse_bool,
-        metavar="BOOL",
-        help="Patch specified files and write changes to the filename + patch suffix",
-    )
-
-    parser.add_argument(
         "--shell",
         nargs="?",
         const=True,
@@ -5776,8 +5770,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shell-networking",
         action="store_true",
-        default=False,
-        help="Allow shell commands to use network address families other than AF_UNIX",
+        default=None,
+        help="Allow --shell or --agent shell commands to use network address families other than AF_UNIX",
+    )
+
+    parser.add_argument(
+        "--patch",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Patch specified files and write changes to the filename + patch suffix",
     )
 
     parser.add_argument(
@@ -7138,7 +7142,11 @@ def main() -> int:
         config,
         'shell',
     )
-    shell_networking = args.shell_networking
+    shell_networking = resolve_bool_option(
+        args.shell_networking,
+        config,
+        'shell_networking',
+    )
     agent_mode = args.agent
     agent_auto = args.agent_auto
     if (
@@ -7246,8 +7254,8 @@ def main() -> int:
     if patch_mode and shell_mode:
         print("ERROR: --shell cannot be combined with --patch", file=sys.stderr)
         return 1
-    if shell_networking and not shell_mode:
-        print("ERROR: --shell-networking requires --shell", file=sys.stderr)
+    if shell_networking and not (shell_mode or agent_mode):
+        print("ERROR: --shell-networking requires --shell or --agent", file=sys.stderr)
         return 1
     if agent_auto and not agent_mode:
         print("ERROR: --agent-auto requires --agent", file=sys.stderr)
@@ -8207,6 +8215,7 @@ def main() -> int:
             worker_system_prompt=agent_worker_system_prompt,
             linenum_system_prompt=linenum_system_prompt,
             shell_system_prompt=shell_system_prompt,
+            shell_networking=shell_networking,
             patch_system_prompt=patch_system_prompt,
             system_prompt_with_task=system_prompt_with_task,
             add_line_numbers=add_line_numbers,
