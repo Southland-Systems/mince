@@ -2,14 +2,18 @@
 
 ## What it does ✨
 
-- Answers direct prompts or performs tasks using one or more local files as context
-- Sends requests to an OpenAI-compatible model endpoint, including optional local model servers
-- Generates structured multi-file patches with diffs, optional review, and configurable output suffixes
-- Processes files recursively in tree mode with include/exclude filters, concurrent requests, retries, and resumable sessions
-- Supports plan mode plus text, JSON, JSON Schema Structured Outputs, and streamed text responses
-- Supports configuration profiles, reusable prompt-library entries, custom system prompts, reasoning controls, and model parameters
-- Provides optional local session logging, API storage controls, usage statistics, token estimates, and cost estimates
-- Creates a context-controlled, continuously verified workflow that maximizes cost effectiveness
+- **Context-aware assistance:** answers direct questions or performs tasks using local files, file lists, standard input, editor-authored prompts, and reusable session context.
+- **OpenAI-compatible by design:** connects to hosted providers or local model servers through configurable API URLs, keys, proxies, organizations, projects, service tiers, sampling controls, reasoning settings, and custom request parameters.
+- **Flexible output contracts:** generates plain text, streamed text, JSON objects, or JSON Schema-validated Structured Outputs; responses can also be written directly to files.
+- **Composable prompting:** supports system-prompt files, task files, a reusable prompt library with nested expansion, mode-specific prompts, and configuration profiles with inheritance.
+- **Planning before execution:** turns a task and its context into a reviewable next-step prompt before making the primary request.
+- **Structured code changes:** produces line-aware, multi-file patch manifests that preserve declared encodings and line endings, show unified diffs, support iterative revisions and review, save artifacts, and can be applied or printed later.
+- **Git-aware patch workflows:** writes suffixed patch files by default, can update approved files in place, and optionally creates, commits, merges, or removes isolated patch branches.
+- **Reviewed shell automation:** generates shell-command manifests with reasons, supports multi-turn command workflows and revisions, enforces per-command timeouts, and restricts network address families on Linux unless networking is explicitly enabled.
+- **Tool-calling agents:** runs confirmed or automatic multi-turn controller sessions that can patch files, run shell commands, delegate through named agent profiles, retain pinned context, and end with an auditable tool history.
+- **Scalable tree processing:** recursively processes filtered file trees with extension-specific tasks and system prompts, bounded parallelism, adaptive retry/backoff, persistent progress, resumable work, and combined Markdown reports.
+- **Session traceability:** stores request state, checksums, responses, reasoning, diffs, shell output, and applied-patch records; sessions can be reused, inspected as JSON, viewed through a pager, or expired automatically.
+- **Operational visibility:** provides input-token estimates, API usage and cost estimates, response statistics, local logging, API-side storage controls, debug request output, and model discovery.
 
 ## Requirements 📦
 
@@ -124,7 +128,7 @@ mince --task "Provide the file name and line count as JSON" \
   --schema-file filemeta-schema.json
 ```
 
-Generate a patch, review the diff, and write the approved result to the original and new file:
+Generate a patch, review the diff, and write approved existing-file changes in place (the manifest may also create new files):
 
 ```bash
 cp /etc/passwd .
@@ -174,7 +178,7 @@ mince -p task --shell -t 'List the content of the current directory, and then wr
 Run a task in automatic agent mode with `mince-contain`:
 
 ```bash
-mince-contain -p task --agent --agent-auto -t 'Examine the global system for development tools and produce a list of them in Markdown format.'
+mince-contain --contain-write-path . -p task --agent  --agent-auto --task 'Determine the globally installed software development tools and write using "patch" as Markdown format to filename `sdk.md`.'
 ```
 
 Create a dedicated 'ask' profile from the default profile:
@@ -244,18 +248,6 @@ Copy a configuration option from another profile:
 mince --profile aws_grok --set-config-from base_url aws
 ```
 
-Run MinCE in a restricted systemd user unit for testing:
-
-```bash
-systemd-run --user -qt -p ProtectSystem=strict \
-  -p ProtectHome=read-only -p PrivateTmp=yes \
-  mince --help
-
-# -p RestrictAddressFamilies=AF_UNIX
-# https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html
-# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
-```
-
 ## Local model servers 🌐
 
 Use any OpenAI‑compatible base URL, including Ollama:
@@ -266,56 +258,13 @@ mince --base-url http://localhost:11434/v1 \
   --files README.md
 ```
 
-## Core workflows: ask, task, patch, plan, and tree ⚡
-
-MinCE centers on five complementary modes. Each mode provides a focused way to send instructions to an OpenAI-compatible model, from quick answers to repeatable, reviewable changes across a codebase.
-
-### Ask mode — quick answers without file context
-
-Use `--ask` (or `--ask-file`) when the model does not need local file context. The configured system prompt still applies. Pass `-` to read the prompt from standard input, or `e` to compose it in `$EDITOR`. Ask mode is mutually exclusive with contextual task and tree inputs.
-
-### Task mode — turn context into action
-
-Task mode is the primary context-aware workflow. Provide an objective with `--task` or `--task-file` and select files with `--files` or `--files-list`. MinCE assembles the files into bounded, line-numbered context by default, making code reviews, explanations, summaries, and implementation tasks concrete and easy to reference. Files larger than the configured limit are skipped.
-
-### Patch mode — changes you can inspect and trust
-
-Append `--patch` to turn a task into a structured, multi-file edit. The model returns a strict `line_replace_manifest`; MinCE validates the replacement ranges, generates a unified diff, and writes modified files alongside the originals using the `.mcepatched` suffix by default. When enabled, the diff is also saved under `~/.local/state/mince/patches`.
-
-Enable `--patch-review` to inspect the diff and approve or cancel it. Approved changes go to the original files by default; explicitly providing `--patch-suffix` writes the approved result to separate suffixed files instead. Patch mode requires `--task` or `--task-file` together with the files to edit.
-
-### Plan mode — think once, execute with intent
-
-The `--plan` option asks the model to turn the supplied task and file context into a self-contained prompt for the next step. MinCE displays the proposed prompt and offers paging, editing, acceptance, or cancellation; only an accepted plan becomes the actual task. Plan mode works with contextual task inputs and can be combined with `--patch` for a planning phase before a controlled edit.
-
-### Tree mode — scale the same judgement across a codebase
-
-Tree mode makes one focused request per matched file. Start with `--tree-files` or `--tree-files-list`, then provide `--tree-task` or an extension-aware `--tree-task-file`. Directories are traversed recursively, `.git` directories are excluded by default, and `--tree-include` and `--tree-exclude` refine the scope. Requests run concurrently with up to 16 workers by default, adjustable with `--tree-parallel`; transient failures are retried with adaptive concurrency and backoff.
-
-Use `.ext:task`, `*:task`, and unprefixed overall-task lines in `--tree-task-file`. `--tree-system-prompt-file` supports the same extension, wildcard, and overall-prompt selection for system instructions. Per-file results, resumable state, and a consolidated Markdown report are stored under `~/.local/state/mince/trees/SESSION_NAME`. Use `--reuse-session NAME` to continue unfinished work. Tree mode cannot be combined with regular ask/task inputs, plan mode, or patch mode.
-
-### Profiles — save your best operating setup
-
-Profiles capture reliable workflows behind a single flag. The default profile resides at `~/.local/state/mince/config.json`; additional named profiles are stored alongside it and can independently configure the model, endpoint, prompts, patch settings, limits, and logging options. Activate a profile with `-p NAME`, initialize or modify one with `--init-profile NAME`, and manage profiles with `--copy-profile`, `--list-profiles`, or `--remove-profile`.
-
-```bash
-mince --init-profile review
-mince -p review --task "Review the public API" --files src/api.py README.md
-```
-
-### Prompt library — reusable instructions
-
-Reusable prompts can be stored as Markdown files in `~/.local/state/mince/prompts/`. `NAME` is the prompt name in the library without the `.md` extension, `PROFILE` is a configuration profile name, and `TYPE` is one of `system`, `linenum`, `patch`, or `plan`.
-
-Create or edit a prompt with `--prompt-edit NAME`, then assign it to a profile with `--prompt-assign NAME PROFILE TYPE`. Assignment prepends a file-backed prompt reference while retaining existing prompt text. Use `--prompt-assign-text` to store the prompt text directly, or `--prompt-assign-replace` to replace the target with only its file reference. `--prompt-unassign NAME PROFILE [TYPE]` removes one file-backed reference, or all prompt-type references when `TYPE` is omitted. Finally, `--prompt-remove NAME` removes references to the prompt from all profiles and deletes its file. Enable `--prompt-expansion` to expand `^^promptname^^` references in tasks and configured prompts.
-
 
 ## Tested Providers ⚒️
 
 | Provider | Model | Status |
 |----------|-------|--------|
-| OpenAI | GPT 5.6 | ✅ |
-| Alibaba | Qwen 3.7 |  ✅ |
+| OpenAI | GPT 6 Astra | ✅ |
+| Alibaba | Qwen 3.8 |  ✅ |
 | Oracle | GPT-OSS-120b | ✅ |
 | xAI | Grok 4.5  | ✅ |
 | AWS | GPT-OSS-120b | ✅ |
@@ -327,48 +276,59 @@ Create or edit a prompt with `--prompt-edit NAME`, then assign it to a profile w
 - Binary files are not supported
 - JSON Schema mode is best when you need machine‑readable output
 - Token estimation is provided by `tiktoken` which will download an encoder on first use
-- MinCE is tested on and assisted by `GPT 5.6 Luna`
+- MinCE is tested on and assisted by `GPT 5.6 Terra`
 
 ## Command line arguments 📋
 
-All public `mince` CLI arguments for reference.
+All public `mince` CLI arguments for reference. Options that modify a configuration profile use the profile selected with `-p` or `--profile`.
 
 | Argument | Description |
 |----------|-------------|
 | `-h`, `--help` | Show the help message and exit. |
 | `-a TEXT`, `--ask TEXT` | Prompt without file context; use `-` for standard input or `e` to edit with `$EDITOR`. |
-| `--ask-file FILE` | Read the ask prompt from the given file. |
+| `--ask-file FILE...` | Read and combine an ask prompt from one or more files. |
 | `-t TEXT`, `--task TEXT` | Task or prompt for the model with file context; use `-` for standard input or `e` to edit. |
-| `--task-file FILE` | Read the contextual task or prompt from the given file. |
+| `--task-file FILE...` | Read and combine a contextual task or prompt from one or more files. |
 | `--plan [BOOL]` | Generate and review an AI prompt from the task and context before using it as the task. |
-| `-f FILE...`, `--files FILE...` | Include the specified files as context. |
-| `--files-list FILE` | Read context-file paths from a file, one path per line; blank lines and lines beginning with `#` are ignored. |
+| `--agent` | Run a confirmed multi-turn agent session that uses controller tool calls. |
+| `--agent-auto` | Automatically confirm agent tool calls and display each call before execution; agent patches overwrite source files unless `--patch-suffix` is supplied. Requires `--agent`. |
+| `--agent-profile NAME[,NAME...]` | Load stored agent profiles as individually named agent controller tools. Requires `--agent`. |
+| `-f FILE...`, `--files FILE...` | Include the specified files as context; use `-` for standard input. |
+| `--files-list FILE...` | Read context-file paths from one or more files; blank lines and lines beginning with `#` are ignored. |
+| `-p NAME`, `--profile NAME` | Select a configuration profile. |
+| `-o FILE`, `--output-file FILE` | Write response output to the given file, overwriting it if it exists. |
+| `--shell [BOOL]` | Generate, review, and run shell commands for the task. |
+| `--shell-networking` | Allow shell commands, including agent shell tools, to use network address families other than `AF_UNIX`. |
+| `--patch [BOOL]` | Generate a structured multi-file patch and write changed files using the patch suffix; requires a task and context files. |
+| `--patch-branch [BOOL\|NAME]` | Use a git branch for patch changes; the default branch is `mcebranch`, and custom names receive an `mce` prefix when needed. |
+| `-D [NAME]`, `--patch-branch-remove [NAME]` | Delete a patch branch; defaults to `mcebranch`. |
+| `-M TEXT...`, `--patch-merge TEXT...` | Squash-merge the selected patch branch and commit the result with `TEXT`; the default branch is `mcebranch`. |
+| `--patch-review [BOOL]` | Review the generated diff before writing; approved changes use original files by default unless a patch suffix is explicitly supplied. |
+| `-S SUFFIX`, `--patch-suffix SUFFIX` | Set the suffix for patched files; the default is `.mcepatched`. |
+| `--patch-save [BOOL]` | Save generated patch files under `~/.local/state/mince/patches`; the default is `on`. |
+| `--patch-file-apply SESSION_OR_PATH [TURN]` | Apply a saved session patch, optionally from a specific turn, or apply a JSON patch manifest file. |
+| `--patch-file-print SESSION_OR_PATH [TURN]` | Print the diff from a saved session patch, optionally from a specific turn, or from a JSON patch manifest file. |
+| `--noninteractive` | Disable review prompts, save the response or patch artifacts, and exit. |
+| `--reuse-session SESSION_NAME [TURN]` | Reuse saved context and task state from a session; optionally select a completed turn. Tree mode resumes unfinished work. |
+| `--reuse-session-skip-verify` | Skip checksum verification of reused session context files. |
 | `--tree-files PATH...` | Recursively process the specified files or directories in tree mode. |
-| `--tree-files-list FILE` | Read tree-mode file or directory roots from a file. |
+| `--tree-files-list FILE...` | Read tree-mode file or directory roots from one or more files. |
 | `--tree-task TEXT...` | Set the tree-mode task directly; use `-` for standard input or `e` to edit. |
-| `--tree-task-file FILE` | Read extension-specific, wildcard, or overall tree tasks; use `.ext:task`, `*:task`, or an unprefixed overall task line. |
-| `--tree-system-prompt-file FILE` | Read extension-specific, wildcard, or overall tree system prompts using the same line format. |
+| `--tree-task-file FILE...` | Read extension-specific, wildcard, or overall tree tasks; use `.ext:task`, `*:task`, or an unprefixed overall task line. |
+| `--tree-system-prompt-file FILE` | Read extension-specific, wildcard, or overall tree system prompts using the same line format as `--tree-task-file`. |
 | `--tree-exclude PATTERN...` | Exclude tree files matching any supplied pattern. |
-| `--tree-exclude-git [BOOL]` | Exclude `.git` directories from tree search; default is `on`. |
+| `--tree-exclude-git [BOOL]` | Exclude `.git` directories from tree search; the default is `on`. |
 | `--tree-include PATTERN...` | Include only tree files matching at least one supplied pattern. |
 | `--tree-show-only` | Print the filtered tree file list and exit without making API calls. |
-| `--tree-parallel [N]` | Set the maximum number of concurrent tree requests; default is `16`, and `N` must be at least `1`. |
-| `--reuse-session SESSION_NAME [TURN]` | Reuse the named session's saved context and state; optionally select a completed turn. In tree mode, resume unfinished work. |
-| `-p NAME`, `--profile NAME` | Select a configuration profile. |
-| `--log-view SESSION` | Display a saved local log session. |
-| `--patch-view SESSION` | Display a saved patch session. |
-| `--tree-view SESSION` | Display a saved combined tree report. |
-| `--remove-expired-data [KEEP_DAYS]` | Delete session data older than `KEEP_DAYS` days; defaults to `60` when omitted. |
-| `-o FILE`, `--output-file FILE` | Write a regular-mode response to the given file, overwriting it if it exists. |
-| `--patch [BOOL]` | Generate a structured multi-file patch and write changed files using the patch suffix; requires a task and context files. |
-| `--patch-review [BOOL]` | Review the generated diff before writing; approved changes use original files by default, unless a patch suffix is explicitly provided. |
-| `-S SUFFIX`, `--patch-suffix SUFFIX` | Set the suffix for patched files; default is `.mcepatched`. |
-| `--patch-save [BOOL]` | Save the generated patch under `~/.local/state/mince/patches`; default is `on`. |
-| `--prompt-expansion [BOOL]` | Expand `^^promptname^^` references using the prompt library; default is `off`. |
+| `--tree-parallel [N]` | Set the maximum number of concurrent tree requests; the default is `16`, and `N` must be at least `1`. |
 | `--system-prompt TEXT` | Override the configured system prompt. |
 | `--system-prompt-file FILE` | Read the system prompt from the given file. |
+| `--system-prompt-with-task [BOOL]` | Append the task to the system prompt instead of including it in the user prompt. |
+| `--linenum-system-prompt TEXT` | Set the system prompt used to explain or handle context-file line numbers. |
 | `--patch-system-prompt TEXT` | Set the system prompt used for patch mode. |
+| `--shell-system-prompt TEXT` | Set the system prompt used for shell-command mode. |
 | `--plan-system-prompt TEXT` | Set the system prompt used for plan mode. |
+| `--prompt-expansion [BOOL]` | Expand `^^promptname^^` references using the prompt library; the default is `off`. |
 | `--model MODEL` | Override the configured model. |
 | `--list-models` | List models available from the configured endpoint. |
 | `--base-url URL` | Set the OpenAI-compatible API base URL. |
@@ -379,7 +339,7 @@ All public `mince` CLI arguments for reference.
 | `--response-format {text,json,schema}` | Select text, JSON object, or JSON Schema output. `schema` requires `--schema-file`. |
 | `--stream [BOOL]` | Stream generated responses; streaming is supported only for text output. |
 | `--schema-file FILE` | Load a JSON Schema for `--response-format schema`. |
-| `--response-verbosity {low,medium,high,off}` | Set the verbosity level for text responses; default is `off`. |
+| `--response-verbosity {low,medium,high,off}` | Set the verbosity level for text responses; the default is `off`. |
 | `--temperature FLOAT` | Set sampling temperature from `0.0` to `2.0`, or use `off` to disable it. |
 | `--top-p FLOAT` | Set top-p nucleus sampling from `0.0` to `1.0`, or use `off` to disable it. |
 | `--reasoning {off,none,minimal,low,medium,high,xhigh,max}` | Set reasoning effort, or use `off` to disable it. |
@@ -390,8 +350,7 @@ All public `mince` CLI arguments for reference.
 | `--estimate-only` | Print only the estimated input-token count and exit without making an API request. |
 | `--max-output-tokens LIMIT` | Set the maximum output tokens the model may use; the built-in default is `65534`. |
 | `--llm-timeout SECONDS` | Set the API request timeout in seconds; the built-in default is `300`. |
-| `--linenum-system-prompt TEXT` | Set the system prompt used to explain or handle context-file line numbers. |
-| `--no-line-numbers [BOOL]` | Control whether line-number prefixes are added to context files; `false` disables them. |
+| `--no-line-numbers [BOOL]` | When true, omit line-number prefixes from context files. |
 | `--print-reasoning [BOOL]` | Include reasoning output in `<think>` tags. |
 | `--print-default-config` | Print the built-in default configuration as JSON. |
 | `--print-current-config` | Print the stored configuration file, creating it if missing; the API key is masked. |
@@ -399,7 +358,7 @@ All public `mince` CLI arguments for reference.
 | `--set-config-from NAME PROFILE` | Set a configuration value in the selected profile from another profile. |
 | `--get-config [NAME]` | Print one configuration value, or all values when `NAME` is omitted. |
 | `--log [BOOL]` | Enable or disable local session logging under `~/.local/state/mince/logs`; the default is `on`, and tree mode always logs its work. |
-| `--no-api-log [BOOL]` | Disable storing requests and responses in the OpenAI-compatible API. |
+| `--no-api-log [BOOL]` | Control API-side request and response storage; the bare option disables storage. |
 | `--quiet [BOOL]` | Suppress extra output such as statistics and informational messages. |
 | `--debug` | Print request and response objects inside debug tags. |
 | `--init` | Initialize and interactively change the default configuration file. |
@@ -407,15 +366,32 @@ All public `mince` CLI arguments for reference.
 | `--copy-profile NEW_NAME` | Copy the selected configuration profile to a new profile. |
 | `--remove-profile NAME` | Remove a configuration profile. |
 | `--list-profiles` | List available configuration profiles. |
-| `--show-profiles [NAME...]` | Display all configuration profiles, or only the named profiles, through the pager. |
+| `--inherit-profile NEW_NAME` | Create a profile that inherits the selected profile. |
+| `--print-profiles [NAME...]` | Display all configuration profiles, or only the named profiles, through the pager. |
+| `--print-profiles-json [NAME...]` | Display all configuration profiles, or only the named profiles, as a JSON object keyed by name. |
 | `--prompt-list` | List stored prompts and their profile assignments. |
 | `--prompt-edit NAME [TEXT...]` | Edit or create a prompt-library entry; additional text forms its content, otherwise `$EDITOR` is opened. |
-| `--prompt-assign NAME PROFILE TYPE` | Prepend a file-backed prompt reference to the selected profile prompt type, retaining existing text. |
-| `--prompt-assign-text NAME PROFILE TYPE` | Replace the selected profile prompt type with the text stored in the named prompt. |
-| `--prompt-assign-replace NAME PROFILE TYPE` | Replace the selected profile prompt type with only a file-backed reference to the named prompt. |
-| `--prompt-unassign NAME PROFILE [TYPE]` | Remove the named prompt reference from one prompt type, or from all prompt types when `TYPE` is omitted. |
+| `--prompt-assign NAME TYPE` | Prepend a file-backed prompt reference to the selected profile prompt type. Types are `system`, `linenum`, `patch`, `plan`, and `shell`. |
+| `--prompt-assign-text NAME TYPE` | Replace the selected profile prompt type with the text stored in the named prompt. |
+| `--prompt-assign-replace NAME TYPE` | Replace the selected profile prompt type with only a file-backed reference to the named prompt. |
+| `--prompt-unassign NAME [TYPE]` | Remove the named prompt reference from one prompt type, or from all prompt types when `TYPE` is omitted. |
 | `--prompt-remove NAME` | Remove references to the named prompt from all profiles and delete its library file. |
-| `--prompt-print NAME` | Print the stored prompt-library entry. |
+| `--prompt-print [NAME...]` | Print all stored prompts or the specified prompt-library entries. |
+| `--prompt-print-json [NAME...]` | Print all stored prompts or the specified entries as a JSON object keyed by name. |
+| `--agent-profile-edit NAME [TEXT...]` | Edit or create an agent profile; additional text forms its content, otherwise `$EDITOR` is opened. |
+| `--agent-profile-description NAME [TEXT...]` | Set an agent profile description from optional text or an editor. |
+| `--agent-profile-type NAME [TYPE]` | Set an agent profile type, or omit `TYPE` for `custom`. Types are `custom`, `patch`, `shell`, and `text`. |
+| `--agent-profile-copy NAME NEW_NAME` | Copy an agent profile. |
+| `--agent-profile-rename NAME NEW_NAME` | Rename an agent profile. |
+| `--agent-profile-remove NAME` | Remove an agent profile. |
+| `--agent-profile-print-json [NAME...]` | Print stored agent profiles as a JSON object keyed by name. |
+| `--agent-profile-list` | List stored agent profile names and descriptions. |
+| `--log-view SESSION` | Display a saved local log session. |
+| `--patch-view SESSION` | Display a saved patch session. |
+| `--tree-view SESSION` | Display a saved combined tree report. |
+| `--state-print-json [SESSION [TURN] [TYPE...]]` | Print saved state artifacts as JSON; with no arguments, list available artifact types. |
+| `--shell-session-print-json SESSION [TURN]` | Print a saved shell-session response as JSON, optionally for a specific turn. |
+| `--remove-expired-data [KEEP_DAYS]` | Delete logs, patches, tree output, and state data older than `KEEP_DAYS`; the default is `60`. |
 
 Environment variable reference.
 

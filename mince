@@ -58,6 +58,22 @@ VERBOSE = 1
 DEBUG = 0
 NONINTERACTIVE = False
 SESSION_NAME: str | None = None
+OUTPUT_FILE: Any | None = None
+
+
+def open_output_file(path: Path) -> None:
+    global OUTPUT_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FILE = path.open("w", encoding="utf-8")
+
+
+def write_output_file(text: str, append: bool = False) -> None:
+    if OUTPUT_FILE is None:
+        raise ValueError("output file is not open")
+    if append and text and OUTPUT_FILE.tell() > 0:
+        OUTPUT_FILE.write("\n\n")
+    OUTPUT_FILE.write(text)
+    OUTPUT_FILE.flush()
 
 
 def page_or_print(text: str) -> None:
@@ -94,11 +110,15 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
     "`shell_commands` arguments used by --shell; do not delegate either to "
     "a separate worker. `agent` starts the next controller turn with a "
     "non-empty task and optional context; use it instead of a no-op "
-    "continuation. `session` uses action=end with a non-empty reason to "
-    "complete the session. `context` uses action=pin with a visible file path "
-    "or prior agent turn such as `turn:2` to retain context. Use a non-empty "
-    "task for `agent`; include context only when useful. Do not duplicate "
-    "work, and call `patch` or `shell` directly for file changes or commands."
+    "continuation. Selected agent profiles are exposed as individual "
+    "controller tools named `agent_<profile_name>`; use the applicable "
+    "profile tool rather than generic `agent`. Profile descriptions explain "
+    "their intended use and profile types identify their intended response "
+    "formats. `session` uses action=end with a non-empty reason to complete "
+    "the session. `context` uses action=pin with a visible file path or prior "
+    "agent turn such as `turn:2` to retain context. Use a non-empty task for "
+    "agent; include context only when useful. Do not duplicate work, and call "
+    "`patch` or `shell` directly for file changes or commands."
  )
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.6-luna",
@@ -117,6 +137,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "system_prompt_with_task": "off",
     "line_numbers": "on",
     "prompt_expansion": "off",
+    "plan": "off",
     "shell": "off",
     "shell_networking": "off",
     "patch": "off",
@@ -1374,6 +1395,391 @@ def handle_prompt_list() -> int:
         if profiles:
             output += f" {' '.join(sorted(profiles))}"
         print(output)
+    return 0
+
+
+AGENT_PROFILE_BUILTIN_SCHEMAS: dict[str, dict[str, Any]] = {
+    "patch": PATCH_MANIFEST_SCHEMA["schema"],
+    "shell": SHELL_COMMAND_SCHEMA["schema"],
+}
+AGENT_PROFILE_TYPES = (
+    "custom",
+    *AGENT_PROFILE_BUILTIN_SCHEMAS,
+    "text",
+)
+AGENT_PROFILE_LEGACY_TYPE_ALIASES = {"schema": "custom"}
+AGENT_PROFILE_DIRECTORY = APP_DIR / "agents"
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    name: str
+    profile_type: str
+    content: str
+    description: str = ""
+
+
+def validate_agent_profile_name(name: str) -> str:
+    name = name.strip()
+    if not name.isidentifier():
+        raise ValueError(f"invalid agent profile name '{name}'")
+    return name
+
+
+def agent_profile_type_choices() -> str:
+    return "|".join(AGENT_PROFILE_TYPES)
+
+
+def normalize_agent_profile_type(value: str) -> str:
+    profile_type = value.strip().lower()
+    profile_type = AGENT_PROFILE_LEGACY_TYPE_ALIASES.get(
+        profile_type, profile_type
+    )
+    if profile_type not in AGENT_PROFILE_TYPES:
+        raise ValueError(
+            "invalid agent profile type "
+            f"'{value}'; choose {agent_profile_type_choices()}"
+        )
+    return profile_type
+
+
+def agent_profile_path(name: str) -> Path:
+    return AGENT_PROFILE_DIRECTORY / (
+        f"{validate_agent_profile_name(name)}.json"
+    )
+
+
+def read_agent_profile_with_document(
+    name: str,
+ ) -> tuple[AgentProfile, dict[str, Any]]:
+    valid_name = validate_agent_profile_name(name)
+    path = agent_profile_path(valid_name)
+    if not path.is_file():
+        raise ValueError(f"agent profile does not exist: {path}")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"cannot read agent profile {path} ({exc})"
+        ) from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"agent profile must contain a JSON object: {path}")
+    allowed_fields = {"type", "content", "description"}
+    if not set(document).issubset(allowed_fields):
+        raise ValueError(
+            "agent profile may contain only type, content, and description: "
+            f"{path}"
+        )
+    profile_type_value = document.get("type", "custom")
+    content = document.get("content", "")
+    description = document.get("description", "")
+    if not isinstance(profile_type_value, str):
+        raise ValueError(f"agent profile type must be a string: {path}")
+    if not isinstance(content, str):
+        raise ValueError(f"agent profile content must be a string: {path}")
+    if not isinstance(description, str):
+        raise ValueError(
+            f"agent profile description must be a string: {path}"
+        )
+    profile_type = normalize_agent_profile_type(profile_type_value)
+    if (
+        "content" not in document
+        and profile_type in ("text", "custom")
+    ):
+        raise ValueError(
+            "text and custom agent profiles must contain content: "
+            f"{path}"
+        )
+    return (
+        AgentProfile(
+            name=valid_name,
+            profile_type=profile_type,
+            content=content,
+            description=description,
+        ),
+        document,
+    )
+
+
+def read_agent_profile(name: str) -> AgentProfile:
+    return read_agent_profile_with_document(name)[0]
+
+
+def write_agent_profile(
+    name: str,
+    profile_type: str,
+    content: str,
+    description: str = "",
+) -> Path:
+    name = validate_agent_profile_name(name)
+    profile_type = normalize_agent_profile_type(profile_type)
+    if not isinstance(content, str):
+        raise ValueError("agent profile content must be a string")
+    if not isinstance(description, str):
+        raise ValueError("agent profile description must be a string")
+    path = agent_profile_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "type": profile_type,
+                "content": content,
+                "description": description,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def agent_profile_names() -> list[str]:
+    if not AGENT_PROFILE_DIRECTORY.is_dir():
+        return []
+    return sorted(
+        path.stem
+        for path in AGENT_PROFILE_DIRECTORY.glob("*.json")
+        if path.is_file() and path.stem.isidentifier()
+    )
+
+
+def parse_agent_profile_names(values: list[str] | None) -> list[str]:
+    names: list[str] = []
+    for value in values or []:
+        for raw_name in value.split(","):
+            name = validate_agent_profile_name(raw_name)
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def load_agent_profiles(values: list[str] | None) -> list[AgentProfile]:
+    return [
+        read_agent_profile(name)
+        for name in parse_agent_profile_names(values)
+    ]
+
+
+def resolved_agent_profile_content(profile: AgentProfile) -> str:
+    profile_type = normalize_agent_profile_type(profile.profile_type)
+    schema = AGENT_PROFILE_BUILTIN_SCHEMAS.get(profile_type)
+    if schema is not None:
+        return json.dumps(schema, indent=2, ensure_ascii=False)
+    return profile.content
+
+
+def agent_profile_tool_name(name: str) -> str:
+    return f"agent_{validate_agent_profile_name(name)}"
+
+
+def agent_agent_tool_schema(profile: AgentProfile) -> dict[str, Any]:
+    profile_type = normalize_agent_profile_type(profile.profile_type)
+    description = (
+        f"Start the next controller turn using the '{profile.name}' agent "
+        f"profile (type: {profile_type})."
+    )
+    if profile.description.strip():
+        description += f" {profile.description.strip()}"
+    return {
+        "type": "function",
+        "name": agent_profile_tool_name(profile.name),
+        "description": description,
+        "parameters": AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
+        "strict": True,
+    }
+
+
+def agent_tool_schemas(
+    profiles: tuple[AgentProfile, ...] = (),
+) -> list[dict[str, Any]]:
+    schemas = list(AGENT_TOOL_SCHEMAS)
+    tool_names = {schema["name"] for schema in schemas}
+    for profile in profiles:
+        schema = agent_agent_tool_schema(profile)
+        if schema["name"] in tool_names:
+            raise ValueError(
+                f"duplicate agent tool name: {schema['name']}"
+            )
+        schemas.append(schema)
+        tool_names.add(schema["name"])
+    return schemas
+
+
+def load_or_create_agent_profile(name: str) -> AgentProfile:
+    name = validate_agent_profile_name(name)
+    path = agent_profile_path(name)
+    if path.exists():
+        return read_agent_profile(name)
+    return AgentProfile(name=name, profile_type="custom", content="")
+
+
+def handle_agent_profile_edit(values: list[str]) -> int:
+    try:
+        profile = load_or_create_agent_profile(values[0])
+        if len(values) > 1:
+            content = " ".join(values[1:]).strip()
+        else:
+            suffix = ".json" 
+            content = edit_text(profile.content, suffix=suffix)
+        write_agent_profile(
+            profile.name,
+            profile.profile_type,
+            content,
+            profile.description,
+        )
+    except Exception as exc:
+        print(f"ERROR: Failed to edit agent profile: {exc}", file=sys.stderr)
+        return 1
+    if not profile.description.strip():
+        print(
+            f"WARNING: Agent profile '{profile.name}' has no description; use ",
+            "--agent-profile-description to set one.",
+            file=sys.stderr,
+        )
+    print(f"agent_profile={profile.name} type={profile.profile_type}")
+    return 0
+
+
+def handle_agent_profile_description(values: list[str]) -> int:
+    try:
+        profile = load_or_create_agent_profile(values[0])
+        if len(values) > 1:
+            description = " ".join(values[1:]).strip()
+        else:
+            description = edit_text(profile.description, suffix=".txt")
+        write_agent_profile(
+            profile.name,
+            profile.profile_type,
+            profile.content,
+            description,
+        )
+    except Exception as exc:
+        print(
+            f"ERROR: Failed to set agent profile description: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    description_set = "yes" if description.strip() else "no"
+    print(f"agent_profile={profile.name} description_set={description_set}")
+    return 0
+
+
+def handle_agent_profile_type(values: list[str]) -> int:
+    try:
+        if len(values) not in (1, 2):
+            raise ValueError(
+                "--agent-profile-type requires NAME and optional TYPE"
+            )
+        name = values[0]
+        requested_type = values[1] if len(values) == 2 else "custom"
+        profile = load_or_create_agent_profile(name)
+        profile_type = normalize_agent_profile_type(requested_type)
+        write_agent_profile(
+            profile.name,
+            profile_type,
+            profile.content,
+            profile.description,
+        )
+    except Exception as exc:
+        print(f"ERROR: Failed to set agent profile type: {exc}", file=sys.stderr)
+        return 1
+    print(f"agent_profile={profile.name} type={profile_type}")
+    return 0
+
+
+def handle_agent_profile_copy(values: list[str]) -> int:
+    try:
+        source_name, destination_name = (
+            validate_agent_profile_name(value) for value in values
+        )
+        if source_name == destination_name:
+            raise ValueError("source and destination agent profiles must differ")
+        profile = read_agent_profile(source_name)
+        destination_path = agent_profile_path(destination_name)
+        if destination_path.exists():
+            raise ValueError(
+                f"destination agent profile already exists: {destination_path}"
+            )
+        write_agent_profile(
+            destination_name,
+            profile.profile_type,
+            profile.content,
+            profile.description,
+        )
+    except Exception as exc:
+        print(f"ERROR: Failed to copy agent profile: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"agent_profile_copied={source_name} "
+        f"new_name={destination_name}"
+    )
+    return 0
+
+
+def handle_agent_profile_rename(values: list[str]) -> int:
+    try:
+        source_name, destination_name = (
+            validate_agent_profile_name(value) for value in values
+        )
+        if source_name == destination_name:
+            raise ValueError("source and destination agent profiles must differ")
+        source_profile = read_agent_profile(source_name)
+        source_path = agent_profile_path(source_profile.name)
+        destination_path = agent_profile_path(destination_name)
+        if destination_path.exists():
+            raise ValueError(
+                f"destination agent profile already exists: {destination_path}"
+            )
+        source_path.rename(destination_path)
+    except Exception as exc:
+        print(f"ERROR: Failed to rename agent profile: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"agent_profile_renamed={source_name} "
+        f"new_name={destination_name}"
+    )
+    return 0
+
+
+def handle_agent_profile_remove(name: str) -> int:
+    try:
+        profile = read_agent_profile(name)
+        agent_profile_path(profile.name).unlink()
+    except Exception as exc:
+        print(f"ERROR: Failed to remove agent profile: {exc}", file=sys.stderr)
+        return 1
+    print(f"agent_profile_removed={profile.name}")
+    return 0
+
+
+def handle_agent_profile_print_json(values: list[str] | None) -> int:
+    try:
+        names = parse_agent_profile_names(values)
+        selected_names = names or agent_profile_names()
+        profile_documents: dict[str, dict[str, Any]] = {}
+        for name in selected_names:
+            profile, document = read_agent_profile_with_document(name)
+            profile_documents[profile.name] = document
+        print(json.dumps(profile_documents, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        print(f"ERROR: Failed to print agent profile: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def handle_agent_profile_list() -> int:
+    try:
+        for name in agent_profile_names():
+            profile = read_agent_profile(name)
+            description = profile.description.strip()
+            output = profile.name
+            if description:
+                output += f" {description}"
+            print(output)
+    except Exception as exc:
+        print(f"ERROR: Failed to list agent profiles: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -2952,7 +3358,7 @@ def handle_patch_file_apply(
         print(f"ERROR: Failed to load patch file: {exc}", file=sys.stderr)
         return 1
 
-    patch_review = (
+    patch_review = not NONINTERACTIVE and (
         patch_review_argument
         if patch_review_argument is not None
         else coerce_bool(config.get("patch_review", "off"))
@@ -3674,11 +4080,11 @@ AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
 AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     AGENT_PATCH_TOOL: (
         "Apply a file modification manifest. Arguments must match the "
-        "line_replace_manifest schema used by --patch."
+        "`patch` schema."
     ),
     AGENT_SHELL_TOOL: (
         "Generate commands for review and execution. Arguments must match "
-        "the shell_commands schema used by --shell."
+        "the `shell` schema."
     ),
     AGENT_AGENT_TOOL: (
         "Start the next controller turn with a new non-empty task and optional "
@@ -3717,12 +4123,18 @@ class AgentToolCall:
     context: str = ""
     context_id: str = ""
     action: str = ""
+    profile_name: str = ""
     arguments: dict[str, Any] | None = None
- 
+
     def as_dict(self) -> dict[str, Any]:
+        tool_name = (
+            agent_profile_tool_name(self.profile_name)
+            if self.profile_name
+            else self.tool
+        )
         if self.arguments is not None:
-            return {"tool": self.tool, **self.arguments}
-        value: dict[str, Any] = {"tool": self.tool}
+            return {"tool": tool_name, **self.arguments}
+        value: dict[str, Any] = {"tool": tool_name}
         for name in AGENT_TOOL_ARGUMENT_SCHEMAS[self.tool]["properties"]:
             value[name] = getattr(self, name)
         return value
@@ -3789,10 +4201,10 @@ class AgentRunSettings:
     suffix_provided: bool
     patch_review: bool
     agent_auto: bool
-    output_file: Path | None
     print_reasoning: bool
     suppress_response_output: bool
-
+    agent_profiles: tuple[AgentProfile, ...] = ()
+    patch_suffix_argument_provided: bool = False
 
 @dataclass(frozen=True)
 class AgentModelResult:
@@ -3806,12 +4218,32 @@ class AgentModelResult:
 def parse_agent_tool_arguments(
     tool: str,
     value: Any,
+    agent_profiles: tuple[AgentProfile, ...] = (),
 ) -> AgentToolCall:
+    profile_name = next(
+        (
+            profile.name
+            for profile in agent_profiles
+            if tool == agent_profile_tool_name(profile.name)
+        ),
+        None,
+    )
+    if profile_name is not None:
+        parsed = parse_agent_tool_arguments(AGENT_AGENT_TOOL, value)
+        return AgentToolCall(
+            tool=parsed.tool,
+            reason=parsed.reason,
+            task=parsed.task,
+            context=parsed.context,
+            context_id=parsed.context_id,
+            action=parsed.action,
+            profile_name=profile_name,
+            arguments=parsed.arguments,
+        )
     if tool not in AGENT_TOOL_NAMES:
         raise ValueError(f"unknown agent tool: {tool}")
     if not isinstance(value, dict):
         raise ValueError(f"agent {tool} arguments must be a JSON object")
- 
     if tool == AGENT_PATCH_TOOL:
         if set(value) != {"files", "commit_message"}:
             raise ValueError(
@@ -3891,7 +4323,10 @@ def normalize_agent_tool_calls(
     return tool_calls
 
 
-def response_agent_tool_calls(response_obj: Any) -> list[AgentToolCall]:
+def response_agent_tool_calls(
+    response_obj: Any,
+    agent_profiles: tuple[AgentProfile, ...] = (),
+) -> list[AgentToolCall]:
     output_text = str(getattr(response_obj, "output_text", "") or "")
     if output_text.strip():
         raise ValueError(
@@ -3934,7 +4369,11 @@ def response_agent_tool_calls(response_obj: Any) -> list[AgentToolCall]:
             raise ValueError(f"agent {tool} arguments must be JSON")
         try:
             tool_calls.append(
-                parse_agent_tool_arguments(str(tool or ""), argument_value)
+                parse_agent_tool_arguments(
+                    str(tool or ""),
+                    argument_value,
+                    agent_profiles,
+                )
             )
         except ValueError as exc:
             raise ValueError(
@@ -3947,10 +4386,42 @@ def format_agent_tool_call(tool_call: AgentToolCall) -> str:
     return json.dumps(tool_call.as_dict(), indent=2, ensure_ascii=False)
 
 
+def format_agent_tool_call_for_output(tool_call: AgentToolCall) -> str:
+    call = tool_call.as_dict()
+    tool_name = str(call.pop("tool"))
+    if (
+        tool_call.tool == AGENT_SHELL_TOOL
+        and tool_call.arguments is not None
+    ):
+        commands = _parse_shell_manifest_value(tool_call.arguments)
+        return f"Tool: {tool_name}\nCommands:\n{format_shell_commands(commands)}"
+    return (
+        f"Tool: {tool_name}\n"
+        "Arguments:\n"
+        f"{json.dumps(call, indent=2, ensure_ascii=False)}"
+    )
+
+
+def format_agent_tool_call_report(
+    tool_calls: list[AgentToolCall],
+    current_turn: int | None = None,
+) -> str:
+    if current_turn is not None:
+        normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
+        return (
+            f"-- [{current_turn}] {'-' * 72}\n"
+            f"{format_agent_tool_call_for_output(normalized_tool_calls[0])}"
+        )
+    blocks = [
+        f"[{index}] {format_agent_tool_call_for_output(tool_call)}"
+        for index, tool_call in enumerate(tool_calls, start=1)
+    ]
+    return "Agent tool calls:\n" + "\n\n".join(blocks)
+
+
 def format_agent_tool_calls(tool_calls: list[AgentToolCall]) -> str:
     normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
     return format_agent_tool_call(normalized_tool_calls[0])
-
 
 def format_agent_tool_outputs(
     tool_calls: list[AgentToolCall],
@@ -4084,6 +4555,7 @@ def build_agent_context_window_prompt(
     pinned_paths: set[str],
     pinned_turn_numbers: set[int],
     revision_instruction: str = "",
+    controller_tools: list[dict[str, Any]] | None = None,
 ) -> str:
     visible_file_indexes = set(range(len(file_contexts)))
     visible_turn_numbers = set(range(1, len(turns) + 1))
@@ -4105,6 +4577,7 @@ def build_agent_context_window_prompt(
             turn_numbers=ordered_turn_numbers,
             active_context=visible_active_context,
             revision_instruction=revision_instruction,
+            controller_tools=controller_tools,
             context_pin_targets=format_agent_context_pin_targets(
                 file_contexts,
                 visible_file_indexes,
@@ -4118,7 +4591,11 @@ def build_agent_context_window_prompt(
             model=model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            tools=AGENT_TOOL_SCHEMAS,
+            tools=(
+                AGENT_TOOL_SCHEMAS
+                if controller_tools is None
+                else controller_tools
+            ),
         )
         if request_tokens <= token_limit:
             return user_prompt
@@ -4157,12 +4634,19 @@ def build_agent_context_window_prompt(
         )
 
 
-def format_agent_tool_schema_context() -> str:
+def format_agent_tool_schema_context(
+    controller_tools: list[dict[str, Any]] | None = None,
+ ) -> str:
+    schemas = (
+        AGENT_TOOL_SCHEMAS
+        if controller_tools is None
+        else controller_tools
+    )
     return (
         "<agent_tool_json_schemas instructions='These are the exact JSON "
         "schemas for the available controller tool calls. Call exactly one "
         "tool with arguments matching its parameters schema.'>\n"
-        f"{json.dumps(AGENT_TOOL_SCHEMAS, indent=2, ensure_ascii=False)}\n"
+        f"{json.dumps(schemas, indent=2, ensure_ascii=False)}\n"
         "</agent_tool_json_schemas>"
     )
 
@@ -4175,9 +4659,10 @@ def build_agent_followup_prompt(
     revision_instruction: str = "",
     context_pin_targets: str = "",
     turn_numbers: list[int] | None = None,
- ) -> str:
+    controller_tools: list[dict[str, Any]] | None = None,
+) -> str:
     additional_parts: list[str] = [
-        format_agent_tool_schema_context(),
+        format_agent_tool_schema_context(controller_tools),
     ]
     if context_pin_targets:
         additional_parts.append(context_pin_targets)
@@ -4254,6 +4739,22 @@ def review_agent_tool_call(
     accept_automatically: bool,
  ) -> tuple[str, str | None]:
     return review_agent_tool_calls([tool_call], accept_automatically)
+
+
+def emit_agent_auto_tool_call(
+    settings: AgentRunSettings,
+    tool_call: AgentToolCall,
+    current_turn: int,
+) -> None:
+    output_text = format_agent_tool_call_report(
+        [tool_call],
+        current_turn=current_turn,
+    )
+    if OUTPUT_FILE is not None:
+        write_output_file(output_text, append=True)
+    elif not settings.suppress_response_output:
+        print(output_text)
+
 
 def review_agent_patch_changes(
     diff_text: str,
@@ -4394,7 +4895,10 @@ def request_agent_model(
         )
         if tools:
             parsed_tool_calls = tuple(
-                response_agent_tool_calls(response_obj)
+                response_agent_tool_calls(
+                    response_obj,
+                    settings.agent_profiles,
+                )
             )
             response = format_agent_tool_calls(list(parsed_tool_calls))
         else:
@@ -4493,6 +4997,10 @@ def run_agent_patch_tool(
     previous_task: str,
 ) -> AgentToolExecution:
     suffix_provided = settings.suffix_provided
+    patch_suffix = settings.patch_suffix
+    if settings.agent_auto and not settings.patch_suffix_argument_provided:
+        patch_suffix = ""
+        suffix_provided = False
     try:
         manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
         original_texts = load_patch_original_texts(manifest)
@@ -4535,8 +5043,7 @@ def run_agent_patch_tool(
         return AgentToolExecution("Patch tool revision was abandoned.")
     if review_action == "save":
         return AgentToolExecution(
-            "Patch manifest was saved in the session without writing files.\n"
-            f"<patch_diff>\n{diff_text}\n</patch_diff>"
+            "Patch manifest was saved in the session without writing files."
         )
     if review_action != "accept":
         return AgentToolExecution(
@@ -4547,7 +5054,7 @@ def run_agent_patch_tool(
             changed_items=changed_items,
             all_paths=[Path(path) for path in updated_texts],
             patch_review=settings.patch_review,
-            patch_suffix=settings.patch_suffix,
+            patch_suffix=patch_suffix,
             suffix_provided=suffix_provided,
             patch_branch_setting=None,
             patch_commit_message=str(
@@ -4565,7 +5072,6 @@ def run_agent_patch_tool(
     written_paths_text = "\n".join(written_paths)
     return AgentToolExecution(
         "Patch changes were written.\n"
-        f"<patch_diff>\n{diff_text}\n</patch_diff>\n"
         f"<written_paths>\n{written_paths_text}\n</written_paths>"
     )
 
@@ -4574,18 +5080,19 @@ def finish_agent_response(
     settings: AgentRunSettings,
     response_text: str,
     reasoning: str,
+    append_output: bool = False,
  ) -> int:
     output_text = response_text
     if settings.print_reasoning:
         output_text = f"<think>\n{reasoning}\n</think>\n\n{output_text}"
-    if settings.output_file is not None:
+    if not output_text:
+        return 0
+    if OUTPUT_FILE is not None:
         try:
-            settings.output_file.parent.mkdir(parents=True, exist_ok=True)
-            settings.output_file.write_text(output_text, encoding="utf-8")
+            write_output_file(output_text, append=append_output)
         except Exception as exc:
             print(
-                f"ERROR: Failed to write output to file "
-                f"{settings.output_file}: {exc}",
+                f"ERROR: Failed to write output to file: {exc}",
                 file=sys.stderr,
             )
             if not settings.suppress_response_output:
@@ -4603,6 +5110,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
     pinned_turn_numbers: set[int] = set()
     active_task = settings.task
     active_context = ""
+    controller_tools = agent_tool_schemas(settings.agent_profiles)
 
     def request_next(revision_instruction: str = "") -> AgentModelResult:
         full_system_prompt = append_task_to_system_prompt(
@@ -4621,13 +5129,14 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             pinned_paths=pinned_paths,
             pinned_turn_numbers=pinned_turn_numbers,
             revision_instruction=revision_instruction,
+            controller_tools=controller_tools,
         )
         return request_agent_model(
             settings,
             full_system_prompt,
             user_prompt,
             active_task,
-            tools=AGENT_TOOL_SCHEMAS,
+            tools=controller_tools,
         )
 
     try:
@@ -4682,10 +5191,23 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 return 1
             continue
 
+        if settings.agent_auto:
+            try:
+                emit_agent_auto_tool_call(
+                    settings,
+                    tool_calls[0],
+                    int(model_result.turn_dir.name) + 1,
+                )
+            except Exception as exc:
+                print(
+                    f"ERROR: Failed to write agent tool call output: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
         executed_tool_calls: list[AgentToolCall] = []
         tool_outputs: list[str] = []
         tool_revision_instruction = ""
- 
+
         def save_tool_outputs() -> bool:
             if not executed_tool_calls:
                 return True
@@ -4711,8 +5233,9 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     return 1
                 return finish_agent_response(
                     settings,
-                    tool_call.reason,
+                    "" if settings.agent_auto else tool_call.reason,
                     model_result.reasoning,
+                    append_output=settings.agent_auto,
                 )
             turn_task = active_task
             tool_context = "\n\n".join(
@@ -4784,8 +5307,14 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             elif tool_call.tool == AGENT_AGENT_TOOL:
                 active_task = tool_call.task
                 active_context = tool_call.context
+                profile_description = (
+                    f" using agent profile '{tool_call.profile_name}'"
+                    if tool_call.profile_name
+                    else ""
+                )
                 tool_output = (
-                    "Started the requested agent task for the next turn."
+                    "Started the requested agent task for the next turn"
+                    f"{profile_description}."
                 )
             else:
                 print(
@@ -5722,7 +6251,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agent-auto",
         action="store_true",
-        help="Automatically confirm agent tool calls and agent worker actions",
+        help=(
+            "Automatically confirm agent tool calls and output each before "
+            "execution; agent patches overwrite source files unless "
+            "--patch-suffix is specified"
+        ),
+    )
+
+    parser.add_argument(
+        "--agent-profile",
+        dest="agent_profiles",
+        action="append",
+        metavar="NAME[,NAME...]",
+        help=("Load one or more stored profiles as individual "
+              "agent-prefixed controller tools"),
     )
 
     files_group = parser.add_mutually_exclusive_group()
@@ -5754,7 +6296,7 @@ def parse_args() -> argparse.Namespace:
         "--output-file",
         metavar="FILE",
         type=Path,
-        help="Write the response to the given file (overwrites if it exists)",
+        help=("Write response output to FILE (overwrites if it exists)"),
     )
 
     parser.add_argument(
@@ -6412,6 +6954,16 @@ def parse_args() -> argparse.Namespace:
         help="Remove prompt NAME from all profiles and delete it",
     )
 
+    parser.add_argument(
+        "--prompt-expansion",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Expand ^^promptname^^ references using the prompt library (default: off)",
+    )
+
     profile_action_group.add_argument(
         "--prompt-print",
         nargs="*",
@@ -6426,14 +6978,61 @@ def parse_args() -> argparse.Namespace:
         help="Print all stored prompts or specified prompts as a JSON object keyed by name",
     )
 
-    parser.add_argument(
-        "--prompt-expansion",
-        nargs="?",
-        const=True,
-        default=None,
-        type=parse_bool,
-        metavar="BOOL",
-        help="Expand ^^promptname^^ references using the prompt library (default: off)",
+    profile_action_group.add_argument(
+        "--agent-profile-edit",
+        nargs="+",
+        metavar=("NAME", "TEXT"),
+        help="Edit or create agent profile NAME, or form it from additional TEXT arguments",
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-description",
+        nargs="+",
+        metavar=("NAME", "TEXT"),
+        help="Set agent profile NAME description from optional TEXT or an editor",
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-type",
+        nargs="+",
+        metavar=("NAME", "TYPE"),
+        help=(
+            "Set agent profile NAME type; omit TYPE for custom "
+            f"(types: {agent_profile_type_choices()})"
+        ),
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-copy",
+        nargs=2,
+        metavar=("NAME", "NEW_NAME"),
+        help="Copy agent profile NAME to NEW_NAME",
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-rename",
+        nargs=2,
+        metavar=("NAME", "NEW_NAME"),
+        help="Rename agent profile NAME to NEW_NAME",
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-remove",
+        metavar="NAME",
+        help="Remove agent profile NAME",
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-print-json",
+        nargs="*",
+        metavar="NAME",
+        help="Dump stored agent profiles as JSON keyed by name",
+    )
+
+    profile_action_group.add_argument(
+        "--agent-profile-list",
+        action="store_true",
+        help="List stored agent profile names and descriptions",
     )
 
     session_view_group = parser.add_mutually_exclusive_group()
@@ -6496,6 +7095,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "plan_system_prompt": None,
         "agent": False,
         "agent_auto": False,
+        "agent_profiles": None,
         "patch": False,
         "shell": False,
         "shell_networking": False,
@@ -6543,6 +7143,7 @@ def main() -> int:
     global DEBUG
     global NONINTERACTIVE
     global SESSION_NAME
+    global OUTPUT_FILE
 
     SESSION_NAME = None
 
@@ -6630,6 +7231,7 @@ def main() -> int:
             ("--plan", args.plan is not None),
             ("--agent", args.agent),
             ("--agent-auto", args.agent_auto),
+            ("--agent-profile", args.agent_profiles is not None),
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
             ("--shell", args.shell is not None),
@@ -6665,6 +7267,20 @@ def main() -> int:
             ("--prompt-remove", args.prompt_remove is not None),
             ("--prompt-print", args.prompt_print is not None),
             ("--prompt-print-json", args.prompt_print_json is not None),
+            ("--agent-profile-edit", args.agent_profile_edit is not None),
+            (
+                "--agent-profile-description",
+                args.agent_profile_description is not None,
+            ),
+            ("--agent-profile-type", args.agent_profile_type is not None),
+            ("--agent-profile-copy", args.agent_profile_copy is not None),
+            ("--agent-profile-rename", args.agent_profile_rename is not None),
+            ("--agent-profile-remove", args.agent_profile_remove is not None),
+            (
+                "--agent-profile-print-json",
+                args.agent_profile_print_json is not None,
+            ),
+            ("--agent-profile-list", args.agent_profile_list),
             ("--set-config", args.set_config is not None),
             ("--set-config-from", args.set_config_from is not None),
             ("--get-config", args.get_config is not None),
@@ -6790,6 +7406,25 @@ def main() -> int:
         return 0
 
     base_profile = args.profile or "config"
+
+    if args.agent_profile_list:
+        return handle_agent_profile_list()
+    if args.agent_profile_print_json is not None:
+        return handle_agent_profile_print_json(args.agent_profile_print_json)
+    if args.agent_profile_edit is not None:
+        return handle_agent_profile_edit(args.agent_profile_edit)
+    if args.agent_profile_description is not None:
+        return handle_agent_profile_description(
+            args.agent_profile_description
+        )
+    if args.agent_profile_type is not None:
+        return handle_agent_profile_type(args.agent_profile_type)
+    if args.agent_profile_copy is not None:
+        return handle_agent_profile_copy(args.agent_profile_copy)
+    if args.agent_profile_rename is not None:
+        return handle_agent_profile_rename(args.agent_profile_rename)
+    if args.agent_profile_remove is not None:
+        return handle_agent_profile_remove(args.agent_profile_remove)
 
     if args.prompt_list:
         return handle_prompt_list()
@@ -7263,6 +7898,18 @@ def main() -> int:
     if agent_mode and (patch_mode or shell_mode):
         print("ERROR: --agent cannot be combined with --patch or --shell", file=sys.stderr)
         return 1
+    selected_agent_profiles: tuple[AgentProfile, ...] = ()
+    if args.agent_profiles is not None:
+        if not agent_mode:
+            print("ERROR: --agent-profile requires --agent", file=sys.stderr)
+            return 1
+        try:
+            selected_agent_profiles = tuple(
+                load_agent_profiles(args.agent_profiles)
+            )
+        except ValueError as exc:
+            print(f"ERROR: Failed to load agent profiles: {exc}", file=sys.stderr)
+            return 1
     if agent_mode and (args.ask or args.ask_file):
         print("ERROR: --agent only supports --task or --task-file", file=sys.stderr)
         return 1
@@ -7507,11 +8154,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-        print(
-            "ERROR: Invalid response format; choose text, json, or schema.",
-            file=sys.stderr,
-        )
-        return 1
     stream_enabled = resolve_bool_option(
         args.stream,
         config,
@@ -7678,12 +8320,6 @@ def main() -> int:
                     ]
                     if not file_names:
                         file_names = reused_file_names
-            except ValueError as exc:
-                print(
-                    f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
-                    file=sys.stderr,
-                )
-                return 1
             except ValueError as exc:
                 print(
                     f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
@@ -8040,6 +8676,16 @@ def main() -> int:
                 )
                 return 1
 
+    if args.output_file is not None:
+        try:
+            open_output_file(args.output_file)
+        except Exception as exc:
+            print(
+                f"ERROR: Failed to open output file {args.output_file}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
     if plan_mode:
         plan_system_base = (
             agent_worker_system_prompt if agent_mode else system_prompt
@@ -8224,9 +8870,10 @@ def main() -> int:
             suffix_provided=suffix_provided,
             patch_review=patch_review,
             agent_auto=agent_auto,
-            output_file=args.output_file,
             print_reasoning=print_reasoning,
             suppress_response_output=suppress_response_output,
+            agent_profiles=selected_agent_profiles,
+            patch_suffix_argument_provided=args.patch_suffix is not None,
         )
         return run_agent_mode(agent_settings)
 
@@ -8304,19 +8951,13 @@ def main() -> int:
                 file_paths=file_paths,
             )
             state_turn += 1
-        stream_file = None
         stream_sink = None
 
         try:
             if stream_enabled and not print_reasoning:
-                if args.output_file:
-                    args.output_file.parent.mkdir(parents=True, exist_ok=True)
-                    stream_file = args.output_file.open("w", encoding="utf-8")
-
                 def emit_stream_text(delta: str) -> None:
-                    if stream_file is not None:
-                        stream_file.write(delta)
-                        stream_file.flush()
+                    if OUTPUT_FILE is not None:
+                        write_output_file(delta)
                     else:
                         sys.stdout.write(delta)
                         sys.stdout.flush()
@@ -8342,9 +8983,6 @@ def main() -> int:
                 complete_state_turn(state_turn_path, "", f"ERROR: {exc}")
             print(f"API error: {exc}", file=sys.stderr)
             return 1
-        finally:
-            if stream_file is not None:
-                stream_file.close()
 
         elapsed = time.perf_counter() - start_time
         reasoning = response_reasoning_text(response_obj)
@@ -8702,10 +9340,9 @@ def main() -> int:
                 f"<think>\n{response_reasoning}\n</think>\n\n"
                 f"{output_str}"
             )
-        if args.output_file:
+        if OUTPUT_FILE is not None:
             try:
-                args.output_file.parent.mkdir(parents=True, exist_ok=True)
-                args.output_file.write_text(output_str, encoding="utf-8")
+                write_output_file(output_str)
             except Exception as exc:
                 print(
                     f"ERROR: Failed to write output to file {args.output_file}: {exc}",
@@ -9274,11 +9911,10 @@ def main() -> int:
     else:
         output_str = result
 
-    if args.output_file:
+    if OUTPUT_FILE is not None:
         if not stream_output_emitted:
             try:
-                args.output_file.parent.mkdir(parents=True, exist_ok=True)
-                args.output_file.write_text(output_str, encoding="utf-8")
+                write_output_file(output_str)
             except Exception as exc:
                 print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
                 if not suppress_response_output:
@@ -9327,6 +9963,11 @@ except Exception as e:
 #    import traceback
 #    traceback.print_exc()
 finally:
+    if OUTPUT_FILE is not None:
+        try:
+            OUTPUT_FILE.close()
+        except Exception:
+            pass
     if SESSION_NAME is not None:
         if VERBOSE and not NONINTERACTIVE:
             print(f"session_name={SESSION_NAME}", file=sys.stderr)
