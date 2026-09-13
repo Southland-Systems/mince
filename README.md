@@ -172,13 +172,15 @@ mince --plan \
 Perform shell tasks:
 
 ```bash
-mince -p task --shell -t 'List the content of the current directory, and then write that listing to a file called "listing.txt" in the next turn. Then get the content of the file "/etc/passwd".'
+mince -p task --shell -t 'List the content of the current directory, \
+and then write that listing to a file called "listing.txt" in the next turn. Then get the content of the file "/etc/passwd".'
 ```
 
 Run a task in automatic agent mode with `mince-contain`:
 
 ```bash
-mince-contain --contain-write-path . -p task --agent  --agent-auto --task 'Determine the globally installed software development tools and write using "patch" as Markdown format to filename `sdk.md`.'
+mince-contain --contain-write-path . -p task --agent  --agent-auto \
+  --task 'Determine the globally installed software development tools and write using "patch" as Markdown format to filename `sdk.md`.'
 ```
 
 Create a dedicated 'ask' profile from the default profile:
@@ -425,23 +427,12 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 
 If token costs are set in the configuration and `--model` is specified, `--token-cost` must also be specified, otherwise the cost calculation will be absent to prevent inaccuracies.
 
-**Patch is writing added lines and nothing else**
-
-If the patch is writing a new file when it should be a diff, this may happen with large context (over 64k), first reset the patch system prompt to default, then try adding instructions like "prepare a text block based patch using the provided JSON schema" or re-word the current task to be more patch oriented.  Lastly try altering the patch system prompt to be more explicit.
 
 ## Known Issues and Reporting ⚠️
 
 **Command line arguments may clash**
 
 Mixing combinations of command line arguments may lead to unexpected behaviour.
-
-**Logging and stats**
-
-Logging and stats have minor issues and will be improved over time (missing multi-turn cost calculation).
-
-**Duplicate script logic, poor runtime state handling**
-
-Script requires a refactor to reduce duplication, global state to reduce complexity and more robust error handling.
 
 **Reporting Issues**
 

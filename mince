@@ -160,6 +160,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "stream": "off",
     "response_verbosity": "off",
     "llm_timeout": 300,
+    "retry": 2,
     "extra_body": "",
     "log": "on",
     "api_log": "on",
@@ -1838,6 +1839,8 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
 
     if canonical_name == "patch_branch":
         return name, parse_patch_branch_value(raw_value)
+    if canonical_name == "retry":
+        return name, parse_retry_count(raw_value)
     expected = (
         DEFAULT_CONFIG[canonical_name]
         if canonical_name in DEFAULT_CONFIG
@@ -2010,6 +2013,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
     prompt_config_value(config, "line_numbers", "Context file line numbers [recommended on] (off, on)")
     prompt_config_value(config, "llm_timeout", "API timeout in seconds", int)
+    prompt_config_value(config, "retry", "Additional transient API retries", parse_retry_count)
     prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs (off, on)")
     prompt_config_value(config, "api_log", "Store logs within the OpenAI-compatible API (off, on)")
     prompt_config_value(config, "quiet", "Quiet mode (off, on)")
@@ -3658,6 +3662,20 @@ def coerce_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
+
+def parse_retry_count(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("retry count must be a non-negative integer")
+    if isinstance(value, int):
+        retry_count = value
+    elif isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        retry_count = int(value.strip())
+    else:
+        raise ValueError("retry count must be a non-negative integer")
+    if retry_count < 0:
+        raise ValueError("retry count must be a non-negative integer")
+    return retry_count
+
 def read_file(path: Path) -> str:
     try:
         return read_text_preserving_line_endings(path)
@@ -4173,6 +4191,7 @@ class AgentModelSettings:
     llm_timeout: int
     safety_identifier: Any
     api_log: bool
+    retry: int = 2
  
  
 @dataclass
@@ -4205,6 +4224,8 @@ class AgentRunSettings:
     suppress_response_output: bool
     agent_profiles: tuple[AgentProfile, ...] = ()
     patch_suffix_argument_provided: bool = False
+    initial_turns: tuple[AgentTurn, ...] = ()
+    initial_active_context: str = ""
 
 @dataclass(frozen=True)
 class AgentModelResult:
@@ -4502,6 +4523,156 @@ def resolve_agent_context_pin(
     raise ValueError(
         "context_id must name an available context file or prior agent turn"
     )
+
+
+@dataclass(frozen=True)
+class ReusedAgentHistory:
+    turns: tuple[AgentTurn, ...]
+    active_task: str
+    active_context: str
+
+
+def parse_reused_agent_tool_call(response: str) -> AgentToolCall:
+    try:
+        value = json.loads(clean_json_response(response))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "reused agent response must contain a JSON tool call"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError("reused agent response must contain a JSON object")
+    tool_name = value.get("tool")
+    if not isinstance(tool_name, str) or not tool_name:
+        raise ValueError("reused agent response must contain a tool name")
+    arguments = {
+        key: argument
+        for key, argument in value.items()
+        if key != "tool"
+    }
+    if tool_name.startswith("agent_"):
+        try:
+            profile_name = validate_agent_profile_name(
+                tool_name[len("agent_"):]
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"reused agent profile tool has an invalid name: {tool_name}"
+            ) from exc
+        parsed = parse_agent_tool_arguments(
+            AGENT_AGENT_TOOL, arguments
+        )
+        return AgentToolCall(
+            tool=parsed.tool,
+            reason=parsed.reason,
+            task=parsed.task,
+            context=parsed.context,
+            context_id=parsed.context_id,
+            action=parsed.action,
+            profile_name=profile_name,
+            arguments=parsed.arguments,
+        )
+    return parse_agent_tool_arguments(tool_name, arguments)
+
+
+def load_reused_session_agent_history(
+    state_session_dir: Path,
+    turn: int | None = None,
+) -> ReusedAgentHistory:
+    selected_turn_dir = last_completed_state_turn(
+        state_session_dir, turn
+    )
+    selected_turn = int(selected_turn_dir.name)
+    turn_directories: list[tuple[int, Path]] = []
+    for entry in state_session_dir.iterdir():
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            turn_number = int(entry.name)
+        except ValueError:
+            continue
+        response_path = entry / "response"
+        if (
+            0 <= turn_number <= selected_turn
+            and response_path.is_file()
+            and not response_path.is_symlink()
+        ):
+            turn_directories.append((turn_number, entry))
+
+    turns: list[AgentTurn] = []
+    active_task = ""
+    active_context = ""
+    for turn_number, turn_dir in sorted(turn_directories):
+        response = read_state_artifact(turn_dir / "response")
+        try:
+            tool_call = parse_reused_agent_tool_call(response)
+        except ValueError as exc:
+            if turn_number == selected_turn:
+                raise ValueError(
+                    "selected session turn is not an agent controller turn: "
+                    f"{turn_dir} ({exc})"
+                ) from exc
+            continue
+        task = read_state_artifact(turn_dir / "request_task")
+        tool_context = "\n\n".join(
+            value for value in (active_context, tool_call.context) if value
+        )
+        output_path = turn_dir / "response_agent_tool_output"
+        output = (
+            read_state_artifact(output_path)
+            if output_path.exists() or output_path.is_symlink()
+            else ""
+        )
+        turns.append(
+            AgentTurn(
+                task=task,
+                context=tool_context,
+                tool_call=tool_call,
+                output=output,
+            )
+        )
+        active_task = task
+        if tool_call.tool == AGENT_AGENT_TOOL:
+            active_task = tool_call.task
+            active_context = tool_call.context
+
+    if not turns:
+        raise ValueError(
+            "selected session turn is not an agent controller turn: "
+            f"{selected_turn_dir}"
+        )
+    return ReusedAgentHistory(
+        turns=tuple(turns),
+        active_task=active_task,
+        active_context=active_context,
+    )
+
+
+def reused_agent_context_pins(
+    file_contexts: list[tuple[str, str]],
+    turns: list[AgentTurn],
+) -> tuple[set[str], set[int]]:
+    pinned_paths: set[str] = set()
+    pinned_turn_numbers: set[int] = set()
+    for turn_number, turn in enumerate(turns, start=1):
+        if (
+            turn.tool_call.tool != AGENT_CONTEXT_TOOL
+            or not turn.output
+            or turn.output.startswith("ERROR:")
+        ):
+            continue
+        try:
+            target_type, target = resolve_agent_context_pin(
+                turn.tool_call.context_id,
+                file_contexts,
+                turns[:turn_number - 1],
+            )
+        except ValueError:
+            continue
+        if target_type == "file":
+            pinned_paths.add(str(target))
+        else:
+            pinned_turn_numbers.add(int(target))
+    return pinned_paths, pinned_turn_numbers
 
 
 def format_agent_context_pin_targets(
@@ -4887,8 +5058,10 @@ def request_agent_model(
             reasoning_mode=model_settings.reasoning_mode,
             extra_body=model_settings.extra_body,
             llm_timeout=model_settings.llm_timeout,
+            retry=model_settings.retry,
             safety_identifier=model_settings.safety_identifier,
             store=model_settings.api_log,
+            error_logger=lambda event: append_agent_log(settings, event),
             tools=tools,
             tool_choice="required" if tools else None,
             parallel_tool_calls=False if tools else None,
@@ -5104,12 +5277,13 @@ def finish_agent_response(
 
 
 def run_agent_mode(settings: AgentRunSettings) -> int:
-    turns: list[AgentTurn] = []
+    turns: list[AgentTurn] = list(settings.initial_turns)
     file_contexts = agent_context_file_sections(settings)
-    pinned_paths: set[str] = set()
-    pinned_turn_numbers: set[int] = set()
+    pinned_paths, pinned_turn_numbers = reused_agent_context_pins(
+        file_contexts, turns
+    )
     active_task = settings.task
-    active_context = ""
+    active_context = settings.initial_active_context
     controller_tools = agent_tool_schemas(settings.agent_profiles)
 
     def request_next(revision_instruction: str = "") -> AgentModelResult:
@@ -5371,6 +5545,71 @@ def _handle_openai_error(exc: Exception) -> None:
     raise exc
 
 
+def _log_api_request_event(error_logger: Any, message: str) -> None:
+    if error_logger is None:
+        return
+    try:
+        error_logger(
+            "<api_retry>\n"
+            f"{message}\n"
+            "</api_retry>\n"
+        )
+    except Exception as exc:
+        print(
+            f"ERROR: Failed to log API request event: {exc}",
+            file=sys.stderr,
+        )
+
+
+def execute_openai_request(
+    operation: Any,
+    *,
+    retry: int,
+    operation_name: str,
+    error_logger: Any = None,
+) -> Any:
+    retry_count = parse_retry_count(retry)
+    failed_retries = 0
+    while True:
+        try:
+            response = operation()
+        except Exception as exc:
+            failed_attempt = failed_retries + 1
+            detail = str(exc).strip() or type(exc).__name__
+            failure_message = (
+                f"ERROR: {operation_name} failed "
+                f"(attempt {failed_attempt}/{retry_count + 1}): {detail}"
+            )
+            print(failure_message, file=sys.stderr)
+            _log_api_request_event(error_logger, failure_message)
+            if (
+                failed_retries >= retry_count
+                or not _is_openai_temp_error(exc)
+            ):
+                raise
+            failed_retries += 1
+            delay_seconds = min(2 ** (failed_retries - 1), 30)
+            retry_message = (
+                f"INFO: Retrying {operation_name} in {delay_seconds} "
+                f"second{'s' if delay_seconds != 1 else ''}."
+            )
+            print(retry_message, file=sys.stderr)
+            _log_api_request_event(error_logger, retry_message)
+            time.sleep(delay_seconds)
+        else:
+            if failed_retries:
+                success_message = (
+                    f"INFO: {operation_name} succeeded after "
+                    f"{failed_retries} "
+                    f"{'retry' if failed_retries == 1 else 'retries'}; "
+                    "retry counter reset."
+                )
+                print(success_message, file=sys.stderr)
+                _log_api_request_event(error_logger, success_message)
+            failed_retries = 0
+            return response
+
+
 def resolve_api_key(config: dict[str, Any]) -> str:
     env_key = os.getenv("OPENAI_API_KEY")
     if env_key:
@@ -5401,12 +5640,14 @@ def call_openai(
     reasoning_mode: str | None = None,
     extra_body: dict[str, Any] | None = None,
     llm_timeout: int | None = None,
+    retry: int = 2,
     safety_identifier: str | None = None,
     store: bool = True,
     stream: bool = False,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
+    error_logger: Any = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
     if openai_proxy:
@@ -5490,7 +5731,12 @@ def call_openai(
         print("</debug_request>", file=sys.stderr)
 
     try:
-        response = client.responses.create(**kwargs)
+        response = execute_openai_request(
+            lambda: client.responses.create(**kwargs),
+            retry=retry,
+            operation_name="API request",
+            error_logger=error_logger,
+        )
     except Exception as exc:
         _handle_openai_error(exc)
 
@@ -5836,13 +6082,20 @@ def run_tree_mode(
     log_path: Path | None,
     system_prompt_with_task: bool = False,
     tree_session_stem: str = "",
-
+    retry: int = 2,
 ) -> int:
+    retry = parse_retry_count(retry)
     log_lock = threading.Lock()
     db_lock = threading.Lock()
     state_turn_lock = threading.Lock()
     next_state_turn = next_state_turn_index(state_session_dir)
 
+    def append_tree_log(text: str) -> None:
+        if not log_enabled or log_path is None:
+            return
+        with log_lock:
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(text)
     def start_tree_state_turn(
         system_prompt: str,
         task: str,
@@ -5907,11 +6160,31 @@ def run_tree_mode(
             finally:
                 state_db.close()
 
+    failed_retries: dict[str, int] = {}
+
+    def schedule_tree_retry(rel: str, error_text: str) -> bool:
+        failed_retries[rel] = failed_retries.get(rel, 0) + 1
+        failed_attempt = failed_retries[rel]
+        failure_message = (
+            f"ERROR: Tree file {rel} failed "
+            f"(attempt {failed_attempt}/{retry + 1}): {error_text}"
+        )
+        print(failure_message, file=sys.stderr)
+        _log_api_request_event(append_tree_log, failure_message)
+        if failed_attempt > retry:
+            set_status(rel, f"temp_error_exhausted:{error_text}")
+            return False
+        return True
+
     def get_pending_files() -> list[tuple[str, Path]]:
         pending: list[tuple[str, Path]] = []
         for rel, fp in list(rel_to_path.items()):
             status = get_status(rel)
-            if not status.startswith("complete") and not status.startswith("perm_error"):
+            if (
+                not status.startswith("complete")
+                and not status.startswith("perm_error")
+                and not status.startswith("temp_error_exhausted")
+            ):
                 pending.append((rel, fp))
         return pending
     def process_file(file_path: Path) -> dict[str, Any]:
@@ -5994,9 +6267,11 @@ def run_tree_mode(
                 reasoning_mode=reasoning_mode,
                 extra_body=extra_body,
                 llm_timeout=llm_timeout,
+                retry=0,
                 safety_identifier=safety_identifier,
                 store=api_log,
                 stream=False,
+                error_logger=append_tree_log,
             )
             result = str(getattr(response_obj, "output_text", "") or "")
             if not result.strip():
@@ -6117,13 +6392,32 @@ def run_tree_mode(
                                 status = "ok" if record["success"] else "error"
                                 print(f"tree_file={record['path']} status={status} {record['statsline']}", file=sys.stderr)
                         if record.get("success"):
+                            failed_retry_count = failed_retries.pop(rel, 0)
+                            if failed_retry_count:
+                                reset_message = (
+                                    f"INFO: Tree file {rel} succeeded after "
+                                    f"{failed_retry_count} "
+                                    f"{'retry' if failed_retry_count == 1 else 'retries'}; "
+                                    "retry counter reset."
+                                )
+                                if VERBOSE:
+                                    print(reset_message, file=sys.stderr)
+                                _log_api_request_event(
+                                    append_tree_log, reset_message
+                                )
                             success_this_round += 1
                         elif record.get("error_type") == "temp":
-                            temp_errors_this_round += 1
+                            if schedule_tree_retry(
+                                rel,
+                                str(record.get("result", "unknown error")),
+                            ):
+                                temp_errors_this_round += 1
                     except BaseException as exc:
-                        print(f"ERROR: Tree worker failed: {_tree_exception_message(exc)}", file=sys.stderr)
-                        set_status(rel, f"temp_error:{_tree_exception_message(exc)}")
-                        temp_errors_this_round += 1
+                        error_text = _tree_exception_message(exc)
+                        print(f"ERROR: Tree worker failed: {error_text}", file=sys.stderr)
+                        set_status(rel, f"temp_error:{error_text}")
+                        if schedule_tree_retry(rel, error_text):
+                            temp_errors_this_round += 1
         except Exception as exc:
             print(f"ERROR: Failed to run tree workers: {exc}", file=sys.stderr)
             temp_errors_this_round += 1
@@ -6406,7 +6700,8 @@ def parse_args() -> argparse.Namespace:
         metavar=("SESSION_NAME", "TURN"),
         help=(
             "Load context and task from the last completed turn of an "
-            "existing session (optionally at TURN). Can be used with --shell and --patch"
+            "existing session (optionally at TURN). Can be used with --shell, "
+            "--patch, and --agent"
         ),
     )
 
@@ -6747,6 +7042,13 @@ def parse_args() -> argparse.Namespace:
         metavar="SECONDS",
         type=int,
         help="Timeout for the API request (300)",
+    )
+
+    parser.add_argument(
+        "--retry",
+        metavar="COUNT",
+        type=parse_retry_count,
+        help="Additional retries for transient API failures (default: 2)",
     )
 
     parser.add_argument(
@@ -7968,6 +8270,15 @@ def main() -> int:
         if args.llm_timeout is not None
         else config.get("llm_timeout", 300)
     )
+    try:
+        retry = parse_retry_count(
+            args.retry
+            if args.retry is not None
+            else config.get("retry", DEFAULT_CONFIG["retry"])
+        )
+    except ValueError as exc:
+        print(f"ERROR: Invalid retry value: {exc}", file=sys.stderr)
+        return 1
 
     model = str(args.model or config.get("model")).strip()
     openai_base_url = str(args.base_url or config.get("base_url")).strip()
@@ -7987,9 +8298,15 @@ def main() -> int:
         client = OpenAI(
             api_key=api_key,
             base_url=openai_base_url,
+            timeout=llm_timeout,
+            max_retries=0,
         )
         try:
-            models = client.models.list()
+            models = execute_openai_request(
+                client.models.list,
+                retry=retry,
+                operation_name="Model listing request",
+            )
             modelnames = []
             for m in models:
                 modelnames.append(m.id)
@@ -8218,9 +8535,11 @@ def main() -> int:
             reasoning_mode=reasoning_mode,
             extra_body=extra_body,
             llm_timeout=llm_timeout,
+            retry=retry,
             safety_identifier=safety_identifier,
             store=api_log,
             stream=stream,
+            error_logger=append_log,
         )
 
     if args.estimate_only and not tree_mode:
@@ -8243,6 +8562,8 @@ def main() -> int:
     reuse_session_name: str | None = None
     reused_patch_turn: ReusedPatchTurn | None = None
     reused_shell_turn: ReusedShellTurn | None = None
+    reused_agent_history: ReusedAgentHistory | None = None
+    reused_agent_active_context = ""
     reused_file_records: list[tuple[str, str]] = []
     shell_revision_task: str | None = None
     if args.reuse_session is not None:
@@ -8305,6 +8626,21 @@ def main() -> int:
                             state_session_dir,
                             turn=reuse_session_turn,
                         )
+                    elif agent_mode:
+                        reused_agent_history = (
+                            load_reused_session_agent_history(
+                                state_session_dir,
+                                turn=reuse_session_turn,
+                            )
+                        )
+                        reused_agent_active_context = (
+                            reused_agent_history.active_context
+                        )
+                        if not task_supplied:
+                            task = expand_prompt_names(
+                                reused_agent_history.active_task,
+                                prompt_expansion_enabled,
+                            )
                     else:
                         reused_task = load_reused_session_task(
                             state_session_dir,
@@ -8554,6 +8890,7 @@ def main() -> int:
             reasoning_mode=reasoning_mode,
             extra_body=extra_body,
             llm_timeout=llm_timeout,
+            retry=retry,
             safety_identifier=safety_identifier,
             api_log=api_log,
             token_cost=token_cost,
@@ -8844,6 +9181,7 @@ def main() -> int:
                 reasoning_mode=reasoning_mode,
                 extra_body=extra_body,
                 llm_timeout=llm_timeout,
+                retry=retry,
                 safety_identifier=safety_identifier,
                 api_log=api_log,
             ),
@@ -8874,6 +9212,12 @@ def main() -> int:
             suppress_response_output=suppress_response_output,
             agent_profiles=selected_agent_profiles,
             patch_suffix_argument_provided=args.patch_suffix is not None,
+            initial_turns=(
+                reused_agent_history.turns
+                if reused_agent_history is not None
+                else ()
+            ),
+            initial_active_context=reused_agent_active_context,
         )
         return run_agent_mode(agent_settings)
 
