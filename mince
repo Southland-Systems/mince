@@ -610,6 +610,17 @@ def normalize_state_artifact_type(value: str) -> str:
         )
     return artifact_type
 
+def state_artifact_last_modified_time(path: Path) -> int:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"state artifact does not exist: {path}")
+    try:
+        return int(path.stat().st_mtime)
+    except Exception as exc:
+        raise ValueError(
+            f"cannot read state artifact last modified time {path} ({exc})"
+        ) from exc
+
+
 def read_state_artifact(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"state artifact does not exist: {path}")
@@ -617,7 +628,6 @@ def read_state_artifact(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except Exception as exc:
         raise ValueError(f"cannot read state artifact {path} ({exc})") from exc
-
 def state_turn_directory(
     state_session_dir: Path,
     turn: int | None,
@@ -4025,9 +4035,13 @@ def build_context_sections(
     add_line_numbers: bool = True,
     stdin_content: str | None = None,
     include_last_modified_time: bool = False,
+    include_last_refreshed_time: bool = False,
 ) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     max_bytes = max_file_size_kb * 1024
+    last_refreshed_time = (
+        int(time.time()) if include_last_refreshed_time else None
+    )
 
     for path in file_paths:
         context_path = "/proc/self/stdin" if path == Path("-") else str(path)
@@ -4076,13 +4090,18 @@ def build_context_sections(
             if numbered_content.endswith(("\r", "\n"))
             else "\n"
         )
+        last_refreshed_time_attribute = (
+            f" last_refreshed_time='{last_refreshed_time}'"
+            if last_refreshed_time is not None
+            else ""
+        )
         last_modified_time_attribute = (
             f" last_modified_time='{last_modified_time}'"
             if last_modified_time is not None
             else ""
         )
         section = (
-            f"<file{last_modified_time_attribute} path='{context_path}' encoding='utf-8' "
+            f"<file{last_refreshed_time_attribute}{last_modified_time_attribute} path='{context_path}' encoding='utf-8' "
             f"line_ending='{content_line_ending}' "
             f"total_lines='{content_total_lines}'>\n"
             f"{numbered_content}{context_ending}</file>"
@@ -4401,6 +4420,7 @@ class AgentTurn:
     context: str
     tool_call: AgentToolCall
     output: str
+    turn_unix_time: int | None = None
     expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT
     purge_in_turns: int | None = None
     removal_reason: str = ""
@@ -4468,6 +4488,7 @@ class AgentRunSettings:
     patch_suffix_argument_provided: bool = False
     initial_turns: tuple[AgentTurn, ...] = ()
     initial_active_context: str = ""
+    agent_hook_context_scripts: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class AgentModelResult:
@@ -4475,8 +4496,8 @@ class AgentModelResult:
     reasoning: str
     statsline: str
     turn_dir: Path | None
+    turn_unix_time: int | None = None
     tool_calls: tuple[AgentToolCall, ...] = ()
-
 class AgentControllerResponseError(ValueError):
     pass
 
@@ -4970,14 +4991,16 @@ def append_agent_tool_history(
     context: str,
     tool_call: AgentToolCall,
     output: str,
+    turn_unix_time: int | None = None,
     readfile_contexts: tuple[tuple[str, str], ...] | None = None,
-) -> None:
+ ) -> None:
     turns.append(
         AgentTurn(
             task=task,
             context=context,
             tool_call=tool_call,
             output=output,
+            turn_unix_time=turn_unix_time,
             readfile_contexts=readfile_contexts,
             expires_in_turns=tool_call.expires_in_turns,
         )
@@ -5166,11 +5189,16 @@ def format_agent_history(
                 continue
             tool_content = agent_history_tool_content(turn)
             purge_attribute = ""
+        turn_unix_time_attribute = (
+            f" turn_unix_time='{turn.turn_unix_time}'"
+            if turn.turn_unix_time is not None
+            else ""
+        )
         pinned_attribute = (
             " pinned" if turn_number in pinned_turn_numbers else ""
         )
         blocks.append(
-            f"<agent_turn{pinned_attribute} index='{turn_number}' expires_in_turns='{turn.expires_in_turns}'{purge_attribute}>\n"
+            f"<agent_turn{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' expires_in_turns='{turn.expires_in_turns}'{purge_attribute}>\n"
             f"<task>\n{turn.task}\n</task>\n"
             f"<context>\n{turn.context}\n</context>\n"
             f"<tool_call>\n{format_agent_tool_call(turn.tool_call)}\n"
@@ -5243,9 +5271,9 @@ class ReusedAgentHistory:
 
 
 AGENT_READFILE_CONTEXT_SECTION_PATTERN = re.compile(
-    r"<file(?: last_modified_time='-?\d+')? path='(?P<path>[^']*)' encoding='utf-8' "
+    r"<file(?: last_refreshed_time='-?\d+')?(?: last_modified_time='-?\d+')? path='(?P<path>[^']*)' encoding='utf-8' "
     r"line_ending='[^']*' total_lines='\d+'>\n.*?</file>"
-    r"(?=\n<file(?: last_modified_time='-?\d+')? path='|\Z)",
+    r"(?=\n<file(?: last_refreshed_time='-?\d+')?(?: last_modified_time='-?\d+')? path='|\Z)",
     re.DOTALL,
  )
 
@@ -5410,7 +5438,9 @@ def load_reused_session_agent_history(
     active_context = ""
 
     for turn_number, turn_dir in sorted(turn_directories):
-        response = read_state_artifact(turn_dir / "response")
+        response_path = turn_dir / "response"
+        response = read_state_artifact(response_path)
+        turn_unix_time = state_artifact_last_modified_time(response_path)
         try:
             tool_calls = parse_reused_agent_tool_calls(response)
         except ValueError as exc:
@@ -5476,6 +5506,7 @@ def load_reused_session_agent_history(
                     context=tool_context,
                     tool_call=tool_call,
                     output=tool_output,
+                    turn_unix_time=turn_unix_time,
                     expires_in_turns=tool_call.expires_in_turns,
                     readfile_contexts=readfile_contexts,
                 )
@@ -5555,7 +5586,8 @@ def build_agent_context_window_prompt(
     pinned_turn_numbers: set[int],
     revision_instruction: str = "",
     controller_tools: list[dict[str, Any]] | None = None,
- ) -> str:
+    hook_contents: tuple[str, ...] = (),
+) -> str:
     advance_agent_history_purges(turns, pinned_turn_numbers)
     visible_file_indexes = set(range(len(file_contexts)))
     visible_turn_numbers = set(
@@ -5593,6 +5625,7 @@ def build_agent_context_window_prompt(
             active_context=visible_active_context,
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
+            hook_contents=hook_contents,
             current_unix_time=current_unix_time,
         )
         return (
@@ -5684,6 +5717,7 @@ def build_agent_followup_prompt(
     visible_turn_numbers: set[int] | None = None,
     pinned_turn_numbers: set[int] | None = None,
     controller_tools: list[dict[str, Any]] | None = None,
+    hook_contents: tuple[str, ...] = (),
     include_task: bool = True,
     current_unix_time: int | None = None,
 ) -> str:
@@ -5692,6 +5726,12 @@ def build_agent_followup_prompt(
     additional_parts: list[str] = [
         format_agent_tool_schema_context(controller_tools),
     ]
+
+    for hook_content in hook_contents:
+        additional_parts.append(
+            f"<additional_context>\n{hook_content}</additional_context>"
+        )
+
 
     if active_context:
         additional_parts.append(
@@ -5725,6 +5765,27 @@ def build_agent_followup_prompt(
         include_task=include_task,
         current_unix_time=current_unix_time,
     )
+
+
+def run_agent_hook_context_scripts(
+    scripts: tuple[str, ...],
+) -> tuple[str, ...]:
+    hook_contents: list[str] = []
+    for script in scripts:
+        try:
+            completed = subprocess.run(
+                [script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            continue
+        if completed.returncode == 0:
+            hook_contents.append(completed.stdout)
+    return tuple(hook_contents)
 
 
 def agent_review_usage() -> str:
@@ -5957,7 +6018,13 @@ def request_agent_model(
             complete_state_turn(turn_dir, "", f"ERROR: {exc}")
         raise
     elapsed = time.perf_counter() - start_time
-    complete_state_turn(turn_dir, reasoning, response)
+    if turn_dir is not None:
+        complete_state_turn(turn_dir, reasoning, response)
+        turn_unix_time = state_artifact_last_modified_time(
+            turn_dir / "response"
+        )
+    else:
+        turn_unix_time = None
     statsline = print_stats(
         request_characters=request_characters,
         request_tokens=request_tokens,
@@ -5981,6 +6048,7 @@ def request_agent_model(
         reasoning=reasoning,
         statsline=statsline,
         turn_dir=turn_dir,
+        turn_unix_time=turn_unix_time,
         tool_calls=parsed_tool_calls,
     )
 
@@ -6065,6 +6133,7 @@ def run_agent_readfile_tool(
             max_file_size_kb=settings.max_file_size_kb,
             add_line_numbers=True,
             include_last_modified_time=True,
+            include_last_refreshed_time=True,
         )
     except Exception as exc:
         return AgentToolExecution(f"ERROR: Readfile tool failed: {exc}")
@@ -6290,6 +6359,9 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             pinned_turn_numbers=pinned_turn_numbers,
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
+            hook_contents=run_agent_hook_context_scripts(
+                settings.agent_hook_context_scripts
+            ),
         )
         result = request_agent_model(
             settings,
@@ -6530,6 +6602,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     tool_context,
                     tool_call,
                     tool_output,
+                    turn_unix_time=model_result.turn_unix_time,
                     readfile_contexts=readfile_contexts,
                 )
             executed_tool_calls.append(tool_call)
@@ -7581,6 +7654,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--agent-hook-context",
+        nargs="+",
+        metavar="SCRIPT",
+        help=(
+            "Run scripts before each agent turn and include successful "
+            "standard output in <hook_content> tags"
+        ),
+    )
+
+    parser.add_argument(
         "--agent-profile",
         dest="agent_profiles",
         action="append",
@@ -8460,6 +8543,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "plan_system_prompt": None,
         "agent": False,
         "agent_auto": False,
+        "agent_hook_context": None,
         "agent_profiles": None,
         "patch": False,
         "shell": False,
@@ -8597,6 +8681,10 @@ def main() -> int:
             ("--plan", args.plan is not None),
             ("--agent", args.agent),
             ("--agent-auto", args.agent_auto),
+            (
+                "--agent-hook-context",
+                args.agent_hook_context is not None,
+            ),
             ("--agent-profile", args.agent_profiles is not None),
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
@@ -9300,6 +9388,9 @@ def main() -> int:
         return 1
     if agent_mode and (patch_mode or shell_mode):
         print("ERROR: --agent cannot be combined with --patch or --shell", file=sys.stderr)
+        return 1
+    if args.agent_hook_context is not None and not agent_mode:
+        print("ERROR: --agent-hook-context requires --agent", file=sys.stderr)
         return 1
     selected_agent_profiles: tuple[AgentProfile, ...] = ()
     if args.agent_profiles is not None:
@@ -10041,6 +10132,7 @@ def main() -> int:
                 add_line_numbers=add_line_numbers,
                 stdin_content=stdin_content,
                 include_last_modified_time=agent_mode,
+                include_last_refreshed_time=agent_mode,
             )
             context = "\n".join(
                 section for _, section in context_sections
@@ -10330,6 +10422,9 @@ def main() -> int:
                 else ()
             ),
             initial_active_context=reused_agent_active_context,
+            agent_hook_context_scripts=tuple(
+                args.agent_hook_context or []
+            ),
         )
         return run_agent_mode(agent_settings)
 
