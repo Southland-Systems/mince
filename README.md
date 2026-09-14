@@ -260,6 +260,12 @@ mince --base-url http://localhost:11434/v1 \
   --files README.md
 ```
 
+## Security and Containment 🔐
+
+- Use `mince-contain` as a drop-in replacement for `mince` to run inside a read-only container
+- Supply `--shell-networking` to enable network access during agent and shell operations
+- `mince-contain --contain-help` provides extensive options to customize the container environment
+
 
 ## Tested Providers ⚒️
 

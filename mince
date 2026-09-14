@@ -29,7 +29,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random, string
 import dbm
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import difflib
 import pydoc
@@ -104,22 +104,43 @@ DEFAULT_SHELL_SYSTEM_PROMPT = (
 DEFAULT_AGENT_SYSTEM_PROMPT = (
     "Run an agent session using the provided controller tools. Every "
     "controller response must call exactly one tool and must not answer with "
-    "plain text. Available tools are `patch`, `shell`, `agent`, `session`, "
-    "and `context`. `patch` directly accepts the `line_replace_manifest` "
-    "arguments used by --patch, and `shell` directly accepts the "
-    "`shell_commands` arguments used by --shell; do not delegate either to "
-    "a separate worker. `agent` starts the next controller turn with a "
-    "non-empty task and optional context; use it instead of a no-op "
-    "continuation. Selected agent profiles are exposed as individual "
-    "controller tools named `agent_<profile_name>`; use the applicable "
-    "profile tool rather than generic `agent`. Profile descriptions explain "
-    "their intended use and profile types identify their intended response "
-    "formats. `session` uses action=end with a non-empty reason to complete "
-    "the session. `context` uses action=pin with a visible file path or prior "
-    "agent turn such as `turn:2` to retain context. Use a non-empty task for "
-    "agent; include context only when useful. Do not duplicate work, and call "
-    "`patch` or `shell` directly for file changes or commands."
- )
+    "plain text. Available tools are `patch`, `shell`, `readfile`, `agent`, "
+    "`session`, and `context`. `patch` directly accepts the "
+    "`line_replace_manifest` arguments used by --patch, and `shell` directly "
+    "accepts the `shell_commands` arguments used by --shell. `readfile` "
+    "accepts one or more file paths and makes their contents available as "
+    "`<file>` sections in the main `<files>` context with line numbers, paths, "
+    "and expiry; use it to inspect files that are not in the controller context. "
+    "A `readfile` call is appended for every document in a `patch` "
+    "response. `agent` starts the next controller turn with a non-empty task and "
+    "optional context. Every controller tool call requires an "
+    "`expires_in_turns` that controls how "
+    "many following controller turns retain its history; use `agent` instead "
+    "of a no-op continuation. Selected agent profiles are exposed as "
+    "`agent_<profile_name>`; use the applicable agent profile rather than "
+    "generic `agent` to delegate work to a worker. Profile descriptions "
+    "explain their intended use and profile types identify their workers' "
+    "response formats. `session` uses action=end with a non-empty reason to "
+    "complete the session. `context` uses action=pin with a visible file path "
+    "or prior agent turn such as `turn:2` to retain context. Use a non-empty "
+    "task for agent; include context only when useful. Do not duplicate work."
+)
+DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
+    "mce_system": DEFAULT_SYSTEM_PROMPT,
+    "mce_linenum": DEFAULT_LINENUM_SYSTEM_PROMPT,
+    "mce_patch": DEFAULT_PATCH_SYSTEM_PROMPT,
+    "mce_plan": DEFAULT_PLAN_SYSTEM_PROMPT,
+    "mce_shell": DEFAULT_SHELL_SYSTEM_PROMPT,
+    "mce_agent": DEFAULT_AGENT_SYSTEM_PROMPT,
+}
+DEFAULT_PROMPT_LIBRARY_REFERENCES: dict[str, str] = {
+    "system_prompt": "./mce_system.md",
+    "linenum_system_prompt": "./mce_linenum.md",
+    "patch_system_prompt": "./mce_patch.md",
+    "plan_system_prompt": "./mce_plan.md",
+    "shell_system_prompt": "./mce_shell.md",
+    "agent_system_prompt": "./mce_agent.md",
+}
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.6-luna",
     "api_key": "",
@@ -129,11 +150,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "meta_project": "",
     "service_tier": "off",
     "safety_identifier": "",
-    "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    "linenum_system_prompt": DEFAULT_LINENUM_SYSTEM_PROMPT,
-    "patch_system_prompt": DEFAULT_PATCH_SYSTEM_PROMPT,
-    "plan_system_prompt": DEFAULT_PLAN_SYSTEM_PROMPT,
-    "shell_system_prompt": DEFAULT_SHELL_SYSTEM_PROMPT,
+    "system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["system_prompt"],
+    "linenum_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["linenum_system_prompt"],
+    "patch_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["patch_system_prompt"],
+    "plan_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["plan_system_prompt"],
+    "shell_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["shell_system_prompt"],
+    "agent_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["agent_system_prompt"],
     "system_prompt_with_task": "off",
     "line_numbers": "on",
     "prompt_expansion": "off",
@@ -220,13 +242,7 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
                                         "minItems": 0,
                                         "items": {"type": "string"},
                                     },
-                                    "summary": {"type": "string", "minLength": 1},
-                                    "confidence": {
-                                        "type": "number",
-                                        "minimum": 0.0,
-                                        "maximum": 1.0,
-                                    },
-                                    "needs_manual_review": {"type": "boolean"},
+                                    "summary_message": {"type": "string", "minLength": 1},
                                 },
                                 "required": [
                                     "patch_id",
@@ -234,9 +250,7 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
                                     "start_line",
                                     "end_line",
                                     "content_line_array",
-                                    "summary",
-                                    "confidence",
-                                    "needs_manual_review",
+                                    "summary_message",
                                 ],
                             },
                         },
@@ -390,6 +404,19 @@ def merged_config(config_path: Path | None = None) -> dict[str, Any]:
         raise SystemExit(1)
 
 
+def inherited_config_names(config_path: Path) -> set[str]:
+    document = _read_config_document_for_merge(config_path)
+    parent_name = _inherit_profile_name(document, config_path)
+    if parent_name is None:
+        return set()
+
+    overridden_names = set(document)
+    for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
+        if deprecated in document:
+            overridden_names.add(replacement)
+    parent_config = merged_config(get_profile_path(parent_name))
+    return set(parent_config) - overridden_names
+
 def migrate_deprecated_config(config: dict[str, Any]) -> bool:
     changed = False
     for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
@@ -404,10 +431,10 @@ def migrate_deprecated_config(config: dict[str, Any]) -> bool:
 
 def ensure_config_exists() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_default_prompt_library_entries()
 
     if not CONFIG_FILE.exists():
         save_config(DEFAULT_CONFIG.copy())
-
 
 def load_config() -> dict[str, Any]:
     ensure_config_exists()
@@ -462,6 +489,7 @@ PROMPT_TYPE_ALIASES: dict[str, str] = {
     "patch": "patch_system_prompt",
     "plan": "plan_system_prompt",
     "shell": "shell_system_prompt",
+    "agent": "agent_system_prompt",
 }
 PROMPT_CONFIG_KEYS = tuple(dict.fromkeys(PROMPT_TYPE_ALIASES.values()))
 
@@ -474,7 +502,7 @@ def prompt_type_key(value: str) -> str:
         return PROMPT_TYPE_ALIASES[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"unknown prompt type '{value}'; choose system, linenum, patch, plan, or shell"
+            f"unknown prompt type '{value}'; choose system, linenum, patch, plan, shell, or agent"
         ) from exc
 
 
@@ -1036,6 +1064,20 @@ def write_state_agent_tool_output(
 def prompt_file_path(name: str) -> Path:
     return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
 
+
+def ensure_default_prompt_library_entries() -> None:
+    prompt_dir = APP_DIR / "prompts"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    for name, prompt in DEFAULT_PROMPT_LIBRARY_ENTRIES.items():
+        try:
+            with (prompt_dir / f"{name}.md").open(
+                "x", encoding="utf-8"
+            ) as prompt_file:
+                prompt_file.write(prompt)
+        except FileExistsError:
+            pass
+
+
 def validate_prompt_profile_name(name: str) -> str:
     name = name.strip()
     if not name.isidentifier():
@@ -1339,22 +1381,84 @@ def handle_prompt_remove(name: str) -> int:
         if prompt_path.exists() and not prompt_path.is_file():
             raise ValueError(f"prompt path is not a file: {prompt_path}")
 
-        documents: list[tuple[Path, dict[str, Any]]] = []
-        for config_path in sorted(APP_DIR.glob("*.json")):
-            documents.append((config_path, read_config_document(config_path)))
+        default_prompt = DEFAULT_PROMPT_LIBRARY_ENTRIES.get(prompt_path.stem)
+        if default_prompt is not None:
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(default_prompt, encoding="utf-8")
+        else:
+            documents: list[tuple[Path, dict[str, Any]]] = []
+            for config_path in sorted(APP_DIR.glob("*.json")):
+                documents.append((config_path, read_config_document(config_path)))
 
-        for config_path, config in documents:
-            if unassign_prompt_from_config(
-                config, prompt_path, PROMPT_CONFIG_KEYS
-            ):
-                write_config_document(config_path, config)
+            for config_path, config in documents:
+                if unassign_prompt_from_config(
+                    config, prompt_path, PROMPT_CONFIG_KEYS
+                ):
+                    write_config_document(config_path, config)
 
-        if prompt_path.exists():
-            prompt_path.unlink()
+            if prompt_path.exists():
+                prompt_path.unlink()
     except Exception as exc:
         print(f"ERROR: Failed to remove prompt: {exc}", file=sys.stderr)
         return 1
     print(f"prompt_removed={prompt_path}")
+    return 0
+
+
+def handle_prompt_reset_default(prompt_types: str = "") -> int:
+    try:
+        if prompt_types:
+            selected_config_keys: list[str] = []
+            for raw_type in prompt_types.split(","):
+                config_key = prompt_type_key(raw_type)
+                if config_key not in selected_config_keys:
+                    selected_config_keys.append(config_key)
+        else:
+            selected_config_keys = list(PROMPT_TYPE_ALIASES.values())
+
+        prompt_names = [
+            Path(DEFAULT_PROMPT_LIBRARY_REFERENCES[config_key]).stem
+            for config_key in selected_config_keys
+        ]
+        if not NONINTERACTIVE:
+            reset_target = (
+                "all default system prompt library entries"
+                if not prompt_types
+                else (
+                    "default system prompt types "
+                    + ", ".join(
+                        prompt_type
+                        for prompt_type, config_key in PROMPT_TYPE_ALIASES.items()
+                        if config_key in selected_config_keys
+                    )
+                )
+            )
+            while True:
+                choice = input(f"Reset {reset_target}? [y/n]: ").strip().lower()
+                if choice in ("y", "yes"):
+                    break
+                if choice in ("n", "no"):
+                    print("Aborted.")
+                    return 0
+                print("Please answer y or n.")
+        prompt_paths = [
+            (prompt_file_path(name), DEFAULT_PROMPT_LIBRARY_ENTRIES[name])
+            for name in prompt_names
+        ]
+        for prompt_path, _ in prompt_paths:
+            if prompt_path.exists() and not prompt_path.is_file():
+                raise ValueError(
+                    f"prompt path is not a file: {prompt_path}"
+                )
+        for prompt_path, prompt in prompt_paths:
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(prompt, encoding="utf-8")
+    except Exception as exc:
+        print(
+            f"ERROR: Failed to reset default prompts: {exc}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -1422,7 +1526,10 @@ class AgentProfile:
 
 def validate_agent_profile_name(name: str) -> str:
     name = name.strip()
-    if not name.isidentifier():
+    if (
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+        or len(f"agent_{name}") > 64
+    ):
         raise ValueError(f"invalid agent profile name '{name}'")
     return name
 
@@ -1570,6 +1677,39 @@ def resolved_agent_profile_content(profile: AgentProfile) -> str:
     return profile.content
 
 
+def agent_profile_response_schema(
+    profile: AgentProfile,
+ ) -> dict[str, Any] | None:
+    profile_type = normalize_agent_profile_type(profile.profile_type)
+    if profile_type == "text":
+        return None
+    try:
+        response_schema = json.loads(
+            resolved_agent_profile_content(profile)
+        )
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"agent profile '{profile.name}' response schema must be valid JSON"
+        ) from exc
+    if not isinstance(response_schema, dict):
+        raise ValueError(
+            f"agent profile '{profile.name}' response schema must be a JSON object"
+        )
+    if response_schema.get("type") == "json_schema":
+        response_schema = response_schema.get("schema")
+        if not isinstance(response_schema, dict):
+            raise ValueError(
+                f"agent profile '{profile.name}' response format must contain "
+                "a schema object"
+            )
+    return {
+        "type": "json_schema",
+        "name": agent_profile_tool_name(profile.name),
+        "strict": True,
+        "schema": response_schema,
+    }
+
+
 def agent_profile_tool_name(name: str) -> str:
     return f"agent_{validate_agent_profile_name(name)}"
 
@@ -1577,8 +1717,8 @@ def agent_profile_tool_name(name: str) -> str:
 def agent_agent_tool_schema(profile: AgentProfile) -> dict[str, Any]:
     profile_type = normalize_agent_profile_type(profile.profile_type)
     description = (
-        f"Start the next controller turn using the '{profile.name}' agent "
-        f"profile (type: {profile_type})."
+        f"Delegate work to a worker using the '{profile.name}' agent "
+        f"profile (response format: {profile_type})."
     )
     if profile.description.strip():
         description += f" {profile.description.strip()}"
@@ -1882,13 +2022,18 @@ def mask_api_key(value: Any) -> str:
         return f"{key[:4]}{'*' * (len(key) - 8)}{key[-4:]}"
     return "*" * len(key)
 
-def format_config_line(config_name: str, value: Any) -> str:
+def format_config_line(
+    config_name: str,
+    value: Any,
+    inherited: bool = False,
+ ) -> str:
     output_value = (
         mask_api_key(value)
         if config_name == "api_key"
         else format_config_value(value)
     )
-    return f"{config_name}={output_value}"
+    prefix = "^" if inherited else ""
+    return f"{prefix}{config_name}={output_value}"
 
 def format_config_lines(config: dict[str, Any]) -> list[str]:
     return [
@@ -1984,12 +2129,13 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "service_tier", "Service tier (off, auto, default, flex, scale, priority)")
     prompt_config_value(config, "files", "Context files (eg: /path/file1|file2)")
-    prompt_config_value(config, "system_prompt_with_task", "Append task to system prompt (off, on)")
+    prompt_config_value(config, "system_prompt_with_task", "Prepend task to system prompt (off, on)")
     prompt_config_value(config, "system_prompt", "System prompt")
     prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
     prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
     prompt_config_value(config, "shell_system_prompt", "System prompt for shell command mode")
+    prompt_config_value(config, "agent_system_prompt", "System prompt for agent mode")
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "shell", "Shell mode (off, on)")
@@ -2849,12 +2995,12 @@ def execute_shell_commands(
         stdout = "\n" + stdout if stdout != "" else stdout
         stderr = "\n" + stderr if stderr != "" else stderr
         output_blocks.append(
-            f"<command index='{index}'>\n"
+            f"<shell_command index='{index}'>\n"
             f"<shell>\n{format_shell_commands([step])}\n</shell>\n"
             f"<exit_status>{status}</exit_status>\n"
             f"<stdout>{stdout}</stdout>\n"
             f"<stderr>{stderr}</stderr>\n"
-            "</command>"
+            "</shell_command>"
         )
     return "\n".join(output_blocks)
 
@@ -3822,6 +3968,32 @@ def resolve_prompt_setting(
         return expanded.strip()
     return expanded
 
+def format_config_detail_line(
+    config_name: str,
+    value: Any,
+    config: dict[str, Any],
+    inherited: bool = False,
+) -> str:
+    if config_name not in PROMPT_CONFIG_KEYS:
+        return format_config_line(config_name, value, inherited)
+
+    expanded_prompt = resolve_prompt_setting(
+        explicit_value=None,
+        prompt_file=None,
+        config=config,
+        config_key=config_name,
+        default=get_default_config_value(config_name),
+        prompt_expansion_enabled=coerce_bool(
+            config.get("prompt_expansion", "off")
+        ),
+        strip_configured_result=True,
+    )
+    one_line_expanded_prompt = " ".join(expanded_prompt.splitlines())
+    return (
+        f"{format_config_line(config_name, value, inherited)} "
+        f"[{one_line_expanded_prompt}]"
+    )
+
 
 def parse_config_files(value: Any) -> list[str]:
     if value is None:
@@ -3855,6 +4027,13 @@ def read_files_list(
                 continue
             files.append(line)
     return files
+
+def resolve_context_file_paths(file_names: list[str]) -> list[Path]:
+    return [
+        Path(file_name) if file_name == "-" else Path(file_name).resolve()
+        for file_name in file_names
+    ]
+
 
 def build_context_sections(
     file_paths: list[Path],
@@ -3996,11 +4175,10 @@ def append_task_to_system_prompt(
     system_prompt: str,
     task: str,
     enabled: bool,
- ) -> str:
+) -> str:
     if not enabled or not task:
         return system_prompt
-    return f"{system_prompt}\n{task}"
-
+    return f"{task}\n{system_prompt}"
 def build_user_prompt(
     task: str,
     context: str,
@@ -4049,25 +4227,61 @@ def build_user_prompt(
 AGENT_TOOL_NAMES = (
     "patch",
     "shell",
+    "readfile",
     "agent",
     "session",
     "context",
 )
+AGENT_EXPIRES_IN_TURNS_DEFAULT = 12
+AGENT_EXPIRES_IN_TURNS_SCHEMA: dict[str, Any] = {
+    "type": "integer",
+    "minimum": 6,
+    "default": AGENT_EXPIRES_IN_TURNS_DEFAULT,
+}
 AGENT_PATCH_TOOL = "patch"
 AGENT_SHELL_TOOL = "shell"
+AGENT_READFILE_TOOL = "readfile"
 AGENT_AGENT_TOOL = "agent"
 AGENT_SESSION_TOOL = "session"
 AGENT_CONTEXT_TOOL = "context"
 
-AGENT_AGENT_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
+
+def agent_tool_argument_schema(
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **schema,
+        "properties": {
+            **schema["properties"],
+            "expires_in_turns": AGENT_EXPIRES_IN_TURNS_SCHEMA,
+        },
+        "required": [*schema["required"], "expires_in_turns"],
+    }
+
+
+AGENT_AGENT_CALL_ARGUMENT_SCHEMA: dict[str, Any] = agent_tool_argument_schema(
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "task": {"type": "string", "minLength": 1},
+            "context": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["task", "context", "reason"],
+    }
+)
+AGENT_READFILE_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "task": {"type": "string", "minLength": 1},
-        "context": {"type": "string"},
-        "reason": {"type": "string"},
+        "paths": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
     },
-    "required": ["task", "context", "reason"],
+    "required": ["paths"],
 }
 AGENT_SESSION_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -4089,24 +4303,42 @@ AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     "required": ["action", "context_id", "reason"],
 }
 AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
-    AGENT_PATCH_TOOL: PATCH_MANIFEST_SCHEMA["schema"],
-    AGENT_SHELL_TOOL: SHELL_COMMAND_SCHEMA["schema"],
+    AGENT_PATCH_TOOL: agent_tool_argument_schema(
+        PATCH_MANIFEST_SCHEMA["schema"]
+    ),
+    AGENT_SHELL_TOOL: agent_tool_argument_schema(
+        SHELL_COMMAND_SCHEMA["schema"]
+    ),
+    AGENT_READFILE_TOOL: agent_tool_argument_schema(
+        AGENT_READFILE_CALL_ARGUMENT_SCHEMA
+    ),
     AGENT_AGENT_TOOL: AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
-    AGENT_SESSION_TOOL: AGENT_SESSION_CALL_ARGUMENT_SCHEMA,
-    AGENT_CONTEXT_TOOL: AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA,
+    AGENT_SESSION_TOOL: agent_tool_argument_schema(
+        AGENT_SESSION_CALL_ARGUMENT_SCHEMA
+    ),
+    AGENT_CONTEXT_TOOL: agent_tool_argument_schema(
+        AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA
+    ),
 }
 AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     AGENT_PATCH_TOOL: (
         "Apply a file modification manifest. Arguments must match the "
-        "`patch` schema."
+        "`patch` schema. A `readfile` call will automatically append "
+        "for every document in the manifest."
     ),
     AGENT_SHELL_TOOL: (
         "Generate commands for review and execution. Arguments must match "
         "the `shell` schema."
     ),
+    AGENT_READFILE_TOOL: (
+        "Read one or more files and make their contents available as `<file>` "
+        "sections in the main `<files>` context with line numbers, paths, "
+        "and expiry. Arguments must match the `readfile` schema."
+    ),
     AGENT_AGENT_TOOL: (
         "Start the next controller turn with a new non-empty task and optional "
-        "context."
+        "context. expires_in_turns controls how many controller turns "
+        "retain this tool call in history (default: 7)."
     ),
     AGENT_SESSION_TOOL: (
         "End the agent session with a non-empty reason that completes the task."
@@ -4141,6 +4373,7 @@ class AgentToolCall:
     context: str = ""
     context_id: str = ""
     action: str = ""
+    expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT
     profile_name: str = ""
     arguments: dict[str, Any] | None = None
 
@@ -4151,25 +4384,34 @@ class AgentToolCall:
             else self.tool
         )
         if self.arguments is not None:
-            return {"tool": tool_name, **self.arguments}
+            return {
+                "tool": tool_name,
+                **self.arguments,
+                "expires_in_turns": self.expires_in_turns,
+            }
         value: dict[str, Any] = {"tool": tool_name}
         for name in AGENT_TOOL_ARGUMENT_SCHEMAS[self.tool]["properties"]:
             value[name] = getattr(self, name)
         return value
- 
- 
+
+
 @dataclass(frozen=True)
 class AgentTurn:
     task: str
     context: str
     tool_call: AgentToolCall
     output: str
+    expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT
+    purge_in_turns: int | None = None
+    removal_reason: str = ""
+    readfile_contexts: tuple[tuple[str, str], ...] | None = None
  
  
 @dataclass(frozen=True)
 class AgentToolExecution:
     output: str
     revision_instruction: str | None = None
+    readfile_contexts: tuple[tuple[str, str], ...] | None = None
  
  
 @dataclass(frozen=True)
@@ -4232,8 +4474,28 @@ class AgentModelResult:
     response: str
     reasoning: str
     statsline: str
-    turn_dir: Path
+    turn_dir: Path | None
     tool_calls: tuple[AgentToolCall, ...] = ()
+
+class AgentControllerResponseError(ValueError):
+    pass
+
+
+AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR = (
+    "Agent controller returned no executable tool call"
+ )
+
+
+def parse_agent_expires_in_turns(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+    ):
+        raise ValueError(
+            "agent field expires_in_turns must be a positive integer"
+        )
+    return value
 
 
 def parse_agent_tool_arguments(
@@ -4258,6 +4520,7 @@ def parse_agent_tool_arguments(
             context=parsed.context,
             context_id=parsed.context_id,
             action=parsed.action,
+            expires_in_turns=parsed.expires_in_turns,
             profile_name=profile_name,
             arguments=parsed.arguments,
         )
@@ -4266,11 +4529,16 @@ def parse_agent_tool_arguments(
     if not isinstance(value, dict):
         raise ValueError(f"agent {tool} arguments must be a JSON object")
     if tool == AGENT_PATCH_TOOL:
-        if set(value) != {"files", "commit_message"}:
+        if set(value) != {
+            "files", "commit_message", "expires_in_turns"
+        }:
             raise ValueError(
-                "agent patch arguments must contain only files and "
-                "commit_message"
+                "agent patch arguments must contain only files, commit_message, "
+                "and expires_in_turns"
             )
+        expires_in_turns = parse_agent_expires_in_turns(
+            value["expires_in_turns"]
+        )
         if not isinstance(value["files"], list) or not value["files"]:
             raise ValueError(
                 "agent patch arguments require a non-empty files array"
@@ -4283,14 +4551,64 @@ def parse_agent_tool_arguments(
             raise ValueError(
                 "agent patch arguments require a non-empty commit_message"
             )
-        return AgentToolCall(tool=tool, arguments=value)
+        return AgentToolCall(
+            tool=tool,
+            expires_in_turns=expires_in_turns,
+            arguments={
+                "files": value["files"],
+                "commit_message": commit_message,
+            },
+        )
  
     if tool == AGENT_SHELL_TOOL:
+        if set(value) != {"commands", "expires_in_turns"}:
+            raise ValueError(
+                "agent shell arguments must contain only commands and "
+                "expires_in_turns"
+            )
+        expires_in_turns = parse_agent_expires_in_turns(
+            value["expires_in_turns"]
+        )
         try:
-            _parse_shell_manifest_value(value)
+            _parse_shell_manifest_value({"commands": value["commands"]})
         except ValueError as exc:
             raise ValueError(f"agent shell arguments are invalid: {exc}") from exc
-        return AgentToolCall(tool=tool, arguments=value)
+        return AgentToolCall(
+            tool=tool,
+            expires_in_turns=expires_in_turns,
+            arguments={"commands": value["commands"]},
+        )
+ 
+    if tool == AGENT_READFILE_TOOL:
+        if set(value) != {"paths", "expires_in_turns"}:
+            raise ValueError(
+                "agent readfile arguments must contain only paths and "
+                "expires_in_turns"
+            )
+        expires_in_turns = parse_agent_expires_in_turns(
+            value["expires_in_turns"]
+        )
+        paths = value["paths"]
+        if not isinstance(paths, list) or not paths:
+            raise ValueError(
+                "agent readfile arguments require a non-empty paths array"
+            )
+        normalized_paths: list[str] = []
+        for index, path in enumerate(paths, start=1):
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(
+                    f"agent readfile paths entry {index} must be a non-empty string"
+                )
+            if "\x00" in path:
+                raise ValueError(
+                    f"agent readfile paths entry {index} cannot contain a null byte"
+                )
+            normalized_paths.append(path.strip())
+        return AgentToolCall(
+            tool=tool,
+            expires_in_turns=expires_in_turns,
+            arguments={"paths": normalized_paths},
+        )
  
     expected_fields = set(AGENT_TOOL_ARGUMENT_FIELDS[tool])
     actual_fields = set(value)
@@ -4306,10 +4624,15 @@ def parse_agent_tool_arguments(
             f"agent {tool} arguments must contain exactly the tool schema "
             "fields (" + "; ".join(details) + ")"
         )
+    expires_in_turns = parse_agent_expires_in_turns(
+        value["expires_in_turns"]
+    )
     for name in expected_fields:
+        if name == "expires_in_turns":
+            continue
         if not isinstance(value[name], str):
             raise ValueError(f"agent {tool} field {name} must be a string")
- 
+
     tool_call = AgentToolCall(
         tool=tool,
         reason=value.get("reason", "").strip(),
@@ -4317,6 +4640,7 @@ def parse_agent_tool_arguments(
         context=value.get("context", "").strip(),
         context_id=value.get("context_id", "").strip(),
         action=value.get("action", "").strip(),
+        expires_in_turns=expires_in_turns,
     )
     if tool == AGENT_AGENT_TOOL:
         if not tool_call.task:
@@ -4339,25 +4663,97 @@ def parse_agent_tool_arguments(
 def normalize_agent_tool_calls(
     tool_calls: list[AgentToolCall],
 ) -> list[AgentToolCall]:
-    if len(tool_calls) != 1:
-        raise ValueError("agent responses require exactly one tool call")
+    if not tool_calls:
+        raise AgentControllerResponseError(
+            "agent responses require at least one tool call"
+        )
     return tool_calls
+
+
+def normalize_agent_controller_tool_calls(
+    tool_calls: list[AgentToolCall],
+) -> list[AgentToolCall]:
+    if not tool_calls:
+        raise AgentControllerResponseError(
+            AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
+        )
+    if len(tool_calls) != 1:
+        raise AgentControllerResponseError(
+            "agent responses require exactly one tool call"
+        )
+    return tool_calls
+
+
+def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
+    arguments = tool_call.arguments
+    if not isinstance(arguments, dict):
+        raise ValueError("agent patch tool received no manifest")
+    files = arguments.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError(
+            "agent patch arguments require a non-empty files array"
+        )
+    paths: list[str] = []
+    for index, file_entry in enumerate(files, start=1):
+        if not isinstance(file_entry, dict):
+            raise ValueError(
+                f"agent patch files entry {index} must be an object"
+            )
+        document = file_entry.get("document")
+        if not isinstance(document, dict):
+            raise ValueError(
+                f"agent patch files entry {index} requires a document object"
+            )
+        path = document.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(
+                f"agent patch files entry {index} document requires a path"
+            )
+        paths.append(path.strip())
+    return paths
+
+
+def append_agent_patch_readfile_tool_calls(
+    tool_calls: list[AgentToolCall],
+) -> list[AgentToolCall]:
+    appended_tool_calls: list[AgentToolCall] = []
+    for tool_call in tool_calls:
+        appended_tool_calls.append(tool_call)
+        if tool_call.tool != AGENT_PATCH_TOOL:
+            continue
+        appended_tool_calls.append(
+            AgentToolCall(
+                tool=AGENT_READFILE_TOOL,
+                expires_in_turns=tool_call.expires_in_turns,
+                arguments={
+                    "paths": agent_patch_readfile_paths(tool_call),
+                },
+            )
+        )
+    return appended_tool_calls
 
 
 def response_agent_tool_calls(
     response_obj: Any,
     agent_profiles: tuple[AgentProfile, ...] = (),
 ) -> list[AgentToolCall]:
-    output_text = str(getattr(response_obj, "output_text", "") or "")
+    output_text_value = (
+        response_obj.get("output_text", "")
+        if isinstance(response_obj, dict)
+        else getattr(response_obj, "output_text", "")
+    )
+    output_text = str(output_text_value or "")
     if output_text.strip():
-        raise ValueError(
-            "agent controller response must contain only a tool call"
+        raise AgentControllerResponseError(
+            AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
         )
     output_items = (
         response_obj.get("output", [])
         if isinstance(response_obj, dict)
         else getattr(response_obj, "output", [])
     )
+    if not isinstance(output_items, (list, tuple)):
+        raise ValueError("agent controller response output must be an array")
     tool_calls: list[AgentToolCall] = []
     for item in output_items:
         item_type = (
@@ -4365,8 +4761,13 @@ def response_agent_tool_calls(
             if isinstance(item, dict)
             else getattr(item, "type", None)
         )
-        if item_type != "function_call":
+        if item_type == "reasoning":
             continue
+        if item_type != "function_call":
+            raise AgentControllerResponseError(
+                "agent controller response must contain only reasoning and "
+                "a function call"
+            )
         tool = (
             item.get("name")
             if isinstance(item, dict)
@@ -4400,22 +4801,89 @@ def response_agent_tool_calls(
             raise ValueError(
                 f"agent tool call {len(tool_calls) + 1}: {exc}"
             ) from exc
-    return normalize_agent_tool_calls(tool_calls)
+    return append_agent_patch_readfile_tool_calls(
+        normalize_agent_controller_tool_calls(tool_calls)
+    )
 
 
 def format_agent_tool_call(tool_call: AgentToolCall) -> str:
     return json.dumps(tool_call.as_dict(), indent=2, ensure_ascii=False)
 
 
+def indent_agent_patch_text(
+    text: str,
+    empty_text: str = "",
+) -> str:
+    lines = text.splitlines() or [empty_text]
+    return "\n".join(f"    {line}" for line in lines)
+
+
+def format_agent_patch_manifest(manifest: dict[str, Any]) -> str:
+    file_blocks: list[str] = []
+    for file_index, file_entry in enumerate(manifest["files"], start=1):
+        document = file_entry["document"]
+        patch_blocks: list[str] = []
+        for patch_index, patch in enumerate(
+            file_entry["patches"],
+            start=1,
+        ):
+            replacement = "\n".join(patch["content_line_array"])
+            patch_blocks.append(
+                f"  Change {patch_index}: lines {patch['start_line']}-"
+                f"{patch['end_line']}\n"
+                "  Summary: "
+                f"{patch['summary_message']}\n"
+            )
+        file_blocks.append(
+            f"[{file_index}] {document['path']}\n"
+            + "\n".join(patch_blocks)
+        )
+    return (
+        "\n\n".join(file_blocks) +
+        f"Patch summary: {manifest['commit_message']}\n"
+    )
+
+
 def format_agent_tool_call_for_output(tool_call: AgentToolCall) -> str:
     call = tool_call.as_dict()
     tool_name = str(call.pop("tool"))
+    if (
+        tool_call.tool == AGENT_PATCH_TOOL
+        and tool_call.arguments is not None
+    ):
+        return (
+            f"Tool: {tool_name}\n"
+            f"{format_agent_patch_manifest(tool_call.arguments)}"
+        )
     if (
         tool_call.tool == AGENT_SHELL_TOOL
         and tool_call.arguments is not None
     ):
         commands = _parse_shell_manifest_value(tool_call.arguments)
         return f"Tool: {tool_name}\nCommands:\n{format_shell_commands(commands)}"
+    if tool_call.tool == AGENT_READFILE_TOOL:
+        paths = call["paths"]
+        path_text = "\n".join(
+            f"[{index}] {path}"
+            for index, path in enumerate(paths, start=1)
+        )
+        return f"Tool: {tool_name}\nPaths:\n{path_text}"
+    if tool_call.tool == AGENT_SESSION_TOOL:
+        return (
+            f"Tool: {tool_name}\n"
+            f"Action: {call['action']}\n"
+            f"Reason:\n{call['reason']}"
+        )
+    if tool_call.tool == AGENT_AGENT_TOOL:
+        sections = [
+            f"Tool: {tool_name}",
+            f"Task:\n{call['task']}",
+        ]
+        if call["context"]:
+            sections.append(f"Context:\n{call['context']}")
+        if call["reason"]:
+            sections.append(f"Reason:\n{call['reason']}")
+        return "\n".join(sections)
     return (
         f"Tool: {tool_name}\n"
         "Arguments:\n"
@@ -4427,50 +4895,251 @@ def format_agent_tool_call_report(
     tool_calls: list[AgentToolCall],
     current_turn: int | None = None,
 ) -> str:
+    normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
     if current_turn is not None:
-        normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
-        return (
-            f"-- [{current_turn}] {'-' * 72}\n"
-            f"{format_agent_tool_call_for_output(normalized_tool_calls[0])}"
+        if len(normalized_tool_calls) == 1:
+            return (
+                f"-- [{current_turn}] {'-' * 72}\n"
+                f"{format_agent_tool_call_for_output(normalized_tool_calls[0])}"
+            )
+        tool_text = "\n\n".join(
+            f"[{index}] {format_agent_tool_call_for_output(tool_call)}"
+            for index, tool_call in enumerate(
+                normalized_tool_calls,
+                start=1,
+            )
         )
+        return f"-- [{current_turn}] {'-' * 72}\n{tool_text}"
     blocks = [
         f"[{index}] {format_agent_tool_call_for_output(tool_call)}"
-        for index, tool_call in enumerate(tool_calls, start=1)
+        for index, tool_call in enumerate(normalized_tool_calls, start=1)
     ]
     return "Agent tool calls:\n" + "\n\n".join(blocks)
 
 
 def format_agent_tool_calls(tool_calls: list[AgentToolCall]) -> str:
     normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
-    return format_agent_tool_call(normalized_tool_calls[0])
+    if len(normalized_tool_calls) == 1:
+        return format_agent_tool_call(normalized_tool_calls[0])
+    return json.dumps(
+        {
+            "tool_calls": [
+                tool_call.as_dict()
+                for tool_call in normalized_tool_calls
+            ],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
 
 def format_agent_tool_outputs(
     tool_calls: list[AgentToolCall],
     tool_outputs: list[str],
 ) -> str:
-    normalize_agent_tool_calls(tool_calls)
-    if len(tool_outputs) != 1:
+    normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
+    if len(normalized_tool_calls) != len(tool_outputs):
         raise ValueError("agent tool calls and outputs must have equal lengths")
-    return tool_outputs[0]
+    if len(tool_outputs) == 1:
+        return tool_outputs[0]
+    return json.dumps(
+        {"tool_outputs": tool_outputs},
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def append_agent_tool_history(
+    turns: list[AgentTurn],
+    task: str,
+    context: str,
+    tool_call: AgentToolCall,
+    output: str,
+    readfile_contexts: tuple[tuple[str, str], ...] | None = None,
+) -> None:
+    turns.append(
+        AgentTurn(
+            task=task,
+            context=context,
+            tool_call=tool_call,
+            output=output,
+            readfile_contexts=readfile_contexts,
+            expires_in_turns=tool_call.expires_in_turns,
+        )
+    )
+
+
+
+def agent_history_tool_content(turn: AgentTurn) -> str:
+    if turn.readfile_contexts is not None:
+        return "File content in <files> tag."
+    return turn.output
+
+
+def agent_readfile_context_section(
+    section: str,
+    expires_in_turns: int,
+ ) -> str:
+    return section.replace(
+        "<file ",
+        f"<file expires_in_turns='{expires_in_turns}' ",
+        1,
+    )
+
+
+def format_agent_readfile_contexts(
+    turns: list[AgentTurn],
+    turn_numbers: list[int],
+    visible_turn_numbers: set[int],
+) -> str:
+    sections: list[str] = []
+    for turn_number, turn in zip(turn_numbers, turns):
+        if turn_number not in visible_turn_numbers:
+            continue
+        for _, section in turn.readfile_contexts or ():
+            sections.append(
+                agent_readfile_context_section(
+                    section,
+                    turn.expires_in_turns,
+                )
+            )
+    return "\n".join(sections)
+
+
+def remove_duplicate_agent_history_context_files(
+    turns: list[AgentTurn],
+    context_sections: tuple[tuple[str, str], ...],
+) -> None:
+    duplicate_paths = {path for path, _ in context_sections}
+    if not duplicate_paths:
+        return
+    for turn_index, turn in enumerate(turns):
+        if turn.readfile_contexts is None:
+            continue
+        remaining_context_sections = tuple(
+            context_section
+            for context_section in turn.readfile_contexts
+            if context_section[0] not in duplicate_paths
+        )
+        if remaining_context_sections == turn.readfile_contexts:
+            continue
+        turns[turn_index] = replace(
+            turn,
+            readfile_contexts=remaining_context_sections,
+        )
+
+AGENT_HISTORY_PURGE_IN_TURNS = 1
+AGENT_HISTORY_EXPIRATION_REMOVAL_REASON = (
+    "This agent turn was removed from the controller context because its "
+    "expires_in_turns limit was reached."
+ )
+AGENT_HISTORY_TOKEN_LIMIT_REMOVAL_REASON = (
+    "This agent turn was removed from the controller context because it "
+    "exceeded the token limit."
+ )
+
+
+def remove_agent_history_turn(
+    turns: list[AgentTurn],
+    turn_index: int,
+    reason: str,
+ ) -> None:
+    turn = turns[turn_index]
+    if turn.purge_in_turns is not None:
+        return
+    turns[turn_index] = replace(
+        turn,
+        purge_in_turns=AGENT_HISTORY_PURGE_IN_TURNS,
+        removal_reason=reason,
+    )
+
+
+def advance_agent_history_purges(
+    turns: list[AgentTurn],
+    pinned_turn_numbers: set[int] | None = None,
+ ) -> None:
+    pinned_turn_numbers = pinned_turn_numbers or set()
+    for turn_index, turn in enumerate(turns):
+        if turn.purge_in_turns is not None:
+            if turn.purge_in_turns > 0:
+                turns[turn_index] = replace(
+                    turn,
+                    purge_in_turns=turn.purge_in_turns - 1,
+                )
+            continue
+        if turn.expires_in_turns > 0:
+            turns[turn_index] = replace(
+                turn,
+                expires_in_turns=turn.expires_in_turns - 1,
+            )
+            continue
+        if turn_index + 1 not in pinned_turn_numbers:
+            remove_agent_history_turn(
+                turns,
+                turn_index,
+                AGENT_HISTORY_EXPIRATION_REMOVAL_REASON,
+            )
+
+
+def agent_history_turn_numbers(
+    turns: list[AgentTurn],
+    turn_numbers: list[int] | None = None,
+    pinned_turn_numbers: set[int] | None = None,
+ ) -> list[int]:
+    if turn_numbers is None:
+        turn_numbers = list(range(1, len(turns) + 1))
+    if len(turn_numbers) != len(turns):
+        raise ValueError("agent turn numbers must match agent turns")
+    return [
+        turn_number
+        for turn_number, turn in zip(turn_numbers, turns)
+        if turn.purge_in_turns is None
+    ]
+
 
 
 def format_agent_history(
     turns: list[AgentTurn],
     turn_numbers: list[int] | None = None,
-) -> str:
+    pinned_turn_numbers: set[int] | None = None,
+    visible_turn_numbers: set[int] | None = None,
+ ) -> str:
     if turn_numbers is None:
         turn_numbers = list(range(1, len(turns) + 1))
+    if pinned_turn_numbers is None:
+        pinned_turn_numbers = set()
     if len(turn_numbers) != len(turns):
         raise ValueError("agent turn numbers must match agent turns")
+    if visible_turn_numbers is None:
+        visible_turn_numbers = set(
+            agent_history_turn_numbers(
+                turns,
+                turn_numbers,
+                pinned_turn_numbers,
+            )
+        )
     blocks: list[str] = []
-    for turn_number, turn in zip(turn_numbers, turns):
+    for turn_number, turn in reversed(list(zip(turn_numbers, turns))):
+        purge_in_turns = turn.purge_in_turns
+        if purge_in_turns is not None:
+            if purge_in_turns <= 0:
+                continue
+            tool_content = turn.removal_reason
+            purge_attribute = f" purge_in_turns='{purge_in_turns}'"
+        else:
+            if turn_number not in visible_turn_numbers:
+                continue
+            tool_content = agent_history_tool_content(turn)
+            purge_attribute = ""
+        pinned_attribute = (
+            " pinned" if turn_number in pinned_turn_numbers else ""
+        )
         blocks.append(
-            f"<agent_turn index='{turn_number}'>\n"
+            f"<agent_turn{pinned_attribute} index='{turn_number}' expires_in_turns='{turn.expires_in_turns}'{purge_attribute}>\n"
             f"<task>\n{turn.task}\n</task>\n"
             f"<context>\n{turn.context}\n</context>\n"
             f"<tool_call>\n{format_agent_tool_call(turn.tool_call)}\n"
             "</tool_call>\n"
-            f"<tool_output>\n{turn.output}\n</tool_output>\n"
+            f"<tool_content>\n{tool_content}\n</tool_content>\n"
             "</agent_turn>"
         )
     return "\n\n".join(blocks)
@@ -4504,6 +5173,7 @@ def resolve_agent_context_pin(
     context_id: str,
     file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
+    available_turn_numbers: set[int] | None = None,
 ) -> tuple[str, str | int]:
     for path, _ in file_contexts:
         if agent_context_path_matches(context_id, path):
@@ -4516,8 +5186,12 @@ def resolve_agent_context_pin(
     )
     if turn_match is not None:
         turn_number = int(turn_match.group(1))
-        if 1 <= turn_number <= len(turns):
+        if available_turn_numbers is None:
+            available_turn_numbers = set(range(1, len(turns) + 1))
+        if turn_number in available_turn_numbers:
             return "turn", turn_number
+        if 1 <= turn_number <= len(turns):
+            raise ValueError(f"agent turn has expired: turn:{turn_number}")
         raise ValueError(f"agent turn does not exist: turn:{turn_number}")
 
     raise ValueError(
@@ -4532,13 +5206,36 @@ class ReusedAgentHistory:
     active_context: str
 
 
-def parse_reused_agent_tool_call(response: str) -> AgentToolCall:
-    try:
-        value = json.loads(clean_json_response(response))
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "reused agent response must contain a JSON tool call"
-        ) from exc
+AGENT_READFILE_CONTEXT_SECTION_PATTERN = re.compile(
+    r"<file path='(?P<path>[^']*)' encoding='utf-8' "
+    r"line_ending='[^']*' total_lines='\d+'>\n.*?</file>"
+    r"(?=\n<file path='|\Z)",
+    re.DOTALL,
+)
+
+
+def parse_agent_readfile_contexts(
+    output: str,
+) -> tuple[tuple[str, str], ...] | None:
+    contexts: list[tuple[str, str]] = []
+    position = 0
+    while position < len(output):
+        match = AGENT_READFILE_CONTEXT_SECTION_PATTERN.match(
+            output, position
+        )
+        if match is None:
+            return None
+        contexts.append((match.group("path"), match.group(0)))
+        position = match.end()
+        if position == len(output):
+            break
+        if output[position] != "\n":
+            return None
+        position += 1
+    return tuple(contexts) or None
+
+
+def parse_reused_agent_tool_call_value(value: Any) -> AgentToolCall:
     if not isinstance(value, dict):
         raise ValueError("reused agent response must contain a JSON object")
     tool_name = value.get("tool")
@@ -4549,6 +5246,11 @@ def parse_reused_agent_tool_call(response: str) -> AgentToolCall:
         for key, argument in value.items()
         if key != "tool"
     }
+    if (
+        tool_name == AGENT_READFILE_TOOL
+        and set(arguments) == {"path"}
+    ):
+        arguments = {"paths": [arguments["path"]]}
     if tool_name.startswith("agent_"):
         try:
             profile_name = validate_agent_profile_name(
@@ -4568,10 +5270,79 @@ def parse_reused_agent_tool_call(response: str) -> AgentToolCall:
             context=parsed.context,
             context_id=parsed.context_id,
             action=parsed.action,
+            expires_in_turns=parsed.expires_in_turns,
             profile_name=profile_name,
             arguments=parsed.arguments,
         )
     return parse_agent_tool_arguments(tool_name, arguments)
+
+
+def parse_reused_agent_tool_calls(response: str) -> list[AgentToolCall]:
+    try:
+        value = json.loads(clean_json_response(response))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "reused agent response must contain a JSON tool call"
+        ) from exc
+    if isinstance(value, dict) and "tool_calls" in value:
+        if set(value) != {"tool_calls"}:
+            raise ValueError(
+                "reused agent response tool_calls must be the only field"
+            )
+        tool_call_values = value["tool_calls"]
+        if not isinstance(tool_call_values, list) or not tool_call_values:
+            raise ValueError(
+                "reused agent response tool_calls must be a non-empty array"
+            )
+    else:
+        tool_call_values = [value]
+    return normalize_agent_tool_calls(
+        [
+            parse_reused_agent_tool_call_value(tool_call_value)
+            for tool_call_value in tool_call_values
+        ]
+    )
+
+
+def parse_reused_agent_tool_call(response: str) -> AgentToolCall:
+    tool_calls = parse_reused_agent_tool_calls(response)
+    if len(tool_calls) != 1:
+        raise ValueError(
+            "reused agent response must contain exactly one tool call"
+        )
+    return tool_calls[0]
+
+
+def parse_reused_agent_tool_outputs(
+    output: str,
+    tool_call_count: int,
+) -> list[str]:
+    if tool_call_count < 1:
+        raise ValueError("reused agent tool call count must be positive")
+    if tool_call_count == 1:
+        return [output]
+    if not output:
+        return [""] * tool_call_count
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "reused agent tool outputs must contain a JSON object"
+        ) from exc
+    if not isinstance(value, dict) or set(value) != {"tool_outputs"}:
+        raise ValueError(
+            "reused agent tool outputs must contain only tool_outputs"
+        )
+    tool_outputs = value["tool_outputs"]
+    if (
+        not isinstance(tool_outputs, list)
+        or len(tool_outputs) != tool_call_count
+        or any(not isinstance(tool_output, str) for tool_output in tool_outputs)
+    ):
+        raise ValueError(
+            "reused agent tool outputs must match the tool call count"
+        )
+    return tool_outputs
 
 
 def load_reused_session_agent_history(
@@ -4601,10 +5372,11 @@ def load_reused_session_agent_history(
     turns: list[AgentTurn] = []
     active_task = ""
     active_context = ""
+
     for turn_number, turn_dir in sorted(turn_directories):
         response = read_state_artifact(turn_dir / "response")
         try:
-            tool_call = parse_reused_agent_tool_call(response)
+            tool_calls = parse_reused_agent_tool_calls(response)
         except ValueError as exc:
             if turn_number == selected_turn:
                 raise ValueError(
@@ -4613,27 +5385,52 @@ def load_reused_session_agent_history(
                 ) from exc
             continue
         task = read_state_artifact(turn_dir / "request_task")
-        tool_context = "\n\n".join(
-            value for value in (active_context, tool_call.context) if value
-        )
         output_path = turn_dir / "response_agent_tool_output"
         output = (
             read_state_artifact(output_path)
             if output_path.exists() or output_path.is_symlink()
             else ""
         )
-        turns.append(
-            AgentTurn(
-                task=task,
-                context=tool_context,
-                tool_call=tool_call,
-                output=output,
+        try:
+            tool_outputs = parse_reused_agent_tool_outputs(
+                output,
+                len(tool_calls),
             )
-        )
-        active_task = task
-        if tool_call.tool == AGENT_AGENT_TOOL:
-            active_task = tool_call.task
-            active_context = tool_call.context
+        except ValueError as exc:
+            if turn_number == selected_turn:
+                raise ValueError(
+                    "selected session turn has invalid agent tool output: "
+                    f"{turn_dir} ({exc})"
+                ) from exc
+            continue
+        for tool_call, tool_output in zip(tool_calls, tool_outputs):
+            tool_context = "\n\n".join(
+                value for value in (active_context, tool_call.context) if value
+            )
+            readfile_contexts = (
+                parse_agent_readfile_contexts(tool_output)
+                if tool_call.tool == AGENT_READFILE_TOOL
+                else None
+            )
+            if readfile_contexts is not None:
+                remove_duplicate_agent_history_context_files(
+                    turns,
+                    readfile_contexts,
+                )
+            turns.append(
+                AgentTurn(
+                    task=task,
+                    context=tool_context,
+                    tool_call=tool_call,
+                    output=tool_output,
+                    expires_in_turns=tool_call.expires_in_turns,
+                    readfile_contexts=readfile_contexts,
+                )
+            )
+            active_task = task
+            if tool_call.tool == AGENT_AGENT_TOOL:
+                active_task = tool_call.task
+                active_context = tool_call.context
 
     if not turns:
         raise ValueError(
@@ -4650,68 +5447,46 @@ def load_reused_session_agent_history(
 def reused_agent_context_pins(
     file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
-) -> tuple[set[str], set[int]]:
+ ) -> tuple[set[str], set[int]]:
     pinned_paths: set[str] = set()
     pinned_turn_numbers: set[int] = set()
+    replayed_turns: list[AgentTurn] = []
     for turn_number, turn in enumerate(turns, start=1):
+        advance_agent_history_purges(
+            replayed_turns,
+            pinned_turn_numbers,
+        )
         if (
-            turn.tool_call.tool != AGENT_CONTEXT_TOOL
-            or not turn.output
-            or turn.output.startswith("ERROR:")
+            turn.tool_call.tool == AGENT_CONTEXT_TOOL
+            and turn.output
+            and not turn.output.startswith("ERROR:")
         ):
-            continue
-        try:
-            target_type, target = resolve_agent_context_pin(
-                turn.tool_call.context_id,
-                file_contexts,
-                turns[:turn_number - 1],
+            available_turn_numbers = set(
+                agent_history_turn_numbers(
+                    replayed_turns,
+                    pinned_turn_numbers=pinned_turn_numbers,
+                )
             )
-        except ValueError:
-            continue
-        if target_type == "file":
-            pinned_paths.add(str(target))
-        else:
-            pinned_turn_numbers.add(int(target))
+            try:
+                target_type, target = resolve_agent_context_pin(
+                    turn.tool_call.context_id,
+                    file_contexts,
+                    replayed_turns,
+                    available_turn_numbers,
+                )
+            except ValueError:
+                pass
+            else:
+                if target_type == "file":
+                    pinned_paths.add(str(target))
+                else:
+                    pinned_turn_numbers.add(int(target))
+        replayed_turns.append(turn)
+    turns[:] = replayed_turns
     return pinned_paths, pinned_turn_numbers
 
 
-def format_agent_context_pin_targets(
-    file_contexts: list[tuple[str, str]],
-    visible_file_indexes: set[int],
-    turns: list[AgentTurn],
-    visible_turn_numbers: set[int],
-    pinned_paths: set[str],
-    pinned_turn_numbers: set[int],
-) -> str:
-    targets: list[str] = []
-    for index, (path, _) in enumerate(file_contexts):
-        if index not in visible_file_indexes:
-            continue
-        pinned_attribute = " pinned='true'" if path in pinned_paths else ""
-        targets.append(
-            f"<file_context path={json.dumps(path, ensure_ascii=False)}"
-            f"{pinned_attribute}/>"
-        )
-    for turn_number in sorted(visible_turn_numbers):
-        if turn_number > len(turns):
-            continue
-        pinned_attribute = (
-            " pinned='true'"
-            if turn_number in pinned_turn_numbers
-            else ""
-        )
-        targets.append(
-            f"<turn_context id='turn:{turn_number}'{pinned_attribute}/>"
-        )
-    if not targets:
-        return ""
-    return (
-        "<agent_context_pin_targets>\n"
-        "Use context_id with a listed file path or turn id to retain that "
-        "context before it falls out of the window.\n"
-        + "\n".join(targets)
-        + "\n</agent_context_pin_targets>"
-    )
+
 
 
 def build_agent_context_window_prompt(
@@ -4727,47 +5502,59 @@ def build_agent_context_window_prompt(
     pinned_turn_numbers: set[int],
     revision_instruction: str = "",
     controller_tools: list[dict[str, Any]] | None = None,
-) -> str:
+ ) -> str:
+    advance_agent_history_purges(turns, pinned_turn_numbers)
     visible_file_indexes = set(range(len(file_contexts)))
-    visible_turn_numbers = set(range(1, len(turns) + 1))
+    visible_turn_numbers = set(
+        agent_history_turn_numbers(
+            turns,
+            pinned_turn_numbers=pinned_turn_numbers,
+        )
+    )
+    turn_numbers = list(range(1, len(turns) + 1))
     visible_active_context = active_context
-
-    while True:
+    def build_visible_prompt() -> tuple[str, int]:
         ordered_file_indexes = sorted(visible_file_indexes)
-        ordered_turn_numbers = sorted(visible_turn_numbers)
-        visible_context = "\n".join(
+        visible_file_context = "\n".join(
             file_contexts[index][1] for index in ordered_file_indexes
         )
-        visible_turns = [
-            turns[turn_number - 1] for turn_number in ordered_turn_numbers
-        ]
+        readfile_context = format_agent_readfile_contexts(
+            turns,
+            turn_numbers,
+            visible_turn_numbers,
+        )
+        visible_context = "\n".join(
+            value
+            for value in (visible_file_context, readfile_context)
+            if value
+        )
         user_prompt = build_agent_followup_prompt(
             task=task,
             context=visible_context,
-            turns=visible_turns,
-            turn_numbers=ordered_turn_numbers,
+            turns=turns,
+            turn_numbers=turn_numbers,
+            visible_turn_numbers=visible_turn_numbers,
+            pinned_turn_numbers=pinned_turn_numbers,
             active_context=visible_active_context,
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
-            context_pin_targets=format_agent_context_pin_targets(
-                file_contexts,
-                visible_file_indexes,
-                turns,
-                visible_turn_numbers,
-                pinned_paths,
-                pinned_turn_numbers,
+        )
+        return (
+            user_prompt,
+            estimate_request_tokens(
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools=(
+                    AGENT_TOOL_SCHEMAS
+                    if controller_tools is None
+                    else controller_tools
+                ),
             ),
         )
-        request_tokens = estimate_request_tokens(
-            model=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            tools=(
-                AGENT_TOOL_SCHEMAS
-                if controller_tools is None
-                else controller_tools
-            ),
-        )
+
+    while True:
+        user_prompt, request_tokens = build_visible_prompt()
         if request_tokens <= token_limit:
             return user_prompt
 
@@ -4777,7 +5564,19 @@ def build_agent_context_window_prompt(
             if turn_number not in pinned_turn_numbers
         )
         if removable_turn_numbers:
-            visible_turn_numbers.remove(removable_turn_numbers[0])
+            removed_turn_number = removable_turn_numbers[-1]
+            remove_agent_history_turn(
+                turns,
+                removed_turn_number - 1,
+                AGENT_HISTORY_TOKEN_LIMIT_REMOVAL_REASON,
+            )
+            visible_turn_numbers.remove(removed_turn_number)
+            print(
+                "WARNING: AgentTurn "
+                f"{removed_turn_number} tool content was removed from the "
+                "controller context because it exceeded the token limit.",
+                file=sys.stderr,
+            )
             continue
 
         removable_file_indexes = [
@@ -4793,17 +5592,14 @@ def build_agent_context_window_prompt(
                 )
             )
             continue
-
         if visible_active_context:
             visible_active_context = ""
             continue
-
         raise ValueError(
             f"Estimated agent input token count ({request_tokens}) exceeds "
             f"token limit ({token_limit}) after removing all unpinned context; "
             "reduce pinned context or increase the token limit"
         )
-
 
 def format_agent_tool_schema_context(
     controller_tools: list[dict[str, Any]] | None = None,
@@ -4828,23 +5624,32 @@ def build_agent_followup_prompt(
     turns: list[AgentTurn],
     active_context: str,
     revision_instruction: str = "",
-    context_pin_targets: str = "",
     turn_numbers: list[int] | None = None,
+    visible_turn_numbers: set[int] | None = None,
+    pinned_turn_numbers: set[int] | None = None,
     controller_tools: list[dict[str, Any]] | None = None,
-) -> str:
+    include_task: bool = True,
+ ) -> str:
     additional_parts: list[str] = [
         format_agent_tool_schema_context(controller_tools),
     ]
-    if context_pin_targets:
-        additional_parts.append(context_pin_targets)
+
     if active_context:
         additional_parts.append(
             f"<agent_context>\n{active_context}\n</agent_context>"
         )
-    history = format_agent_history(turns, turn_numbers)
+    history = format_agent_history(
+        turns,
+        turn_numbers,
+        pinned_turn_numbers,
+        visible_turn_numbers,
+    )
+
     if history:
         additional_parts.append(
-            f"<agent_history>\n{history}\n</agent_history>"
+            "<agent_history description='Turn sort order is newest to oldest; "
+            "unpinned turns expire after their expires_in_turns.'>\n"
+            f"{history}\n</agent_history>"
         )
     if revision_instruction:
         additional_parts.append(
@@ -4852,11 +5657,13 @@ def build_agent_followup_prompt(
             "one that follows this user instruction.'>\n"
             f"{revision_instruction}\n</agent_revision>"
         )
+
     return build_user_prompt(
         task=task,
         context=context,
         response_format="text",
         additional_prompt="\n\n".join(additional_parts),
+        include_task=include_task,
     )
 
 
@@ -4868,7 +5675,7 @@ def review_agent_tool_calls(
     tool_calls: list[AgentToolCall],
     accept_automatically: bool,
  ) -> tuple[str, str | None]:
-    tool_text = format_agent_tool_calls(tool_calls)
+    tool_text = format_agent_tool_call_report(tool_calls)
     if accept_automatically:
         return "accept", None
     if NONINTERACTIVE:
@@ -4984,7 +5791,8 @@ def request_agent_model(
     task: str,
     json_schema: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
- ) -> AgentModelResult:
+    record_state: bool = True,
+) -> AgentModelResult:
     request_tokens = estimate_request_tokens(
         model=settings.model_settings.model,
         system_prompt=system_prompt,
@@ -5008,14 +5816,16 @@ def request_agent_model(
         if settings.token_cost is not None
         else ""
     )
-    turn_dir = start_state_turn(
-        settings.state_session_dir,
-        settings.state_turn,
-        system_prompt,
-        task,
-        settings.file_paths,
-    )
-    settings.state_turn += 1
+    turn_dir: Path | None = None
+    if record_state:
+        turn_dir = start_state_turn(
+            settings.state_session_dir,
+            settings.state_turn,
+            system_prompt,
+            task,
+            settings.file_paths,
+        )
+        settings.state_turn += 1
     append_agent_log(
         settings,
         "<agent_request>\n"
@@ -5038,47 +5848,53 @@ def request_agent_model(
     model_settings = settings.model_settings
     parsed_tool_calls: tuple[AgentToolCall, ...] = ()
     try:
-        response_obj, usage = call_openai(
-            api_key=model_settings.api_key,
-            openai_base_url=model_settings.openai_base_url,
-            openai_proxy=model_settings.openai_proxy,
-            openai_organization=model_settings.openai_organization,
-            openai_project=model_settings.openai_project,
-            model=model_settings.model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_format=("schema" if json_schema is not None else "text"),
-            json_schema=json_schema,
-            response_verbosity=model_settings.response_verbosity,
-            temperature=model_settings.temperature,
-            top_p=model_settings.top_p,
-            max_output_tokens=model_settings.max_output_tokens,
-            openai_service_tier=model_settings.openai_service_tier,
-            openai_reasoning=model_settings.openai_reasoning,
-            reasoning_mode=model_settings.reasoning_mode,
-            extra_body=model_settings.extra_body,
-            llm_timeout=model_settings.llm_timeout,
-            retry=model_settings.retry,
-            safety_identifier=model_settings.safety_identifier,
-            store=model_settings.api_log,
-            error_logger=lambda event: append_agent_log(settings, event),
-            tools=tools,
-            tool_choice="required" if tools else None,
-            parallel_tool_calls=False if tools else None,
-        )
-        if tools:
-            parsed_tool_calls = tuple(
-                response_agent_tool_calls(
-                    response_obj,
-                    settings.agent_profiles,
+        while True:
+            try:
+                response_obj, usage = call_openai(
+                    api_key=model_settings.api_key,
+                    openai_base_url=model_settings.openai_base_url,
+                    openai_proxy=model_settings.openai_proxy,
+                    openai_organization=model_settings.openai_organization,
+                    openai_project=model_settings.openai_project,
+                    model=model_settings.model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response_format=("schema" if json_schema is not None else "text"),
+                    json_schema=json_schema,
+                    response_verbosity=model_settings.response_verbosity,
+                    temperature=model_settings.temperature,
+                    top_p=model_settings.top_p,
+                    max_output_tokens=model_settings.max_output_tokens,
+                    openai_service_tier=model_settings.openai_service_tier,
+                    openai_reasoning=model_settings.openai_reasoning,
+                    reasoning_mode=model_settings.reasoning_mode,
+                    extra_body=model_settings.extra_body,
+                    llm_timeout=model_settings.llm_timeout,
+                    retry=model_settings.retry,
+                    safety_identifier=model_settings.safety_identifier,
+                    store=model_settings.api_log,
+                    error_logger=lambda event: append_agent_log(settings, event),
+                    tools=tools,
+                    tool_choice="required" if tools else None,
+                    parallel_tool_calls=False if tools else None,
                 )
-            )
-            response = format_agent_tool_calls(list(parsed_tool_calls))
-        else:
-            response = str(getattr(response_obj, "output_text", "") or "")
-        reasoning = response_reasoning_text(response_obj)
+                if tools:
+                    parsed_tool_calls = tuple(
+                        response_agent_tool_calls(
+                            response_obj,
+                            settings.agent_profiles,
+                        )
+                    )
+                    response = format_agent_tool_calls(list(parsed_tool_calls))
+                else:
+                    response = str(getattr(response_obj, "output_text", "") or "")
+                reasoning = response_reasoning_text(response_obj)
+            except AgentControllerResponseError:
+                continue
+            break
     except Exception as exc:
-        complete_state_turn(turn_dir, "", f"ERROR: {exc}")
+        if turn_dir is not None:
+            complete_state_turn(turn_dir, "", f"ERROR: {exc}")
         raise
     elapsed = time.perf_counter() - start_time
     complete_state_turn(turn_dir, reasoning, response)
@@ -5108,6 +5924,112 @@ def request_agent_model(
         tool_calls=parsed_tool_calls,
     )
 
+
+def run_agent_profile_tool(
+    settings: AgentRunSettings,
+    profile_name: str,
+    task: str,
+    context: str,
+ ) -> AgentToolExecution:
+    try:
+        profile = next(
+            profile
+            for profile in settings.agent_profiles
+            if profile.name == profile_name
+        )
+    except StopIteration:
+        return AgentToolExecution(
+            f"ERROR: Agent profile does not exist: {profile_name}"
+        )
+
+    try:
+        profile_type = normalize_agent_profile_type(profile.profile_type)
+        response_schema = agent_profile_response_schema(profile)
+        worker_system_prompt = settings.worker_system_prompt
+        if settings.add_line_numbers:
+            worker_system_prompt += "\n" + settings.linenum_system_prompt
+        if profile_type == "patch":
+            worker_system_prompt += "\n" + settings.patch_system_prompt
+        elif profile_type == "shell":
+            worker_system_prompt += "\n" + settings.shell_system_prompt
+        elif profile_type == "text" and profile.content.strip():
+            worker_system_prompt += "\n" + profile.content.strip()
+        if profile.description.strip():
+            worker_system_prompt += "\n" + profile.description.strip()
+        worker_system_prompt = append_task_to_system_prompt(
+            worker_system_prompt,
+            task,
+            settings.system_prompt_with_task,
+        )
+        worker_context = (
+            f"<agent_context>\n{context}\n</agent_context>"
+            if context
+            else ""
+        )
+        worker_user_prompt = build_user_prompt(
+            task=task,
+            context=settings.context,
+            response_format=("schema" if response_schema is not None else "text"),
+            json_schema=response_schema,
+            include_task=not settings.system_prompt_with_task,
+            additional_prompt=worker_context,
+        )
+        result = request_agent_model(
+            settings,
+            worker_system_prompt,
+            worker_user_prompt,
+            task,
+            json_schema=response_schema,
+            record_state=False,
+        )
+    except Exception as exc:
+        return AgentToolExecution(
+            f"ERROR: Agent profile tool failed: {exc}"
+        )
+    if not result.response.strip():
+        return AgentToolExecution(
+            "ERROR: Agent profile worker returned an empty response."
+        )
+    return AgentToolExecution(result.response)
+
+
+def run_agent_readfile_tool(
+    settings: AgentRunSettings,
+    path_texts: list[str],
+) -> AgentToolExecution:
+    try:
+        file_paths = resolve_context_file_paths(path_texts)
+        sections = build_context_sections(
+            file_paths=file_paths,
+            max_file_size_kb=settings.max_file_size_kb,
+            add_line_numbers=True,
+        )
+    except Exception as exc:
+        return AgentToolExecution(f"ERROR: Readfile tool failed: {exc}")
+    return AgentToolExecution(
+        "\n".join(section for _, section in sections),
+        readfile_contexts=tuple(sections),
+    )
+ 
+
+def run_agent_readfile_tool_call(
+    settings: AgentRunSettings,
+    tool_call: AgentToolCall,
+) -> AgentToolExecution:
+    arguments = tool_call.arguments
+    if arguments is None:
+        return AgentToolExecution(
+            "ERROR: Readfile tool received no paths."
+        )
+    paths = arguments.get("paths")
+    if (
+        not isinstance(paths, list)
+        or any(not isinstance(path, str) for path in paths)
+    ):
+        return AgentToolExecution(
+            "ERROR: Readfile tool received invalid paths."
+        )
+    return run_agent_readfile_tool(settings, paths)
 
 def run_agent_shell_tool(
     settings: AgentRunSettings,
@@ -5286,7 +6208,9 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
     active_context = settings.initial_active_context
     controller_tools = agent_tool_schemas(settings.agent_profiles)
 
-    def request_next(revision_instruction: str = "") -> AgentModelResult:
+    def request_next(
+        revision_instruction: str = "",
+    ) -> AgentModelResult:
         full_system_prompt = append_task_to_system_prompt(
             settings.agent_system_prompt,
             active_task,
@@ -5305,13 +6229,16 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
         )
-        return request_agent_model(
+        result = request_agent_model(
             settings,
             full_system_prompt,
             user_prompt,
             active_task,
             tools=controller_tools,
         )
+        if result.turn_dir is None:
+            raise ValueError("agent controller request did not create a state turn")
+        return result
 
     try:
         model_result = request_next()
@@ -5320,9 +6247,9 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         return 1
     while True:
         tool_calls = list(model_result.tool_calls)
-        if len(tool_calls) != 1:
+        if not tool_calls:
             print(
-                "ERROR: Agent controller returned no executable tool call",
+                f"ERROR: {AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR}",
                 file=sys.stderr,
             )
             return 1
@@ -5345,7 +6272,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 try:
                     edited_text = edit_text(
                         build_patch_revision_editor_text(
-                            format_agent_tool_calls(tool_calls),
+                            format_agent_tool_call_report(tool_calls),
                             active_task,
                         ),
                     )
@@ -5381,7 +6308,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         executed_tool_calls: list[AgentToolCall] = []
         tool_outputs: list[str] = []
         tool_revision_instruction = ""
-
         def save_tool_outputs() -> bool:
             if not executed_tool_calls:
                 return True
@@ -5415,12 +6341,22 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             tool_context = "\n\n".join(
                 value for value in (active_context, tool_call.context) if value
             )
+
+            readfile_contexts: tuple[tuple[str, str], ...] | None = None
+
             if tool_call.tool == AGENT_CONTEXT_TOOL:
+                available_turn_numbers = set(
+                    agent_history_turn_numbers(
+                        turns,
+                        pinned_turn_numbers=pinned_turn_numbers,
+                    )
+                )
                 try:
                     target_type, target = resolve_agent_context_pin(
                         tool_call.context_id,
                         file_contexts,
                         turns,
+                        available_turn_numbers,
                     )
                 except ValueError as exc:
                     tool_output = f"ERROR: Failed to pin context: {exc}"
@@ -5441,6 +6377,13 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                             f"Agent turn was {'already ' if already_pinned else ''}"
                             f"pinned: turn:{turn_number}"
                         )
+            elif tool_call.tool == AGENT_READFILE_TOOL:
+                execution = run_agent_readfile_tool_call(
+                    settings,
+                    tool_call,
+                )
+                tool_output = execution.output
+                readfile_contexts = execution.readfile_contexts
             elif tool_call.tool == AGENT_PATCH_TOOL:
                 manifest = tool_call.arguments
                 if manifest is None:
@@ -5479,30 +6422,38 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                             execution.revision_instruction or ""
                         )
             elif tool_call.tool == AGENT_AGENT_TOOL:
-                active_task = tool_call.task
-                active_context = tool_call.context
-                profile_description = (
-                    f" using agent profile '{tool_call.profile_name}'"
-                    if tool_call.profile_name
-                    else ""
-                )
-                tool_output = (
-                    "Started the requested agent task for the next turn"
-                    f"{profile_description}."
-                )
+                if tool_call.profile_name:
+                    execution = run_agent_profile_tool(
+                        settings,
+                        tool_call.profile_name,
+                        tool_call.task,
+                        tool_context,
+                    )
+                    tool_output = execution.output
+                else:
+                    active_task = tool_call.task
+                    active_context = tool_call.context
+                    tool_output = (
+                        "Started the requested agent task for the next turn."
+                    )
             else:
                 print(
                     f"ERROR: Unknown agent tool: {tool_call.tool}",
                     file=sys.stderr,
                 )
                 return 1
-            turns.append(
-                AgentTurn(
-                    task=turn_task,
-                    context=tool_context,
-                    tool_call=tool_call,
-                    output=tool_output,
+            if readfile_contexts is not None:
+                remove_duplicate_agent_history_context_files(
+                    turns,
+                    readfile_contexts,
                 )
+            append_agent_tool_history(
+                turns,
+                turn_task,
+                tool_context,
+                tool_call,
+                tool_output,
+                readfile_contexts=readfile_contexts,
             )
             executed_tool_calls.append(tool_call)
             tool_outputs.append(tool_output)
@@ -6605,8 +7556,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--shell-networking",
-        action="store_true",
+        nargs="?",
+        const=True,
         default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help="Allow --shell or --agent shell commands to use network address families other than AF_UNIX",
     )
 
@@ -6821,7 +7775,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         type=parse_bool,
         metavar="BOOL",
-        help="Append the task to the system prompt instead of the user prompt",
+        help="Prepend the task to the system prompt instead of the user prompt",
     )
 
     parser.add_argument(
@@ -6834,6 +7788,11 @@ def parse_args() -> argparse.Namespace:
         "--shell-system-prompt",
         metavar="TEXT",
         help="System prompt for shell command mode",
+    )
+    parser.add_argument(
+        "--agent-system-prompt",
+        metavar="TEXT",
+        help="System prompt for agent mode",
     )
     parser.add_argument(
         "--plan-system-prompt",
@@ -7110,8 +8069,23 @@ def parse_args() -> argparse.Namespace:
         const="",
         default=None,
         metavar="NAME",
-        help="Get a configuration value, or all values if NAME is omitted",
+        help=("Get a configuration value, or all values if NAME is omitted "
+              "(^ marks values inherited from the parent profile)"),
     )
+
+    config_print_group.add_argument(
+        "--get-config-detail",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Get a configuration value with system prompts expanded and "
+            "enclosed in square brackets, or all values if NAME is omitted "
+            "(^ marks values inherited from the parent profile)"
+        ),
+    )
+
 
     parser.add_argument(
         "--log",
@@ -7216,6 +8190,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     profile_action_group.add_argument(
+        "--prompt-reset-default",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="TYPE,...",
+        help=(
+            "Reset builtin system prompt files to default (types: system, "
+            "linenum, patch, plan, shell, agent; default: all)"
+        ),
+    )
+
+    profile_action_group.add_argument(
         "--prompt-edit",
         nargs="+",
         metavar=("NAME", "TEXT"),
@@ -7226,7 +8212,7 @@ def parse_args() -> argparse.Namespace:
         "--prompt-assign",
         nargs=2,
         metavar=("NAME", "TYPE"),
-        help="Add prompt NAME to the current profile prompt TYPE (types: system, linenum, patch, plan, shell)",
+        help="Add prompt NAME to the current profile prompt TYPE (types: system, linenum, patch, plan, shell, agent)",
     )
 
     profile_action_group.add_argument(
@@ -7253,7 +8239,7 @@ def parse_args() -> argparse.Namespace:
     profile_action_group.add_argument(
         "--prompt-remove",
         metavar="NAME",
-        help="Remove prompt NAME from all profiles and delete it",
+        help="Remove prompt NAME from all profiles and delete it; remove a mce system prompt to reset it",
     )
 
     parser.add_argument(
@@ -7411,6 +8397,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "patch_file_print": None,
         "patch_system_prompt": None,
         "shell_system_prompt": None,
+        "agent_system_prompt": None,
         "reuse_session": None,
         "reuse_session_skip_verify": False,
         "tree_files": None,
@@ -7537,7 +8524,7 @@ def main() -> int:
             ("--output-file", args.output_file is not None),
             ("--patch-save", args.patch_save is not None),
             ("--shell", args.shell is not None),
-            ("--shell-networking", args.shell_networking),
+            ("--shell-networking", args.shell_networking is not None),
             ("--reuse-session", args.reuse_session is not None),
             ("--tree-files", args.tree_files is not None),
             ("--tree-files-list", args.tree_files_list is not None),
@@ -7561,6 +8548,7 @@ def main() -> int:
             ("--print-profiles", args.print_profiles is not None),
             ("--print-profiles-json", args.print_profiles_json is not None),
             ("--prompt-list", args.prompt_list),
+            ("--prompt-reset-default", args.prompt_reset_default is not None),
             ("--prompt-edit", args.prompt_edit is not None),
             ("--prompt-assign", args.prompt_assign is not None),
             ("--prompt-assign-text", args.prompt_assign_text is not None),
@@ -7586,6 +8574,7 @@ def main() -> int:
             ("--set-config", args.set_config is not None),
             ("--set-config-from", args.set_config_from is not None),
             ("--get-config", args.get_config is not None),
+            ("--get-config-detail", args.get_config_detail is not None),
             ("--print-default-config", args.print_default_config),
             ("--print-current-config", args.print_current_config),
         )
@@ -7730,6 +8719,8 @@ def main() -> int:
 
     if args.prompt_list:
         return handle_prompt_list()
+    if args.prompt_reset_default is not None:
+        return handle_prompt_reset_default(args.prompt_reset_default)
     if args.prompt_print_json is not None:
         return handle_prompt_print(args.prompt_print_json, json_output=True)
     if args.prompt_print is not None:
@@ -7949,9 +8940,15 @@ def main() -> int:
             save_config(config)
         return 0
 
-    if args.get_config is not None:
+    if args.get_config is not None or args.get_config_detail is not None:
         config = load_config()
-        name = args.get_config.strip()
+        detail_requested = args.get_config_detail is not None
+        requested_name = (
+            args.get_config_detail
+            if detail_requested
+            else args.get_config
+        )
+        name = str(requested_name or "").strip()
         if name:
             if name not in config:
                 print(f"ERROR: Configuration value '{name}' does not exist.", file=sys.stderr)
@@ -7960,8 +8957,35 @@ def main() -> int:
         else:
             items = config.items()
 
-        for config_name, value in items:
-            print(format_config_line(config_name, value))
+        inherited_names = inherited_config_names(CONFIG_FILE)
+        if detail_requested:
+            try:
+                output_lines = [
+                    format_config_detail_line(
+                        config_name,
+                        value,
+                        config,
+                        inherited=config_name in inherited_names,
+                    )
+                    for config_name, value in items
+                ]
+            except Exception as exc:
+                print(
+                    f"ERROR: Failed to get config detail: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            output_lines = [
+                format_config_line(
+                    config_name,
+                    value,
+                    inherited=config_name in inherited_names,
+                )
+                for config_name, value in items
+            ]
+        for output_line in output_lines:
+            print(output_line)
         return 0
 
     if args.print_default_config:
@@ -8322,7 +9346,7 @@ def main() -> int:
         prompt_file=args.system_prompt_file,
         config=config,
         config_key='system_prompt',
-        default=DEFAULT_SYSTEM_PROMPT,
+        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['system_prompt'],
         prompt_expansion_enabled=prompt_expansion_enabled,
     )
     linenum_system_prompt = resolve_prompt_setting(
@@ -8330,7 +9354,7 @@ def main() -> int:
         prompt_file=None,
         config=config,
         config_key='linenum_system_prompt',
-        default=DEFAULT_LINENUM_SYSTEM_PROMPT,
+        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['linenum_system_prompt'],
         prompt_expansion_enabled=prompt_expansion_enabled,
         strip_configured_result=True,
     )
@@ -8339,7 +9363,7 @@ def main() -> int:
         prompt_file=None,
         config=config,
         config_key='patch_system_prompt',
-        default=DEFAULT_PATCH_SYSTEM_PROMPT,
+        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['patch_system_prompt'],
         prompt_expansion_enabled=prompt_expansion_enabled,
         strip_configured_result=True,
     )
@@ -8348,7 +9372,16 @@ def main() -> int:
         prompt_file=None,
         config=config,
         config_key='shell_system_prompt',
-        default=DEFAULT_SHELL_SYSTEM_PROMPT,
+        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['shell_system_prompt'],
+        prompt_expansion_enabled=prompt_expansion_enabled,
+        strip_configured_result=True,
+    )
+    agent_system_prompt = resolve_prompt_setting(
+        explicit_value=args.agent_system_prompt,
+        prompt_file=None,
+        config=config,
+        config_key='agent_system_prompt',
+        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['agent_system_prompt'],
         prompt_expansion_enabled=prompt_expansion_enabled,
         strip_configured_result=True,
     )
@@ -8357,7 +9390,7 @@ def main() -> int:
         prompt_file=None,
         config=config,
         config_key='plan_system_prompt',
-        default=DEFAULT_PLAN_SYSTEM_PROMPT,
+        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['plan_system_prompt'],
         prompt_expansion_enabled=prompt_expansion_enabled,
     )
 
@@ -8464,7 +9497,8 @@ def main() -> int:
     if agent_mode:
         response_format = "text"
         json_schema = None
-        system_prompt = system_prompt + "\n" + DEFAULT_AGENT_SYSTEM_PROMPT
+        system_prompt = system_prompt + "\n" + agent_system_prompt
+        add_line_numbers = True
     if response_format not in ("text", "json", "schema"):
         print(
             "ERROR: Invalid response format; choose text, json, or schema.",
@@ -8918,10 +9952,7 @@ def main() -> int:
             )
         full_system_prompt = system_prompt
     else:
-        file_paths = [
-            Path(f) if f == "-" else Path(f).resolve()
-            for f in file_names
-        ]
+        file_paths = resolve_context_file_paths(file_names)
         max_file_size_kb=coerce_int(config.get("max_file_size_kb", 512), 512)
         try:
             stdin_content = (
