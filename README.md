@@ -172,8 +172,8 @@ mince --plan \
 Perform shell tasks:
 
 ```bash
-mince -p task --shell -t 'List the content of the current directory, \
-and then write that listing to a file called "listing.txt" in the next turn. Then get the content of the file "/etc/passwd".'
+mince -p task --shell -t 'List the content of the current directory, ' \
+  'and then write that listing to a file called "listing.txt" in the next turn. Then get the content of the file "/etc/passwd".'
 ```
 
 Run a task in automatic agent mode with `mince-contain`:
@@ -181,6 +181,14 @@ Run a task in automatic agent mode with `mince-contain`:
 ```bash
 mince-contain --contain-write-path . -p task --agent  --agent-auto \
   --task 'Determine the globally installed software development tools and write using "patch" as Markdown format to filename `sdk.md`.'
+```
+
+Create a chess game with python:
+
+```bash
+mince-contain --contain-write-path . -p ollama --agent --agent-auto --shell-networking \
+  --task 'Create or continue the text based chess game using `python.chess` module in the `.venv` environment. ' \
+  'Create or change any support scripts as required.'
 ```
 
 Create a dedicated 'ask' profile from the default profile:
@@ -276,6 +284,7 @@ mince --base-url http://localhost:11434/v1 \
 | Oracle | GPT-OSS-120b | ✅ |
 | xAI | Grok 4.5  | ✅ |
 | AWS | GPT-OSS-120b | ✅ |
+| Ollama | Ornith 1.5 9b | ✅ |
 
 
 ## Notes 🗒️
@@ -284,7 +293,7 @@ mince --base-url http://localhost:11434/v1 \
 - Binary files are not supported
 - JSON Schema mode is best when you need machine‑readable output
 - Token estimation is provided by `tiktoken` which will download an encoder on first use
-- MinCE is tested on and assisted by `GPT 5.6 Terra`
+- MinCE is tested on and assisted by `GPT 5.6 Terra` and locally tested on `Ollama` with `Ornith 1.5 9b`
 
 ## Command line arguments 📋
 

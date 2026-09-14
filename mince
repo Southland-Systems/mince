@@ -106,13 +106,11 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
     "controller response must call exactly one tool and must not answer with "
     "plain text. Available tools are `patch`, `shell`, `readfile`, `agent`, "
     "`session`, and `context`. `patch` directly accepts the "
-    "`line_replace_manifest` arguments used by --patch, and `shell` directly "
-    "accepts the `shell_commands` arguments used by --shell. `readfile` "
-    "accepts one or more file paths and makes their contents available as "
+    "`patch` JSON schema, and `shell` directly accepts the `shell_commands`. "
+    "`readfile` accepts one or more file paths and makes their contents available as "
     "`<file>` sections in the main `<files>` context with line numbers, paths, "
     "and expiry; use it to inspect files that are not in the controller context. "
-    "A `readfile` call is appended for every document in a `patch` "
-    "response. `agent` starts the next controller turn with a non-empty task and "
+    "`agent` starts the next controller turn with a non-empty task and "
     "optional context. Every controller tool call requires an "
     "`expires_in_turns` that controls how "
     "many following controller turns retain its history; use `agent` instead "
@@ -123,7 +121,8 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
     "response formats. `session` uses action=end with a non-empty reason to "
     "complete the session. `context` uses action=pin with a visible file path "
     "or prior agent turn such as `turn:2` to retain context. Use a non-empty "
-    "task for agent; include context only when useful. Do not duplicate work."
+    "task for agent; include context only when useful. Do not duplicate "
+    "tool calls across turns and always look for file content in `<files>`."
 )
 DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
     "mce_system": DEFAULT_SYSTEM_PROMPT,
@@ -222,9 +221,8 @@ PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
                                 "path": {"type": "string", "minLength": 1},
                                 "encoding": {"type": "string", "enum": ["utf-8"]},
                                 "line_ending": {"type": "string", "enum": ["lf", "crlf"]},
-                                "total_lines": {"type": "integer", "minimum": 0},
                             },
-                            "required": ["path", "encoding", "line_ending", "total_lines"],
+                            "required": ["path", "encoding", "line_ending"],
                         },
                         "patches": {
                             "type": "array",
@@ -3239,20 +3237,6 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
 
     lines = original_text.splitlines(keepends=False)
     total_lines = len(lines)
-    declared_total_lines = document.get("total_lines")
-    # edge case: single line patch with no line ending
-    total_lines = declared_total_lines if total_lines == 0 else total_lines
-
-    if (
-        isinstance(declared_total_lines, bool)
-        or not isinstance(declared_total_lines, int)
-    ):
-        raise ValueError("patch document total_lines must be an integer")
-    if declared_total_lines != total_lines:
-        raise ValueError(
-            "patch document total_lines does not match source: "
-            f"expected {total_lines}, got {declared_total_lines}"
-        )
     if original_text:
         detected_line_ending = detect_line_ending(original_text)
         if detected_line_ending == "mixed":
@@ -4040,12 +4024,14 @@ def build_context_sections(
     max_file_size_kb: int,
     add_line_numbers: bool = True,
     stdin_content: str | None = None,
+    include_last_modified_time: bool = False,
 ) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     max_bytes = max_file_size_kb * 1024
 
     for path in file_paths:
         context_path = "/proc/self/stdin" if path == Path("-") else str(path)
+        last_modified_time: int | None = None
         if path == Path("-"):
             if stdin_content is None:
                 sections.append((context_path, f"[MISSING FILE: {context_path}]"))
@@ -4065,16 +4051,19 @@ def build_context_sections(
                 sections.append((context_path, f"[MISSING FILE: {context_path}]"))
                 continue
 
-            if path.stat().st_size > max_bytes:
+            file_stat = path.stat()
+            if file_stat.st_size > max_bytes:
                 sections.append(
                     (
                         context_path,
-                        f"[SKIPPED LARGE FILE: {context_path} ({path.stat().st_size} bytes)]",
+                        f"[SKIPPED LARGE FILE: {context_path} ({file_stat.st_size} bytes)]",
                     )
                 )
                 continue
 
             content = read_file(path)
+            if include_last_modified_time:
+                last_modified_time = int(file_stat.st_mtime)
         content_line_ending = detect_line_ending(content)
         content_total_lines = len(content.splitlines())
         if add_line_numbers:
@@ -4087,12 +4076,17 @@ def build_context_sections(
             if numbered_content.endswith(("\r", "\n"))
             else "\n"
         )
+        last_modified_time_attribute = (
+            f" last_modified_time='{last_modified_time}'"
+            if last_modified_time is not None
+            else ""
+        )
         section = (
-            f"<file path='{context_path}' encoding='utf-8' "
+            f"<file{last_modified_time_attribute} path='{context_path}' encoding='utf-8' "
             f"line_ending='{content_line_ending}' "
             f"total_lines='{content_total_lines}'>\n"
             f"{numbered_content}{context_ending}</file>"
-        ).strip()
+).strip()
         sections.append((context_path, section))
 
     return sections
@@ -4189,8 +4183,9 @@ def build_user_prompt(
     json_patch_block = "",
     include_task: bool = True,
     additional_prompt: str = "",
-    schema_block = ""
- ) -> str:
+    schema_block = "",
+    current_unix_time: int | None = None,
+) -> str:
     additional_prompt_block = (
         f'\n{additional_prompt.strip()}'
         if additional_prompt.strip()
@@ -4214,12 +4209,17 @@ def build_user_prompt(
             f"{task_block}<json_patch>\n"
             f"{last_response}\n</json_patch>"
         )
+    current_time_context = (
+        f"<current_unix_time>{current_unix_time}</current_unix_time>\n"
+        if current_unix_time is not None
+        else ""
+    )
 
     return f"""
 {task if include_task else ""}
 
 <files current_working_directory='{os.getcwd()}'>
-{context}
+{current_time_context}{context}
 </files>
 {schema_block}{json_patch_block}{additional_prompt_block}
 """.strip()
@@ -4733,6 +4733,22 @@ def append_agent_patch_readfile_tool_calls(
     return appended_tool_calls
 
 
+def is_agent_patch_readfile_companion(
+    patch_tool_call: AgentToolCall,
+    readfile_tool_call: AgentToolCall,
+) -> bool:
+    if (
+        patch_tool_call.tool != AGENT_PATCH_TOOL
+        or readfile_tool_call.tool != AGENT_READFILE_TOOL
+    ):
+        return False
+    try:
+        return readfile_tool_call.arguments == {
+            "paths": agent_patch_readfile_paths(patch_tool_call),
+        }
+    except ValueError:
+        return False
+
 def response_agent_tool_calls(
     response_obj: Any,
     agent_profiles: tuple[AgentProfile, ...] = (),
@@ -4970,8 +4986,11 @@ def append_agent_tool_history(
 
 
 def agent_history_tool_content(turn: AgentTurn) -> str:
-    if turn.readfile_contexts is not None:
-        return "File content in <files> tag."
+    if (
+        turn.tool_call.tool == AGENT_READFILE_TOOL
+        and turn.readfile_contexts is not None
+    ):
+        return "`readfile` content loaded into the `<files>` tag."
     return turn.output
 
 
@@ -5027,6 +5046,23 @@ def remove_duplicate_agent_history_context_files(
             readfile_contexts=remaining_context_sections,
         )
 
+
+def attach_agent_patch_readfile_contexts(
+    turns: list[AgentTurn],
+    patch_tool_call: AgentToolCall,
+    readfile_contexts: tuple[tuple[str, str], ...],
+) -> None:
+    if (
+        not turns
+        or turns[-1].tool_call != patch_tool_call
+    ):
+        raise ValueError(
+            "agent patch readfile call has no preceding patch turn"
+        )
+    turns[-1] = replace(
+        turns[-1],
+        readfile_contexts=readfile_contexts,
+    )
 AGENT_HISTORY_PURGE_IN_TURNS = 1
 AGENT_HISTORY_EXPIRATION_REMOVAL_REASON = (
     "This agent turn was removed from the controller context because its "
@@ -5207,11 +5243,11 @@ class ReusedAgentHistory:
 
 
 AGENT_READFILE_CONTEXT_SECTION_PATTERN = re.compile(
-    r"<file path='(?P<path>[^']*)' encoding='utf-8' "
+    r"<file(?: last_modified_time='-?\d+')? path='(?P<path>[^']*)' encoding='utf-8' "
     r"line_ending='[^']*' total_lines='\d+'>\n.*?</file>"
-    r"(?=\n<file path='|\Z)",
+    r"(?=\n<file(?: last_modified_time='-?\d+')? path='|\Z)",
     re.DOTALL,
-)
+ )
 
 
 def parse_agent_readfile_contexts(
@@ -5403,9 +5439,18 @@ def load_reused_session_agent_history(
                     f"{turn_dir} ({exc})"
                 ) from exc
             continue
-        for tool_call, tool_output in zip(tool_calls, tool_outputs):
+        for tool_call_index, (tool_call, tool_output) in enumerate(
+            zip(tool_calls, tool_outputs)
+        ):
             tool_context = "\n\n".join(
                 value for value in (active_context, tool_call.context) if value
+            )
+            patch_readfile_companion = (
+                tool_call_index > 0
+                and is_agent_patch_readfile_companion(
+                    tool_calls[tool_call_index - 1],
+                    tool_call,
+                )
             )
             readfile_contexts = (
                 parse_agent_readfile_contexts(tool_output)
@@ -5417,6 +5462,14 @@ def load_reused_session_agent_history(
                     turns,
                     readfile_contexts,
                 )
+            if patch_readfile_companion:
+                if readfile_contexts is not None:
+                    attach_agent_patch_readfile_contexts(
+                        turns,
+                        tool_calls[tool_call_index - 1],
+                        readfile_contexts,
+                    )
+                continue
             turns.append(
                 AgentTurn(
                     task=task,
@@ -5513,6 +5566,8 @@ def build_agent_context_window_prompt(
     )
     turn_numbers = list(range(1, len(turns) + 1))
     visible_active_context = active_context
+    current_unix_time = int(time.time())
+
     def build_visible_prompt() -> tuple[str, int]:
         ordered_file_indexes = sorted(visible_file_indexes)
         visible_file_context = "\n".join(
@@ -5538,6 +5593,7 @@ def build_agent_context_window_prompt(
             active_context=visible_active_context,
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
+            current_unix_time=current_unix_time,
         )
         return (
             user_prompt,
@@ -5629,7 +5685,10 @@ def build_agent_followup_prompt(
     pinned_turn_numbers: set[int] | None = None,
     controller_tools: list[dict[str, Any]] | None = None,
     include_task: bool = True,
- ) -> str:
+    current_unix_time: int | None = None,
+) -> str:
+    if current_unix_time is None:
+        current_unix_time = int(time.time())
     additional_parts: list[str] = [
         format_agent_tool_schema_context(controller_tools),
     ]
@@ -5664,6 +5723,7 @@ def build_agent_followup_prompt(
         response_format="text",
         additional_prompt="\n\n".join(additional_parts),
         include_task=include_task,
+        current_unix_time=current_unix_time,
     )
 
 
@@ -5973,6 +6033,7 @@ def run_agent_profile_tool(
             json_schema=response_schema,
             include_task=not settings.system_prompt_with_task,
             additional_prompt=worker_context,
+            current_unix_time=int(time.time()),
         )
         result = request_agent_model(
             settings,
@@ -6003,6 +6064,7 @@ def run_agent_readfile_tool(
             file_paths=file_paths,
             max_file_size_kb=settings.max_file_size_kb,
             add_line_numbers=True,
+            include_last_modified_time=True,
         )
     except Exception as exc:
         return AgentToolExecution(f"ERROR: Readfile tool failed: {exc}")
@@ -6327,7 +6389,14 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 return False
             return True
  
-        for tool_call in tool_calls:
+        for tool_call_index, tool_call in enumerate(tool_calls):
+            patch_readfile_companion = (
+                tool_call_index > 0
+                and is_agent_patch_readfile_companion(
+                    tool_calls[tool_call_index - 1],
+                    tool_call,
+                )
+            )
             if tool_call.tool == AGENT_SESSION_TOOL:
                 if not save_tool_outputs():
                     return 1
@@ -6447,14 +6516,22 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     turns,
                     readfile_contexts,
                 )
-            append_agent_tool_history(
-                turns,
-                turn_task,
-                tool_context,
-                tool_call,
-                tool_output,
-                readfile_contexts=readfile_contexts,
-            )
+            if patch_readfile_companion:
+                if readfile_contexts is not None:
+                    attach_agent_patch_readfile_contexts(
+                        turns,
+                        tool_calls[tool_call_index - 1],
+                        readfile_contexts,
+                    )
+            else:
+                append_agent_tool_history(
+                    turns,
+                    turn_task,
+                    tool_context,
+                    tool_call,
+                    tool_output,
+                    readfile_contexts=readfile_contexts,
+                )
             executed_tool_calls.append(tool_call)
             tool_outputs.append(tool_output)
         if not save_tool_outputs():
@@ -9963,6 +10040,7 @@ def main() -> int:
                 max_file_size_kb=max_file_size_kb,
                 add_line_numbers=add_line_numbers,
                 stdin_content=stdin_content,
+                include_last_modified_time=agent_mode,
             )
             context = "\n".join(
                 section for _, section in context_sections
@@ -10064,6 +10142,9 @@ def main() -> int:
             response_format="text",
             json_schema=None,
             include_task=not system_prompt_with_task,
+            current_unix_time=(
+                int(time.time()) if agent_mode else None
+            ),
         )
         plan_full_system_prompt = plan_system_base + "\n" + plan_system_prompt
         if add_line_numbers or patch_mode:
