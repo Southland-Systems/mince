@@ -4256,6 +4256,7 @@ AGENT_EXPIRES_IN_TURNS_DEFAULT = 12
 AGENT_EXPIRES_IN_TURNS_SCHEMA: dict[str, Any] = {
     "type": "integer",
     "minimum": 6,
+    "maximum": 24,
     "default": AGENT_EXPIRES_IN_TURNS_DEFAULT,
 }
 AGENT_PATCH_TOOL = "patch"
@@ -4509,14 +4510,16 @@ AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR = (
 
 
 def parse_agent_expires_in_turns(value: Any) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < 1
-    ):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
-            "agent field expires_in_turns must be a positive integer"
+            "agent field expires_in_turns must be an integer"
         )
+    minimum = AGENT_EXPIRES_IN_TURNS_SCHEMA["minimum"]
+    maximum = AGENT_EXPIRES_IN_TURNS_SCHEMA["maximum"]
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
     return value
 
 
@@ -5661,12 +5664,6 @@ def build_agent_context_window_prompt(
                 AGENT_HISTORY_TOKEN_LIMIT_REMOVAL_REASON,
             )
             visible_turn_numbers.remove(removed_turn_number)
-            print(
-                "WARNING: AgentTurn "
-                f"{removed_turn_number} tool content was removed from the "
-                "controller context because it exceeded the token limit.",
-                file=sys.stderr,
-            )
             continue
 
         removable_file_indexes = [
