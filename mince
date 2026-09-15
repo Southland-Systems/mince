@@ -4191,7 +4191,8 @@ def append_task_to_system_prompt(
 ) -> str:
     if not enabled or not task:
         return system_prompt
-    return f"{task}\n{system_prompt}"
+    return f"{system_prompt}\n{task}"
+
 def build_user_prompt(
     task: str,
     context: str,
@@ -5653,7 +5654,7 @@ def build_agent_context_window_prompt(
             if turn_number not in pinned_turn_numbers
         )
         if removable_turn_numbers:
-            removed_turn_number = removable_turn_numbers[-1]
+            removed_turn_number = removable_turn_numbers[0]
             remove_agent_history_turn(
                 turns,
                 removed_turn_number - 1,
