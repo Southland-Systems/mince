@@ -107,31 +107,53 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
 )
 AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "Use the provided controller tools. Every controller response must call at "
-    "least one tool and must not answer with plain text. Additional tool calls "
-    "are allowed if the tool is `meta_task_list` or `meta_context_control`. "
-    "Available tools are `patch`, `shell`, `readfile`, `meta_task_list`, `agent`, "
-    "`session`, and `meta_context_control`. `patch` directly accepts the "
-    "`patch` JSON schema, and `shell` directly accepts the `shell_commands` "
-    "schema. `readfile` accepts one or more file paths and makes their contents "
-    "available as `<file>` sections in the main `<files>` context with line "
-    "numbers, paths, turn tracking, and expiry; use it to inspect desired files "
-    "that are not already in `<files>`. "
-    "`meta_task_list` replaces the entire persistent ordered task list. "
-    "Each task has an ordered list of subtasks. "
-    "`agent` starts the next controller turn with a non-empty task and optional "
-    "context. Every controller tool call requires an `expires_in_turns` that "
-    "controls how many following controller turns retain its history; use "
+    "least one tool and must not answer with plain text. Put the executable tool "
+    "call first. Additional calls may only use `meta_context_control`, and a "
+    "`session` call must be the only call in its response. The "
+    "`<agent_tool_json_schemas>` context contains the JSON schemas for the "
+    "available controller tool calls. Available tools are `patch`, `shell`, "
+    "`readfile`, `meta_task_list`, `agent`, `session`, and "
+    "`meta_context_control`. `patch` directly accepts the `patch` JSON schema, "
+    "applies its file modification manifest, and automatically appends a "
+    "`readfile` companion call for every document in the manifest. `shell` "
+    "directly accepts the `shell_commands` schema and generates commands for "
+    "review and execution. Every shell command requires a concise, non-empty "
+    "reason. Use a lines array only when the command needs standard input; its "
+    "entries are sent in order. `readfile` accepts one or more file paths and "
+    "makes their contents available as `<file>` sections in the main `<files>` "
+    "context with line numbers, paths, turn tracking, and expiry; use it to "
+    "inspect desired files that are not already in `<files>`. `meta_task_list` "
+    "applies an ordered batch of add, change, and remove operations to the "
+    "persistent task list. Add top-level tasks using tasks, or append subtasks "
+    "using task_number and subtasks. Change operations require a task or "
+    "task.subtask number and a status, and only change that status. Tasks and "
+    "subtasks have status values todo, done, or skip, displayed as [todo], "
+    "[done], or [skip], and parent and subtask statuses are independent. Remove "
+    "operations require a non-empty numbers array of task integers or "
+    "task.subtask strings, such as 2 or \"2.1\". Removing a task also removes "
+    "its subtasks. Keep incomplete tasks and update statuses whenever progress "
+    "changes. Numbers refer to the task list before each operation, and removals "
+    "renumber remaining entries. At most 25 top-level tasks are retained. After "
+    "the entire batch, the oldest done or skip tasks are removed when more "
+    "space is needed; if insufficient space remains, the entire batch is "
+    "rejected without changing the list. The task list never expires, and any "
+    "expires_in_turns supplied to `meta_task_list` is ignored. `agent` starts "
+    "the next controller turn with a non-empty task and optional context. Use "
     "`agent` instead of a no-op continuation. Selected agent profiles are "
-    "exposed as `agent_<profile_name>`; use the applicable agent profile rather "
-    "than generic `agent` to delegate work to a worker. Profile descriptions "
-    "explain their intended use and profile types identify their workers' "
-    "response formats. `session` uses action=end with a non-empty reason to "
-    "complete the session. `meta_context_control` uses action=pin to retain a "
-    "visible file path or prior agent turn such as `turn:2`, or "
-    "action=set_expires_in_turns to update a specified context's "
-    "`expires_in_turns` value. Use a non-empty task for `agent`; include "
-    "context only when useful. Always examine `<files>` for file content."
-)
+    "exposed as `agent_<profile_name>`; use the applicable profile rather than "
+    "generic `agent` to delegate work to a worker. Selected profile response "
+    "formats and instructions are appended to this system prompt. `session` "
+    "uses action=end with a non-empty reason to complete the session. Every "
+    "controller tool other than `meta_task_list` requires expires_in_turns, "
+    "which controls how many following controller turns retain its history. "
+    "`meta_context_control` uses action=pin to retain a visible file path or "
+    "prior agent turn such as `turn:2`, or action=set_expires_in_turns to update "
+    "a specified context's expiry to the call's expires_in_turns value. The "
+    "`<agent_history>` context is ordered newest to oldest, and unpinned turns "
+    "expire after their expires_in_turns. When `<agent_revision>` is present, "
+    "replace the previous tool call with one that follows its user instruction. "
+    "Always examine `<files>` for file content."
+ )
 DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
     "mce_system": DEFAULT_SYSTEM_PROMPT,
     "mce_linenum": DEFAULT_LINENUM_SYSTEM_PROMPT,
@@ -276,7 +298,7 @@ SHELL_COMMAND_ITEM_SCHEMAS: list[dict[str, Any]] = [
         "additionalProperties": False,
         "properties": {
             "command": {"type": "string", "minLength": 1},
-            "reason": {"type": "string", "minLength": 1, "description": "Why this command is needed"},
+            "reason": {"type": "string", "minLength": 1},
         },
         "required": ["command", "reason"],
     },
@@ -290,7 +312,7 @@ SHELL_COMMAND_ITEM_SCHEMAS: list[dict[str, Any]] = [
                 "minItems": 1,
                 "items": {"type": "string"},
             },
-            "reason": {"type": "string", "minLength": 1, "description": "Why this command is needed"},
+            "reason": {"type": "string", "minLength": 1},
         },
         "required": ["command", "lines", "reason"],
     },
@@ -335,6 +357,104 @@ SHELL_FOLLOWUP_SCHEMA: dict[str, Any] = {
 }
 
 
+META_TASK_LIST_MAX_TASKS = 25
+META_TASK_STATUS_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["todo", "done", "skip"],
+}
+META_SUBTASK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task": {"type": "string", "minLength": 1},
+        "status": META_TASK_STATUS_SCHEMA,
+    },
+    "required": ["task", "status"],
+}
+META_TASK_SCHEMA: dict[str, Any] = {
+    **META_SUBTASK_SCHEMA,
+    "properties": {
+        **META_SUBTASK_SCHEMA["properties"],
+        "subtasks": {
+            "type": "array",
+            "minItems": 0,
+            "items": META_SUBTASK_SCHEMA,
+        },
+    },
+    "required": ["task", "status", "subtasks"],
+}
+META_TASK_NUMBER_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        {"type": "integer", "minimum": 1},
+        {
+            "type": "string",
+            "pattern": r"^[1-9][0-9]*(?:\.[1-9][0-9]*)?$",
+        },
+    ],
+}
+META_TASK_LIST_OPERATION_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "action": {"type": "string", "enum": ["add"]},
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "items": META_TASK_SCHEMA,
+            },
+        },
+        "required": ["action", "tasks"],
+    },
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "action": {"type": "string", "enum": ["add"]},
+            "task_number": {"type": "integer", "minimum": 1},
+            "subtasks": {
+                "type": "array",
+                "minItems": 1,
+                "items": META_SUBTASK_SCHEMA,
+            },
+        },
+        "required": ["action", "task_number", "subtasks"],
+    },
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "action": {"type": "string", "enum": ["change"]},
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "number": META_TASK_NUMBER_SCHEMA,
+                        "status": META_TASK_STATUS_SCHEMA,
+                    },
+                    "required": ["number", "status"],
+                },
+            },
+        },
+        "required": ["action", "tasks"],
+    },
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "action": {"type": "string", "enum": ["remove"]},
+            "numbers": {
+                "type": "array",
+                "minItems": 1,
+                "items": META_TASK_NUMBER_SCHEMA,
+            },
+        },
+        "required": ["action", "numbers"],
+    },
+]
 META_TASK_LIST_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "name": "meta_task_list",
@@ -343,28 +463,13 @@ META_TASK_LIST_SCHEMA: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "tasks": {
+            "operations": {
                 "type": "array",
-                "minItems": 0,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "task": {"type": "string", "minLength": 1},
-                        "subtasks": {
-                            "type": "array",
-                            "minItems": 0,
-                            "items": {
-                                "type": "string",
-                                "minLength": 1,
-                            },
-                        },
-                    },
-                    "required": ["task", "subtasks"],
-                },
+                "minItems": 1,
+                "items": {"anyOf": META_TASK_LIST_OPERATION_SCHEMAS},
             },
         },
-        "required": ["tasks"],
+        "required": ["operations"],
     },
 }
 
@@ -1604,6 +1709,26 @@ class AgentProfile:
     description: str = ""
 
 
+def agent_tool_call_system_prompt(
+    profiles: tuple[AgentProfile, ...] = (),
+) -> str:
+    if not profiles:
+        return AGENT_TOOL_CALL_SYSTEM_PROMPT
+    profile_lines: list[str] = []
+    for profile in profiles:
+        profile_line = (
+            f"- `{agent_profile_tool_name(profile.name)}` uses response format "
+            f"`{profile.profile_type}`."
+        )
+        if profile.description.strip():
+            profile_line += f" {profile.description.strip()}"
+        profile_lines.append(profile_line)
+    return (
+        AGENT_TOOL_CALL_SYSTEM_PROMPT.rstrip()
+        + "\nSelected agent profiles and their instructions:\n"
+        + "\n".join(profile_lines)
+    )
+
 def validate_agent_profile_name(name: str) -> str:
     name = name.strip()
     if (
@@ -1795,17 +1920,10 @@ def agent_profile_tool_name(name: str) -> str:
 
 
 def agent_agent_tool_schema(profile: AgentProfile) -> dict[str, Any]:
-    profile_type = normalize_agent_profile_type(profile.profile_type)
-    description = (
-        f"Delegate work to a worker using the '{profile.name}' agent "
-        f"profile (response format: {profile_type})."
-    )
-    if profile.description.strip():
-        description += f" {profile.description.strip()}"
     return {
         "type": "function",
         "name": agent_profile_tool_name(profile.name),
-        "description": description,
+        "description": f"Agent profile '{profile.name}'.",
         "parameters": AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
         "strict": True,
     }
@@ -1832,8 +1950,18 @@ def handle_agent_tool_list(
 ) -> int:
     try:
         profiles = tuple(load_agent_profiles(values))
+        profiles_by_tool = {
+            agent_profile_tool_name(profile.name): profile
+            for profile in profiles
+        }
         for schema in agent_tool_schemas(profiles):
-            print(f"{schema['name']}     {schema['description']}")
+            description = schema["description"]
+            profile = profiles_by_tool.get(schema["name"])
+            if profile is not None:
+                description += f" Response format: {profile.profile_type}."
+                if profile.description.strip():
+                    description += f" {profile.description.strip()}"
+            print(f"{schema['name']}     {description}")
     except Exception as exc:
         print(f"ERROR: Failed to list agent tools: {exc}", file=sys.stderr)
         return 1
@@ -4421,9 +4549,7 @@ AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
     AGENT_READFILE_TOOL: agent_tool_argument_schema(
         AGENT_READFILE_CALL_ARGUMENT_SCHEMA
     ),
-    AGENT_META_TASK_LIST_TOOL: agent_tool_argument_schema(
-        META_TASK_LIST_SCHEMA["schema"]
-    ),
+    AGENT_META_TASK_LIST_TOOL: META_TASK_LIST_SCHEMA["schema"],
     AGENT_AGENT_TOOL: AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
     AGENT_SESSION_TOOL: agent_tool_argument_schema(
         AGENT_SESSION_CALL_ARGUMENT_SCHEMA
@@ -4433,37 +4559,13 @@ AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
 }
 AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
-    AGENT_PATCH_TOOL: (
-        "Apply a file modification manifest. Arguments must match the "
-        "`patch` schema. A `readfile` call will automatically append "
-        "for every document in the manifest."
-    ),
-    AGENT_SHELL_TOOL: (
-        "Generate commands for review and execution. Arguments must match "
-        "the `shell` schema."
-    ),
-    AGENT_READFILE_TOOL: (
-        "Read one or more files and make their contents available as `<file>` "
-        "sections in the main `<files>` context with line numbers, paths, turn "
-        "tracking, and expiry. Arguments must match the `readfile` schema."
-    ),
-    AGENT_META_TASK_LIST_TOOL: (
-        "Replace the agent-managed task list persisted in the state session. "
-        "Each entry contains a task and an ordered array of subtasks."
-    ),
-    AGENT_AGENT_TOOL: (
-        "Start the next controller turn with a new non-empty task and optional "
-        "context. `expires_in_turns` controls how many controller turns "
-        "retain this tool call in history."
-    ),
-    AGENT_SESSION_TOOL: (
-        "End the agent session with a non-empty reason that completes the task."
-    ),
-    AGENT_META_CONTEXT_CONTROL_TOOL: (
-        "Pin a currently visible file or prior agent turn so it remains in the "
-        "controller context window, or set a visible file or prior agent turn's "
-        "`expires_in_turns` to the tool call's `expires_in_turns` value."
-    ),
+    AGENT_PATCH_TOOL: "File patch application.",
+    AGENT_SHELL_TOOL: "Reviewed shell command execution.",
+    AGENT_READFILE_TOOL: "File context loading.",
+    AGENT_META_TASK_LIST_TOOL: "Persistent task list management.",
+    AGENT_AGENT_TOOL: "Agent controller continuation.",
+    AGENT_SESSION_TOOL: "Agent session completion.",
+    AGENT_META_CONTEXT_CONTROL_TOOL: "Agent context retention management.",
 }
 AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -4474,7 +4576,7 @@ AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "strict": True,
     }
     for tool, argument_schema in AGENT_TOOL_ARGUMENT_SCHEMAS.items()
- ]
+]
  
 AGENT_TOOL_ARGUMENT_FIELDS: dict[str, frozenset[str]] = {
     tool: frozenset(argument_schema["properties"])
@@ -4501,11 +4603,12 @@ class AgentToolCall:
             else self.tool
         )
         if self.arguments is not None:
-            return {
-                "tool": tool_name,
-                **self.arguments,
-                "expires_in_turns": self.expires_in_turns,
-            }
+            value = {"tool": tool_name, **self.arguments}
+            if self.tool == AGENT_META_TASK_LIST_TOOL:
+                value.pop("expires_in_turns", None)
+            else:
+                value["expires_in_turns"] = self.expires_in_turns
+            return value
         value: dict[str, Any] = {"tool": tool_name}
         for name in AGENT_TOOL_ARGUMENT_SCHEMAS[self.tool]["properties"]:
             value[name] = getattr(self, name)
@@ -4620,43 +4723,226 @@ def parse_agent_expires_in_turns(value: Any) -> int:
     return value
 
 
+def normalize_agent_meta_task_item(
+    value: Any,
+    label: str,
+    include_subtasks: bool = False,
+) -> dict[str, Any]:
+    expected_fields = {"task", "status"}
+    if include_subtasks:
+        expected_fields.add("subtasks")
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise ValueError(
+            f"{label} must contain only "
+            + ", ".join(sorted(expected_fields))
+            + " fields"
+        )
+    task = value["task"]
+    if not isinstance(task, str):
+        raise ValueError(f"{label} task must be a non-empty string")
+    task = task.strip()
+    status = value["status"]
+    if not task:
+        raise ValueError(f"{label} task must be a non-empty string")
+    if status not in META_TASK_STATUS_SCHEMA["enum"]:
+        raise ValueError(f"{label} status must be todo, done, or skip")
+    item: dict[str, Any] = {"task": task, "status": status}
+    if include_subtasks:
+        subtasks = value["subtasks"]
+        if not isinstance(subtasks, list):
+            raise ValueError(f"{label} subtasks must be an array")
+        item["subtasks"] = [
+            normalize_agent_meta_task_item(
+                subtask,
+                f"{label} subtask {index}",
+            )
+            for index, subtask in enumerate(subtasks, start=1)
+        ]
+    return item
+
+
 def normalize_agent_meta_task_list(
     value: Any,
  ) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("meta_task_list tasks must be an array")
-    task_list: list[dict[str, Any]] = []
-    for task_index, task_value in enumerate(value, start=1):
-        if not isinstance(task_value, dict) or set(task_value) != {
-            "task", "subtasks"
-        }:
+    return [
+        normalize_agent_meta_task_item(
+            task,
+            f"meta_task_list task {index}",
+            include_subtasks=True,
+        )
+        for index, task in enumerate(value, start=1)
+    ]
+
+
+def normalize_agent_meta_task_number(value: Any) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]*(?:\.[1-9][0-9]*)?", value) is None
+    ):
+        raise ValueError(
+            "meta_task_list number must be a positive task number "
+            "or a task.subtask string"
+        )
+    return value
+
+
+def normalize_agent_meta_task_operations(
+    value: Any,
+ ) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("meta_task_list operations must be a non-empty array")
+    operations: list[dict[str, Any]] = []
+    for index, operation in enumerate(value, start=1):
+        label = f"meta_task_list operation {index}"
+        if not isinstance(operation, dict):
+            raise ValueError(f"{label} must be an object")
+        action = operation.get("action")
+        if action == "add" and "subtasks" in operation:
+            entry_field = "subtasks"
+            expected_fields = {"action", "task_number", "subtasks"}
+        elif action in ("add", "change"):
+            entry_field = "tasks"
+            expected_fields = {"action", "tasks"}
+        elif action == "remove":
+            entry_field = "numbers"
+            expected_fields = {"action", "numbers"}
+        else:
+            raise ValueError(f"{label} action must be add, change, or remove")
+        if set(operation) != expected_fields:
             raise ValueError(
-                "meta_task_list task "
-                f"{task_index} must contain task and subtasks fields"
+                f"{label} must contain only "
+                + ", ".join(sorted(expected_fields))
+                + " fields"
             )
-        task = task_value["task"]
-        if not isinstance(task, str) or not task.strip():
-            raise ValueError(
-                f"meta_task_list task {task_index} must be a non-empty string"
-            )
-        subtasks_value = task_value["subtasks"]
-        if not isinstance(subtasks_value, list):
-            raise ValueError(
-                f"meta_task_list task {task_index} subtasks must be an array"
-            )
-        subtasks: list[str] = []
-        for subtask_index, subtask in enumerate(
-            subtasks_value, start=1
-        ):
-            if not isinstance(subtask, str) or not subtask.strip():
-                raise ValueError(
-                    "meta_task_list task "
-                    f"{task_index} subtask {subtask_index} must be a "
-                    "non-empty string"
-                )
-            subtasks.append(subtask.strip())
-        task_list.append({"task": task.strip(), "subtasks": subtasks})
-    return task_list
+        entries = operation[entry_field]
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(f"{label} {entry_field} must be a non-empty array")
+        normalized: dict[str, Any] = {"action": action}
+        if action == "add":
+            if entry_field == "tasks":
+                entries = normalize_agent_meta_task_list(entries)
+            else:
+                task_number = operation["task_number"]
+                if (
+                    isinstance(task_number, bool)
+                    or not isinstance(task_number, int)
+                    or task_number < 1
+                ):
+                    raise ValueError(
+                        f"{label} task_number must be a positive integer"
+                    )
+                normalized["task_number"] = task_number
+                entries = [
+                    normalize_agent_meta_task_item(
+                        subtask, f"{label} subtask {subtask_index}"
+                    )
+                    for subtask_index, subtask in enumerate(entries, start=1)
+                ]
+        elif action == "change":
+            changes: list[dict[str, Any]] = []
+            for change in entries:
+                expected_change_fields = {"number", "status"}
+                if (
+                    not isinstance(change, dict)
+                    or set(change) != expected_change_fields
+                ):
+                    raise ValueError(
+                        f"{label} changes must contain number and status"
+                    )
+                number = normalize_agent_meta_task_number(change["number"])
+                status = change["status"]
+                if status not in META_TASK_STATUS_SCHEMA["enum"]:
+                    raise ValueError(
+                        f"{label} status must be todo, done, or skip"
+                    )
+                changes.append({"number": number, "status": status})
+            entries = changes
+        else:
+            entries = [
+                normalize_agent_meta_task_number(number)
+                for number in entries
+            ]
+        normalized[entry_field] = entries
+        operations.append(normalized)
+    return operations
+
+
+def limit_agent_meta_task_list(
+    task_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    excess = len(task_list) - META_TASK_LIST_MAX_TASKS
+    if excess <= 0:
+        return task_list
+    removable_indexes = [
+        index
+        for index, task in enumerate(task_list)
+        if task["status"] in ("done", "skip")
+    ][:excess]
+    if len(removable_indexes) < excess:
+        raise ValueError(
+            f"meta_task_list supports at most {META_TASK_LIST_MAX_TASKS} tasks; "
+            "remove tasks or mark them done or skip to make room"
+        )
+    removed_indexes = set(removable_indexes)
+    return [
+        task for index, task in enumerate(task_list)
+        if index not in removed_indexes
+    ]
+
+
+def apply_agent_meta_task_operations(
+    task_list: list[dict[str, Any]],
+    operations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    updated_tasks = normalize_agent_meta_task_list(task_list)
+    operations = normalize_agent_meta_task_operations(operations)
+
+    def resolve(number: str) -> tuple[list[dict[str, Any]], int]:
+        task_number, separator, subtask_number = number.partition(".")
+        task_index = int(task_number) - 1
+        if task_index >= len(updated_tasks):
+            raise ValueError(f"meta_task_list task does not exist: {number}")
+        if not separator:
+            return updated_tasks, task_index
+        subtasks = updated_tasks[task_index]["subtasks"]
+        subtask_index = int(subtask_number) - 1
+        if subtask_index >= len(subtasks):
+            raise ValueError(f"meta_task_list subtask does not exist: {number}")
+        return subtasks, subtask_index
+
+    for operation in operations:
+        action = operation["action"]
+        if action == "add":
+            if "tasks" in operation:
+                updated_tasks.extend(operation["tasks"])
+            else:
+                entries, index = resolve(str(operation["task_number"]))
+                entries[index]["subtasks"].extend(operation["subtasks"])
+        elif action == "change":
+            for change in operation["tasks"]:
+                entries, index = resolve(change["number"])
+                if change.get("task") is not None:
+                    entries[index]["task"] = change["task"]
+                if change.get("status") is not None:
+                    entries[index]["status"] = change["status"]
+        else:
+            # Validate before deleting, then work backwards to keep numbers valid.
+            for number in operation["numbers"]:
+                resolve(number)
+            numbers = {
+                tuple(int(part) for part in number.split("."))
+                for number in operation["numbers"]
+            }
+            for number in sorted(numbers, reverse=True):
+                if len(number) == 1:
+                    del updated_tasks[number[0] - 1]
+                else:
+                    del updated_tasks[number[0] - 1]["subtasks"][number[1] - 1]
+    return limit_agent_meta_task_list(updated_tasks)
 
 
 def parse_agent_tool_arguments(
@@ -4741,24 +5027,20 @@ def parse_agent_tool_arguments(
         )
 
     if tool == AGENT_META_TASK_LIST_TOOL:
-        if set(value) != {"tasks", "expires_in_turns"}:
+        if set(value) - {"expires_in_turns"} != {"operations"}:
             raise ValueError(
-                "agent meta_task_list arguments must contain only tasks and "
-                "expires_in_turns"
+                "agent meta_task_list arguments must contain only operations; "
+                "expires_in_turns is ignored"
             )
-        expires_in_turns = parse_agent_expires_in_turns(
-            value["expires_in_turns"]
-        )
         try:
-            tasks = normalize_agent_meta_task_list(value["tasks"])
+            operations = normalize_agent_meta_task_operations(value["operations"])
         except ValueError as exc:
             raise ValueError(
                 f"agent meta_task_list arguments are invalid: {exc}"
             ) from exc
         return AgentToolCall(
             tool=tool,
-            expires_in_turns=expires_in_turns,
-            arguments={"tasks": tasks},
+            arguments={"operations": operations},
         )
  
     if tool == AGENT_READFILE_TOOL:
@@ -5019,23 +5301,132 @@ def format_agent_tool_call(tool_call: AgentToolCall) -> str:
     return json.dumps(tool_call.as_dict(), indent=2, ensure_ascii=False)
 
 
+def format_agent_meta_subtask_list(
+    task_number: int,
+    subtasks: list[dict[str, Any]],
+    subtask_number_start: int = 1,
+    indent: str = "",
+) -> list[str]:
+    return [
+        f"{indent}{task_number}.{subtask_index}. "
+        f"[{subtask['status']}] {subtask['task']}"
+        for subtask_index, subtask in enumerate(
+            subtasks,
+            start=subtask_number_start,
+        )
+    ]
+
+
 def format_agent_meta_task_list(
     task_list: list[dict[str, Any]] | None,
-) -> str:
+    task_number_start: int = 1,
+ ) -> str:
     if not task_list:
         return "No tasks."
 
     lines: list[str] = []
-    for task_index, task in enumerate(task_list, start=1):
-        lines.append(f"{task_index}. {task['task']}")
+    for task_index, task in enumerate(
+        task_list,
+        start=task_number_start,
+    ):
+        lines.append(
+            f"{task_index}. [{task['status']}] {task['task']}"
+        )
         lines.extend(
-            f"   {task_index}.{subtask_index}. {subtask}"
-            for subtask_index, subtask in enumerate(
+            format_agent_meta_subtask_list(
+                task_index,
                 task["subtasks"],
-                start=1,
+                indent="   ",
             )
         )
     return "\n".join(lines)
+
+
+def format_agent_meta_task_operations(
+    operations: list[dict[str, Any]],
+    task_list: list[dict[str, Any]] | None = None,
+) -> str:
+    try:
+        original_task_list = normalize_agent_meta_task_list(
+            task_list if task_list is not None else []
+        )
+    except ValueError:
+        original_task_list = None
+
+    blocks: list[str] = []
+    for operation in operations:
+        action = operation["action"]
+        if action == "add":
+            if "tasks" in operation:
+                if original_task_list is None:
+                    task_lines: list[str] = []
+                    for task in operation["tasks"]:
+                        task_lines.append(
+                            f"  - [{task['status']}] {task['task']}"
+                        )
+                        task_lines.extend(
+                            f"    - [{subtask['status']}] {subtask['task']}"
+                            for subtask in task["subtasks"]
+                        )
+                else:
+                    task_lines = [
+                        f"  {line}"
+                        for line in format_agent_meta_task_list(
+                            operation["tasks"],
+                            len(original_task_list) + 1,
+                        ).splitlines()
+                    ]
+                blocks.append(
+                    "Add tasks:\n" + "\n".join(task_lines)
+                )
+            else:
+                task_number = operation["task_number"]
+                if (
+                    original_task_list is None
+                    or task_number > len(original_task_list)
+                ):
+                    subtask_lines = [
+                        f"  - [{subtask['status']}] {subtask['task']}"
+                        for subtask in operation["subtasks"]
+                    ]
+                else:
+                    subtask_lines = format_agent_meta_subtask_list(
+                        task_number,
+                        operation["subtasks"],
+                        len(
+                            original_task_list[task_number - 1]["subtasks"]
+                        ) + 1,
+                        indent="  ",
+                    )
+                blocks.append(
+                    "Add subtasks to task "
+                    f"{task_number}:\n"
+                    + "\n".join(subtask_lines)
+                )
+        elif action == "change":
+            blocks.append(
+                "Change task statuses:\n"
+                + "\n".join(
+                    f"  - {change['number']}: [{change['status']}]"
+                    for change in operation["tasks"]
+                )
+            )
+        else:
+            blocks.append(
+                "Remove tasks:\n"
+                + "\n".join(
+                    f"  - {number}" for number in operation["numbers"]
+                )
+            )
+        if original_task_list is not None:
+            try:
+                original_task_list = apply_agent_meta_task_operations(
+                    original_task_list,
+                    [operation],
+                )
+            except ValueError:
+                original_task_list = None
+    return "\n\n".join(blocks)
 
 
 def indent_agent_patch_text(
@@ -5072,7 +5463,10 @@ def format_agent_patch_manifest(manifest: dict[str, Any]) -> str:
     )
 
 
-def format_agent_tool_call_for_output(tool_call: AgentToolCall) -> str:
+def format_agent_tool_call_for_output(
+    tool_call: AgentToolCall,
+    meta_task_list: list[dict[str, Any]] | None = None,
+) -> str:
     call = tool_call.as_dict()
     tool_name = str(call.pop("tool"))
     if (
@@ -5093,10 +5487,13 @@ def format_agent_tool_call_for_output(tool_call: AgentToolCall) -> str:
         tool_call.tool == AGENT_META_TASK_LIST_TOOL
         and tool_call.arguments is not None
     ):
-        return (
-            f"Tool: {tool_name}\nTask list:\n"
-            f"{format_agent_meta_task_list(tool_call.arguments['tasks'])}"
-        )
+        operations = tool_call.arguments.get("operations")
+        if isinstance(operations, list):
+            return (
+                f"Tool: {tool_name}\n"
+                f"Task list updates:\n"
+                f"{format_agent_meta_task_operations(operations, meta_task_list)}"
+            )
     if tool_call.tool == AGENT_READFILE_TOOL:
         paths = call["paths"]
         path_text = "\n".join(
@@ -5130,16 +5527,17 @@ def format_agent_tool_call_for_output(tool_call: AgentToolCall) -> str:
 def format_agent_tool_call_report(
     tool_calls: list[AgentToolCall],
     current_turn: int | None = None,
+    meta_task_list: list[dict[str, Any]] | None = None,
 ) -> str:
     normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
     if current_turn is not None:
         if len(normalized_tool_calls) == 1:
             return (
                 f"-- [{current_turn}] {'-' * 72}\n"
-                f"{format_agent_tool_call_for_output(normalized_tool_calls[0])}"
+                f"{format_agent_tool_call_for_output(normalized_tool_calls[0], meta_task_list)}"
             )
         tool_text = "\n\n".join(
-            f"[{index}] {format_agent_tool_call_for_output(tool_call)}"
+            f"[{index}] {format_agent_tool_call_for_output(tool_call, meta_task_list)}"
             for index, tool_call in enumerate(
                 normalized_tool_calls,
                 start=1,
@@ -5147,7 +5545,7 @@ def format_agent_tool_call_report(
         )
         return f"-- [{current_turn}] {'-' * 72}\n{tool_text}"
     blocks = [
-        f"[{index}] {format_agent_tool_call_for_output(tool_call)}"
+        f"[{index}] {format_agent_tool_call_for_output(tool_call, meta_task_list)}"
         for index, tool_call in enumerate(normalized_tool_calls, start=1)
     ]
     return "Agent tool calls:\n" + "\n\n".join(blocks)
@@ -5208,7 +5606,11 @@ def append_agent_tool_history(
 
 
 def agent_history_tool_content(turn: AgentTurn) -> str:
-    if (turn.tool_call.tool == AGENT_META_TASK_LIST_TOOL):
+    if turn.tool_call.tool == AGENT_META_TASK_LIST_TOOL:
+        if turn.output.startswith("ERROR:"):
+            return turn.output
+        if not turn.output:
+            return "Task list update was not executed."
         return "Task list loaded into `<meta_task_list>` tag."
     if turn.tool_call.tool.startswith("meta_"):
         return ""
@@ -5947,12 +6349,23 @@ def load_reused_session_agent_history(
             )
             if (
                 tool_call.tool == AGENT_META_TASK_LIST_TOOL
+                and tool_output
                 and not tool_output.startswith("ERROR:")
                 and isinstance(tool_call.arguments, dict)
             ):
-                task_list = normalize_agent_meta_task_list(
-                    tool_call.arguments.get("tasks")
-                )
+                if "operations" in tool_call.arguments:
+                    try:
+                        task_list = apply_agent_meta_task_operations(
+                            task_list,
+                            tool_call.arguments["operations"],
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"invalid saved meta_task_list operations: {turn_dir}"
+                        ) from exc
+                else:
+                    saved_tasks = tool_call.arguments.get("tasks")
+                    task_list = normalize_agent_meta_task_list(saved_tasks)
             active_task = task
             if tool_call.tool == AGENT_AGENT_TOOL:
                 active_task = tool_call.task
@@ -6163,8 +6576,7 @@ def format_agent_tool_schema_context(
         else controller_tools
     )
     return (
-        "<agent_tool_json_schemas instructions='This is the JSON schema "
-        "for the available controller tool calls.'>\n"
+        "<agent_tool_json_schemas>\n"
         f"{json.dumps(schemas, indent=2, ensure_ascii=False)}\n"
         "</agent_tool_json_schemas>"
     )
@@ -6191,9 +6603,7 @@ def build_agent_followup_prompt(
         format_agent_tool_schema_context(controller_tools),
     ]
     additional_parts.append(
-        "<meta_task_list instructions='This is the persisted agent-managed "
-        "task list. Use the `meta_task_list` tool to replace it whenever progress "
-        "or scope changes.'>\n"
+        "<meta_task_list>\n"
         f"{format_agent_meta_task_list(meta_task_list)}\n"
         "</meta_task_list>"
     )
@@ -6217,14 +6627,12 @@ def build_agent_followup_prompt(
 
     if history:
         additional_parts.append(
-            "<agent_history instructions='Turn sort order is newest to oldest; "
-            "unpinned turns expire after their `expires_in_turns`.'>\n"
+            "<agent_history>\n"
             f"{history}\n</agent_history>"
         )
     if revision_instruction:
         additional_parts.append(
-            "<agent_revision instructions='Replace the previous tool call with "
-            "one that follows this user instruction.'>\n"
+            "<agent_revision>\n"
             f"{revision_instruction}\n</agent_revision>"
         )
 
@@ -6266,8 +6674,12 @@ def agent_review_usage() -> str:
 def review_agent_tool_calls(
     tool_calls: list[AgentToolCall],
     accept_automatically: bool,
+    task_list: list[dict[str, Any]] | None = None,
  ) -> tuple[str, str | None]:
-    tool_text = format_agent_tool_call_report(tool_calls)
+    tool_text = format_agent_tool_call_report(
+        tool_calls,
+        meta_task_list=task_list,
+    )
     if accept_automatically:
         return "accept", None
     if NONINTERACTIVE:
@@ -6315,16 +6727,17 @@ def emit_agent_auto_tool_call(
     settings: AgentRunSettings,
     tool_calls: list[AgentToolCall],
     current_turn: int,
+    task_list: list[dict[str, Any]] | None = None,
 ) -> None:
     output_text = format_agent_tool_call_report(
         tool_calls,
         current_turn=current_turn,
+        meta_task_list=task_list,
     )
     if OUTPUT_FILE is not None:
         write_output_file(output_text, append=True)
     elif not settings.suppress_response_output:
         print(output_text)
-
 
 def review_agent_patch_changes(
     diff_text: str,
@@ -6634,18 +7047,19 @@ def run_agent_readfile_tool_call(
 
 def run_agent_meta_task_list_tool(
     settings: AgentRunSettings,
-    tasks: list[dict[str, Any]],
+    task_list: list[dict[str, Any]],
+    operations: list[dict[str, Any]],
 ) -> AgentToolExecution:
     try:
-        task_list = normalize_agent_meta_task_list(tasks)
+        task_list = apply_agent_meta_task_operations(task_list, operations)
         write_state_meta_task_list(settings.state_session_dir, task_list)
     except Exception as exc:
         return AgentToolExecution(
-            f"ERROR: Failed to save task list: {exc}"
+            f"ERROR: Failed to update task list: {exc}"
         )
+    # Store the structured snapshot separately so resuming an earlier turn remains exact.
     return AgentToolExecution(
-        "Task list was saved.\n"
-        f"{format_agent_meta_task_list(task_list)}",
+        format_agent_meta_task_list(task_list),
         meta_task_list=tuple(task_list),
     )
 
@@ -6829,8 +7243,10 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
     )
     active_task = settings.task
     active_context = settings.initial_active_context
-    meta_task_list = normalize_agent_meta_task_list(
-        list(settings.initial_meta_task_list)
+    meta_task_list = limit_agent_meta_task_list(
+        normalize_agent_meta_task_list(
+            list(settings.initial_meta_task_list),
+        )
     )
     controller_tools = agent_tool_schemas(settings.agent_profiles)
 
@@ -6888,6 +7304,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         review_action, revision_task = review_agent_tool_calls(
             tool_calls,
             settings.agent_auto,
+            meta_task_list,
         )
         if review_action == "save":
             return finish_agent_response(
@@ -6904,7 +7321,10 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 try:
                     edited_text = edit_text(
                         build_patch_revision_editor_text(
-                            format_agent_tool_call_report(tool_calls),
+                            format_agent_tool_call_report(
+                                tool_calls,
+                                meta_task_list=meta_task_list,
+                            ),
                             active_task,
                         ),
                     )
@@ -6930,6 +7350,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     settings,
                     tool_calls,
                     int(model_result.turn_dir.name) + 1,
+                    meta_task_list,
                 )
             except Exception as exc:
                 print(
@@ -7034,11 +7455,12 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             elif tool_call.tool == AGENT_META_TASK_LIST_TOOL:
                 arguments = tool_call.arguments
                 if not isinstance(arguments, dict):
-                    tool_output = "ERROR: Task list tool received no tasks."
+                    tool_output = "ERROR: Task list tool received no operations."
                 else:
                     execution = run_agent_meta_task_list_tool(
                         settings,
-                        arguments.get("tasks"),
+                        meta_task_list,
+                        arguments.get("operations"),
                     )
                     tool_output = execution.output
                     if execution.meta_task_list is not None:
@@ -10205,7 +10627,7 @@ def main() -> int:
             + "\n"
             + agent_system_prompt
             + "\n"
-            + AGENT_TOOL_CALL_SYSTEM_PROMPT
+            + agent_tool_call_system_prompt(selected_agent_profiles)
         )
         add_line_numbers = True
     if response_format not in ("text", "json", "schema"):
