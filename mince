@@ -102,27 +102,35 @@ DEFAULT_SHELL_SYSTEM_PROMPT = (
     "array and a non-empty reason that completes the session."
 )
 DEFAULT_AGENT_SYSTEM_PROMPT = (
-    "Run an agent session using the provided controller tools. Every "
-    "controller response must call exactly one tool and must not answer with "
-    "plain text. Available tools are `patch`, `shell`, `readfile`, `agent`, "
-    "`session`, and `context`. `patch` directly accepts the "
-    "`patch` JSON schema, and `shell` directly accepts the `shell_commands`. "
-    "`readfile` accepts one or more file paths and makes their contents available as "
-    "`<file>` sections in the main `<files>` context with line numbers, paths, "
-    "and expiry; use it to inspect files that are not in the controller context. "
-    "`agent` starts the next controller turn with a non-empty task and "
-    "optional context. Every controller tool call requires an "
-    "`expires_in_turns` that controls how "
-    "many following controller turns retain its history; use `agent` instead "
-    "of a no-op continuation. Selected agent profiles are exposed as "
-    "`agent_<profile_name>`; use the applicable agent profile rather than "
-    "generic `agent` to delegate work to a worker. Profile descriptions "
+    "Run an agent session. Complete the requested task accurately and "
+    "efficiently. Examine the previous turn to prevent duplicate work. "
+)
+AGENT_TOOL_CALL_SYSTEM_PROMPT = (
+    "Use the provided controller tools. Every controller response must call at "
+    "least one tool and must not answer with plain text. Additional tool calls "
+    "are allowed if the tool is `meta_task_list` or `meta_context_control`. "
+    "Available tools are `patch`, `shell`, `readfile`, `meta_task_list`, `agent`, "
+    "`session`, and `meta_context_control`. `patch` directly accepts the "
+    "`patch` JSON schema, and `shell` directly accepts the `shell_commands` "
+    "schema. `readfile` accepts one or more file paths and makes their contents "
+    "available as `<file>` sections in the main `<files>` context with line "
+    "numbers, paths, turn tracking, and expiry; use it to inspect desired files "
+    "that are not already in `<files>`. "
+    "`meta_task_list` replaces the persistent ordered task list. "
+    "Each task has an ordered list of subtasks; update it as work progresses. "
+    "`agent` starts the next controller turn with a non-empty task and optional "
+    "context. Every controller tool call requires an `expires_in_turns` that "
+    "controls how many following controller turns retain its history; use "
+    "`agent` instead of a no-op continuation. Selected agent profiles are "
+    "exposed as `agent_<profile_name>`; use the applicable agent profile rather "
+    "than generic `agent` to delegate work to a worker. Profile descriptions "
     "explain their intended use and profile types identify their workers' "
     "response formats. `session` uses action=end with a non-empty reason to "
-    "complete the session. `context` uses action=pin with a visible file path "
-    "or prior agent turn such as `turn:2` to retain context. Use a non-empty "
-    "task for agent; include context only when useful. Do not duplicate "
-    "tool calls across turns and always look for file content in `<files>`."
+    "complete the session. `meta_context_control` uses action=pin to retain a "
+    "visible file path or prior agent turn such as `turn:2`, or "
+    "action=set_expires_in_turns to update a specified context's "
+    "`expires_in_turns` value. Use a non-empty task for `agent`; include "
+    "context only when useful. Always examine `<files>` for file content."
 )
 DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
     "mce_system": DEFAULT_SYSTEM_PROMPT,
@@ -323,6 +331,40 @@ SHELL_FOLLOWUP_SCHEMA: dict[str, Any] = {
             "reason": {"type": "string"},
         },
         "required": ["action", "commands", "reason"],
+    },
+}
+
+
+META_TASK_LIST_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "name": "meta_task_list",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "minItems": 0,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "minLength": 1},
+                        "subtasks": {
+                            "type": "array",
+                            "minItems": 0,
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                        },
+                    },
+                    "required": ["task", "subtasks"],
+                },
+            },
+        },
+        "required": ["tasks"],
     },
 }
 
@@ -585,6 +627,11 @@ def last_completed_state_turn(
     )
 
 STATE_SESSION_ARTIFACT = "request_files"
+STATE_META_TASK_LIST_ARTIFACT = "meta_task_list"
+STATE_SESSION_ARTIFACTS = (
+    STATE_SESSION_ARTIFACT,
+    STATE_META_TASK_LIST_ARTIFACT,
+)
 STATE_TURN_ARTIFACTS = (
     "request_system_prompt",
     "request_task",
@@ -595,11 +642,12 @@ STATE_TURN_ARTIFACTS = (
     "response_schema_patch_applied",
     "response_shell_output",
     "response_agent_tool_output",
+    "response_agent_file_contexts",
 )
 STATE_ARTIFACT_TYPES = (
-    STATE_SESSION_ARTIFACT,
+    *STATE_SESSION_ARTIFACTS,
     *STATE_TURN_ARTIFACTS,
- )
+)
 
 def normalize_state_artifact_type(value: str) -> str:
     artifact_type = value.strip()
@@ -673,7 +721,7 @@ def handle_state_print_json(values: list[str]) -> int:
         turn_artifact_types = [
             artifact_type
             for artifact_type in artifact_types
-            if artifact_type != STATE_SESSION_ARTIFACT
+            if artifact_type not in STATE_SESSION_ARTIFACTS
         ]
         turn_dir: Path | None = None
         if not artifact_types or turn_artifact_types:
@@ -683,11 +731,12 @@ def handle_state_print_json(values: list[str]) -> int:
 
         artifacts: dict[str, str] = {}
         if not artifact_types:
-            request_files_path = state_session_dir / STATE_SESSION_ARTIFACT
-            if request_files_path.is_file() and not request_files_path.is_symlink():
-                artifacts[STATE_SESSION_ARTIFACT] = read_state_artifact(
-                    request_files_path
-                )
+            for session_artifact_type in STATE_SESSION_ARTIFACTS:
+                artifact_path = state_session_dir / session_artifact_type
+                if artifact_path.is_file() and not artifact_path.is_symlink():
+                    artifacts[session_artifact_type] = read_state_artifact(
+                        artifact_path
+                    )
             if turn_dir is not None:
                 for artifact_path in sorted(
                     turn_dir.iterdir(), key=lambda path: path.name
@@ -698,7 +747,7 @@ def handle_state_print_json(values: list[str]) -> int:
                         )
         else:
             for artifact_type in artifact_types:
-                if artifact_type == STATE_SESSION_ARTIFACT:
+                if artifact_type in STATE_SESSION_ARTIFACTS:
                     artifact_path = state_session_dir / artifact_type
                 else:
                     if turn_dir is None:
@@ -1066,6 +1115,29 @@ def write_state_agent_tool_output(
  ) -> None:
     (turn_dir / "response_agent_tool_output").write_text(
         output,
+        encoding="utf-8",
+    )
+
+
+def write_state_agent_file_contexts(
+    turn_dir: Path,
+    contexts: tuple[tuple[str, str], ...],
+) -> None:
+    context_entries = [
+        {"path": path, "section": section}
+        for path, section in contexts
+    ]
+    (turn_dir / "response_agent_file_contexts").write_text(
+        json.dumps(context_entries, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+def write_state_meta_task_list(
+    state_session_dir: Path,
+    task_list: list[dict[str, Any]],
+) -> None:
+    (state_session_dir / STATE_META_TASK_LIST_ARTIFACT).write_text(
+        json.dumps(task_list, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -1754,6 +1826,18 @@ def agent_tool_schemas(
         tool_names.add(schema["name"])
     return schemas
 
+
+def handle_agent_tool_list(
+    values: list[str] | None,
+) -> int:
+    try:
+        profiles = tuple(load_agent_profiles(values))
+        for schema in agent_tool_schemas(profiles):
+            print(f"{schema['name']}     {schema['description']}")
+    except Exception as exc:
+        print(f"ERROR: Failed to list agent tools: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 def load_or_create_agent_profile(name: str) -> AgentProfile:
     name = validate_agent_profile_name(name)
@@ -4127,8 +4211,6 @@ def build_context(
         )
     )
 
-
-
 def load_json_schema(path: Path) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -4191,7 +4273,7 @@ def append_task_to_system_prompt(
 ) -> str:
     if not enabled or not task:
         return system_prompt
-    return f"{system_prompt}\n{task}"
+    return f"{task}\n{system_prompt}"
 
 def build_user_prompt(
     task: str,
@@ -4238,8 +4320,9 @@ def build_user_prompt(
     return f"""
 {task if include_task else ""}
 
+{current_time_context}
 <files current_working_directory='{os.getcwd()}'>
-{current_time_context}{context}
+{context}
 </files>
 {schema_block}{json_patch_block}{additional_prompt_block}
 """.strip()
@@ -4248,9 +4331,10 @@ AGENT_TOOL_NAMES = (
     "patch",
     "shell",
     "readfile",
+    "meta_task_list",
     "agent",
     "session",
-    "context",
+    "meta_context_control",
 )
 AGENT_EXPIRES_IN_TURNS_DEFAULT = 12
 AGENT_EXPIRES_IN_TURNS_SCHEMA: dict[str, Any] = {
@@ -4262,9 +4346,10 @@ AGENT_EXPIRES_IN_TURNS_SCHEMA: dict[str, Any] = {
 AGENT_PATCH_TOOL = "patch"
 AGENT_SHELL_TOOL = "shell"
 AGENT_READFILE_TOOL = "readfile"
+AGENT_META_TASK_LIST_TOOL = "meta_task_list"
 AGENT_AGENT_TOOL = "agent"
 AGENT_SESSION_TOOL = "session"
-AGENT_CONTEXT_TOOL = "context"
+AGENT_META_CONTEXT_CONTROL_TOOL = "meta_context_control"
 
 
 def agent_tool_argument_schema(
@@ -4313,11 +4398,14 @@ AGENT_SESSION_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     },
     "required": ["action", "reason"],
 }
-AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
+AGENT_META_CONTEXT_CONTROL_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "action": {"type": "string", "enum": ["pin"]},
+        "action": {
+            "type": "string",
+            "enum": ["pin", "set_expires_in_turns"],
+        },
         "context_id": {"type": "string", "minLength": 1},
         "reason": {"type": "string"},
     },
@@ -4333,12 +4421,15 @@ AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
     AGENT_READFILE_TOOL: agent_tool_argument_schema(
         AGENT_READFILE_CALL_ARGUMENT_SCHEMA
     ),
+    AGENT_META_TASK_LIST_TOOL: agent_tool_argument_schema(
+        META_TASK_LIST_SCHEMA["schema"]
+    ),
     AGENT_AGENT_TOOL: AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
     AGENT_SESSION_TOOL: agent_tool_argument_schema(
         AGENT_SESSION_CALL_ARGUMENT_SCHEMA
     ),
-    AGENT_CONTEXT_TOOL: agent_tool_argument_schema(
-        AGENT_CONTEXT_CALL_ARGUMENT_SCHEMA
+    AGENT_META_CONTEXT_CONTROL_TOOL: agent_tool_argument_schema(
+        AGENT_META_CONTEXT_CONTROL_CALL_ARGUMENT_SCHEMA
     ),
 }
 AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
@@ -4353,20 +4444,25 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     AGENT_READFILE_TOOL: (
         "Read one or more files and make their contents available as `<file>` "
-        "sections in the main `<files>` context with line numbers, paths, "
-        "and expiry. Arguments must match the `readfile` schema."
+        "sections in the main `<files>` context with line numbers, paths, turn "
+        "tracking, and expiry. Arguments must match the `readfile` schema."
+    ),
+    AGENT_META_TASK_LIST_TOOL: (
+        "Replace the agent-managed task list persisted in the state session. "
+        "Each entry contains a task and an ordered array of subtasks."
     ),
     AGENT_AGENT_TOOL: (
         "Start the next controller turn with a new non-empty task and optional "
-        "context. expires_in_turns controls how many controller turns "
-        "retain this tool call in history (default: 7)."
+        "context. `expires_in_turns` controls how many controller turns "
+        "retain this tool call in history."
     ),
     AGENT_SESSION_TOOL: (
         "End the agent session with a non-empty reason that completes the task."
     ),
-    AGENT_CONTEXT_TOOL: (
+    AGENT_META_CONTEXT_CONTROL_TOOL: (
         "Pin a currently visible file or prior agent turn so it remains in the "
-        "controller context window."
+        "controller context window, or set a visible file or prior agent turn's "
+        "`expires_in_turns` to the tool call's `expires_in_turns` value."
     ),
 }
 AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -4434,6 +4530,7 @@ class AgentToolExecution:
     output: str
     revision_instruction: str | None = None
     readfile_contexts: tuple[tuple[str, str], ...] | None = None
+    meta_task_list: tuple[dict[str, Any], ...] | None = None
  
  
 @dataclass(frozen=True)
@@ -4489,6 +4586,7 @@ class AgentRunSettings:
     agent_profiles: tuple[AgentProfile, ...] = ()
     patch_suffix_argument_provided: bool = False
     initial_turns: tuple[AgentTurn, ...] = ()
+    initial_meta_task_list: tuple[dict[str, Any], ...] = ()
     initial_active_context: str = ""
     agent_hook_context_scripts: tuple[str, ...] = ()
 
@@ -4500,6 +4598,7 @@ class AgentModelResult:
     turn_dir: Path | None
     turn_unix_time: int | None = None
     tool_calls: tuple[AgentToolCall, ...] = ()
+
 class AgentControllerResponseError(ValueError):
     pass
 
@@ -4510,10 +4609,8 @@ AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR = (
 
 
 def parse_agent_expires_in_turns(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(
-            "agent field expires_in_turns must be an integer"
-        )
+    if not isinstance(value, int):
+        value = AGENT_EXPIRES_IN_TURNS_SCHEMA["default"]
     minimum = AGENT_EXPIRES_IN_TURNS_SCHEMA["minimum"]
     maximum = AGENT_EXPIRES_IN_TURNS_SCHEMA["maximum"]
     if value < minimum:
@@ -4521,6 +4618,45 @@ def parse_agent_expires_in_turns(value: Any) -> int:
     if value > maximum:
         return maximum
     return value
+
+
+def normalize_agent_meta_task_list(
+    value: Any,
+ ) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("meta_task_list tasks must be an array")
+    task_list: list[dict[str, Any]] = []
+    for task_index, task_value in enumerate(value, start=1):
+        if not isinstance(task_value, dict) or set(task_value) != {
+            "task", "subtasks"
+        }:
+            raise ValueError(
+                "meta_task_list task "
+                f"{task_index} must contain task and subtasks fields"
+            )
+        task = task_value["task"]
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError(
+                f"meta_task_list task {task_index} must be a non-empty string"
+            )
+        subtasks_value = task_value["subtasks"]
+        if not isinstance(subtasks_value, list):
+            raise ValueError(
+                f"meta_task_list task {task_index} subtasks must be an array"
+            )
+        subtasks: list[str] = []
+        for subtask_index, subtask in enumerate(
+            subtasks_value, start=1
+        ):
+            if not isinstance(subtask, str) or not subtask.strip():
+                raise ValueError(
+                    "meta_task_list task "
+                    f"{task_index} subtask {subtask_index} must be a "
+                    "non-empty string"
+                )
+            subtasks.append(subtask.strip())
+        task_list.append({"task": task.strip(), "subtasks": subtasks})
+    return task_list
 
 
 def parse_agent_tool_arguments(
@@ -4603,6 +4739,27 @@ def parse_agent_tool_arguments(
             expires_in_turns=expires_in_turns,
             arguments={"commands": value["commands"]},
         )
+
+    if tool == AGENT_META_TASK_LIST_TOOL:
+        if set(value) != {"tasks", "expires_in_turns"}:
+            raise ValueError(
+                "agent meta_task_list arguments must contain only tasks and "
+                "expires_in_turns"
+            )
+        expires_in_turns = parse_agent_expires_in_turns(
+            value["expires_in_turns"]
+        )
+        try:
+            tasks = normalize_agent_meta_task_list(value["tasks"])
+        except ValueError as exc:
+            raise ValueError(
+                f"agent meta_task_list arguments are invalid: {exc}"
+            ) from exc
+        return AgentToolCall(
+            tool=tool,
+            expires_in_turns=expires_in_turns,
+            arguments={"tasks": tasks},
+        )
  
     if tool == AGENT_READFILE_TOOL:
         if set(value) != {"paths", "expires_in_turns"}:
@@ -4675,12 +4832,15 @@ def parse_agent_tool_arguments(
             raise ValueError("agent session tool requires action=end")
         if not tool_call.reason:
             raise ValueError("agent session tool requires a non-empty reason")
-    elif tool == AGENT_CONTEXT_TOOL:
-        if tool_call.action != "pin":
-            raise ValueError("agent context tool requires action=pin")
+    elif tool == AGENT_META_CONTEXT_CONTROL_TOOL:
+        if tool_call.action not in ("pin", "set_expires_in_turns"):
+            raise ValueError(
+                "agent meta_context_control tool requires action=pin or "
+                "action=set_expires_in_turns"
+            )
         if not tool_call.context_id:
             raise ValueError(
-                "agent context tool requires a non-empty context_id"
+                "agent meta_context_control tool requires a non-empty context_id"
             )
     return tool_call
 
@@ -4702,9 +4862,17 @@ def normalize_agent_controller_tool_calls(
         raise AgentControllerResponseError(
             AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
         )
-    if len(tool_calls) != 1:
+    if any(
+        tool_call.tool != AGENT_META_CONTEXT_CONTROL_TOOL
+        for tool_call in tool_calls[1:]
+    ):
         raise AgentControllerResponseError(
-            "agent responses require exactly one tool call"
+            "agent responses may include additional tool calls only for "
+            "meta_context_control"
+        )
+    if tool_calls[0].tool == AGENT_SESSION_TOOL and len(tool_calls) != 1:
+        raise AgentControllerResponseError(
+            "agent session end responses must contain exactly one tool call"
         )
     return tool_calls
 
@@ -4851,6 +5019,25 @@ def format_agent_tool_call(tool_call: AgentToolCall) -> str:
     return json.dumps(tool_call.as_dict(), indent=2, ensure_ascii=False)
 
 
+def format_agent_meta_task_list(
+    task_list: list[dict[str, Any]] | None,
+) -> str:
+    if not task_list:
+        return "No tasks."
+
+    lines: list[str] = []
+    for task_index, task in enumerate(task_list, start=1):
+        lines.append(f"{task_index}. {task['task']}")
+        lines.extend(
+            f"   {task_index}.{subtask_index}. {subtask}"
+            for subtask_index, subtask in enumerate(
+                task["subtasks"],
+                start=1,
+            )
+        )
+    return "\n".join(lines)
+
+
 def indent_agent_patch_text(
     text: str,
     empty_text: str = "",
@@ -4902,6 +5089,14 @@ def format_agent_tool_call_for_output(tool_call: AgentToolCall) -> str:
     ):
         commands = _parse_shell_manifest_value(tool_call.arguments)
         return f"Tool: {tool_name}\nCommands:\n{format_shell_commands(commands)}"
+    if (
+        tool_call.tool == AGENT_META_TASK_LIST_TOOL
+        and tool_call.arguments is not None
+    ):
+        return (
+            f"Tool: {tool_name}\nTask list:\n"
+            f"{format_agent_meta_task_list(tool_call.arguments['tasks'])}"
+        )
     if tool_call.tool == AGENT_READFILE_TOOL:
         paths = call["paths"]
         path_text = "\n".join(
@@ -5013,6 +5208,10 @@ def append_agent_tool_history(
 
 
 def agent_history_tool_content(turn: AgentTurn) -> str:
+    if (turn.tool_call.tool == AGENT_META_TASK_LIST_TOOL):
+        return "Task list loaded into `<meta_task_list>` tag."
+    if turn.tool_call.tool.startswith("meta_"):
+        return ""
     if (
         turn.tool_call.tool == AGENT_READFILE_TOOL
         and turn.readfile_contexts is not None
@@ -5020,15 +5219,30 @@ def agent_history_tool_content(turn: AgentTurn) -> str:
         return "`readfile` content loaded into the `<files>` tag."
     return turn.output
 
+AGENT_INITIAL_FILE_CONTEXT_TURN = 0
+
+
+def agent_file_context_section(
+    section: str,
+    expires_in_turns: int,
+    turn: int = AGENT_INITIAL_FILE_CONTEXT_TURN,
+) -> str:
+    return section.replace(
+        "<file ",
+        f"<file turn='{turn}' expires_in_turns='{expires_in_turns}' ",
+        1,
+    )
+
 
 def agent_readfile_context_section(
     section: str,
     expires_in_turns: int,
- ) -> str:
-    return section.replace(
-        "<file ",
-        f"<file expires_in_turns='{expires_in_turns}' ",
-        1,
+    turn: int = AGENT_INITIAL_FILE_CONTEXT_TURN,
+) -> str:
+    return agent_file_context_section(
+        section,
+        expires_in_turns,
+        turn,
     )
 
 
@@ -5046,9 +5260,35 @@ def format_agent_readfile_contexts(
                 agent_readfile_context_section(
                     section,
                     turn.expires_in_turns,
+                    turn_number,
                 )
             )
     return "\n".join(sections)
+
+
+def build_agent_files_context(
+    file_contexts: list[tuple[str, str]],
+    file_expires_in_turns: dict[str, int],
+    visible_file_indexes: set[int],
+    turns: list[AgentTurn],
+    turn_numbers: list[int],
+    visible_turn_numbers: set[int],
+) -> str:
+    initial_sections = [
+        agent_file_context_section(
+            file_contexts[index][1],
+            file_expires_in_turns[file_contexts[index][0]],
+        )
+        for index in sorted(visible_file_indexes)
+    ]
+    readfile_context = format_agent_readfile_contexts(
+        turns,
+        turn_numbers,
+        visible_turn_numbers,
+    )
+    return "\n".join(
+        value for value in (*initial_sections, readfile_context) if value
+    )
 
 
 def remove_duplicate_agent_history_context_files(
@@ -5201,12 +5441,15 @@ def format_agent_history(
         pinned_attribute = (
             " pinned" if turn_number in pinned_turn_numbers else ""
         )
+        tool_call_content = (
+            turn.tool_call.tool
+            if turn.tool_call.tool.startswith("meta_")
+            else format_agent_tool_call(turn.tool_call)
+        )
         blocks.append(
-            f"<agent_turn{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' expires_in_turns='{turn.expires_in_turns}'{purge_attribute}>\n"
-            f"<task>\n{turn.task}\n</task>\n"
-            f"<context>\n{turn.context}\n</context>\n"
-            f"<tool_call>\n{format_agent_tool_call(turn.tool_call)}\n"
-            "</tool_call>\n"
+            f"<agent_turn{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' "
+            f"expires_in_turns='{turn.expires_in_turns}'{purge_attribute}>\n"
+            f"<tool_call>\n{tool_call_content}\n</tool_call>\n"
             f"<tool_content>\n{tool_content}\n</tool_content>\n"
             "</agent_turn>"
         )
@@ -5215,13 +5458,42 @@ def format_agent_history(
 
 def agent_context_file_sections(
     settings: AgentRunSettings,
- ) -> list[tuple[str, str]]:
+) -> list[tuple[str, str]]:
     if settings.context_sections is not None:
         return settings.context_sections
     if not settings.context:
         return []
     return [("<files>", settings.context)]
 
+
+def agent_file_context_expirations(
+    file_contexts: list[tuple[str, str]],
+) -> dict[str, int]:
+    return {
+        path: AGENT_EXPIRES_IN_TURNS_DEFAULT
+        for path, _ in file_contexts
+    }
+
+
+def advance_agent_file_context_expirations(
+    file_contexts: list[tuple[str, str]],
+    file_expires_in_turns: dict[str, int],
+    pinned_paths: set[str],
+) -> None:
+    expired_paths: set[str] = set()
+    for path, expires_in_turns in list(file_expires_in_turns.items()):
+        if expires_in_turns > 0:
+            file_expires_in_turns[path] = expires_in_turns - 1
+        elif path not in pinned_paths:
+            expired_paths.add(path)
+    if not expired_paths:
+        return
+    file_contexts[:] = [
+        context for context in file_contexts
+        if context[0] not in expired_paths
+    ]
+    for path in expired_paths:
+        file_expires_in_turns.pop(path, None)
 
 def agent_context_path_matches(context_id: str, path: str) -> bool:
     if context_id == path:
@@ -5267,40 +5539,194 @@ def resolve_agent_context_pin(
     )
 
 
+def set_agent_context_expires_in_turns(
+    target_type: str,
+    target: str | int,
+    turns: list[AgentTurn],
+    file_expires_in_turns: dict[str, int],
+    expires_in_turns: int,
+) -> None:
+    if target_type == "file":
+        file_expires_in_turns[str(target)] = expires_in_turns
+        return
+    if target_type != "turn":
+        raise ValueError(f"unknown agent context target type: {target_type}")
+    turn_number = int(target)
+    turns[turn_number - 1] = replace(
+        turns[turn_number - 1],
+        expires_in_turns=expires_in_turns,
+    )
+
+
 @dataclass(frozen=True)
 class ReusedAgentHistory:
     turns: tuple[AgentTurn, ...]
     active_task: str
     active_context: str
+    meta_task_list: tuple[dict[str, Any], ...] = ()
 
 
-AGENT_READFILE_CONTEXT_SECTION_PATTERN = re.compile(
-    r"<file(?: last_refreshed_time='-?\d+')?(?: last_modified_time='-?\d+')? path='(?P<path>[^']*)' encoding='utf-8' "
-    r"line_ending='[^']*' total_lines='\d+'>\n.*?</file>"
-    r"(?=\n<file(?: last_refreshed_time='-?\d+')?(?: last_modified_time='-?\d+')? path='|\Z)",
-    re.DOTALL,
- )
+def agent_file_context_attributes(section: str) -> dict[str, str] | None:
+    header, separator, _ = section.partition("\n")
+    if (
+        not separator
+        or not header.startswith("<file ")
+        or not header.endswith(">")
+    ):
+        return None
+    try:
+        values = shlex.split(header[1:-1])
+    except ValueError:
+        return None
+    if not values or values[0] != "file":
+        return None
+    attributes: dict[str, str] = {}
+    for value in values[1:]:
+        name, equals, attribute_value = value.partition("=")
+        if not equals or not name or name in attributes:
+            return None
+        attributes[name] = attribute_value
+    return attributes
+
+
+def agent_file_context_path(section: str) -> str | None:
+    attributes = agent_file_context_attributes(section)
+    if attributes is None:
+        return None
+    path = attributes.get("path")
+    total_lines = attributes.get("total_lines")
+    if (
+        not path
+        or attributes.get("encoding") != "utf-8"
+        or not attributes.get("line_ending")
+        or total_lines is None
+        or not total_lines.isascii()
+        or not total_lines.isdigit()
+    ):
+        return None
+    return path
+
+
+def agent_file_context_matches_turn(
+    section: str,
+    turn: int,
+) -> bool:
+    attributes = agent_file_context_attributes(section)
+    return (
+        attributes is not None
+        and attributes.get("turn") == str(turn)
+    )
+
+
+def remove_agent_history_turn_file_contexts(
+    turns: list[AgentTurn],
+    turn_number: int,
+) -> None:
+    turn_index = turn_number - 1
+    turn = turns[turn_index]
+    if turn.readfile_contexts is None:
+        return
+    remaining_contexts = tuple(
+        context_section
+        for context_section in turn.readfile_contexts
+        if not (
+            agent_file_context_matches_turn(
+                context_section[1],
+                turn_number,
+            )
+            or agent_file_context_matches_turn(
+                agent_readfile_context_section(
+                    context_section[1],
+                    turn.expires_in_turns,
+                    turn_number,
+                ),
+                turn_number,
+            )
+        )
+    )
+    if remaining_contexts != turn.readfile_contexts:
+        turns[turn_index] = replace(
+            turn,
+            readfile_contexts=remaining_contexts,
+        )
 
 
 def parse_agent_readfile_contexts(
     output: str,
-) -> tuple[tuple[str, str], ...] | None:
+ ) -> tuple[tuple[str, str], ...] | None:
     contexts: list[tuple[str, str]] = []
     position = 0
     while position < len(output):
-        match = AGENT_READFILE_CONTEXT_SECTION_PATTERN.match(
-            output, position
-        )
-        if match is None:
+        closing_position = output.find("\n</file>", position)
+        while closing_position != -1:
+            after_closing = closing_position + len("\n</file>")
+            if (
+                after_closing == len(output)
+                or output.startswith("\n<file ", after_closing)
+            ):
+                section = output[position:after_closing]
+                path = agent_file_context_path(section)
+                if path is None:
+                    return None
+                contexts.append((path, section))
+                if after_closing == len(output):
+                    return tuple(contexts)
+                position = after_closing + 1
+                break
+            closing_position = output.find(
+                "\n</file>",
+                closing_position + 1,
+            )
+        else:
             return None
-        contexts.append((match.group("path"), match.group(0)))
-        position = match.end()
-        if position == len(output):
-            break
-        if output[position] != "\n":
-            return None
-        position += 1
     return tuple(contexts) or None
+
+
+def load_state_agent_file_contexts(
+    turn_dir: Path,
+ ) -> tuple[tuple[str, str], ...] | None:
+    artifact_path = turn_dir / "response_agent_file_contexts"
+    if not artifact_path.exists() and not artifact_path.is_symlink():
+        return None
+    try:
+        entries = json.loads(read_state_artifact(artifact_path))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"agent file contexts must contain JSON: {artifact_path}"
+        ) from exc
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"agent file contexts must contain an array: {artifact_path}"
+        )
+    contexts: list[tuple[str, str]] = []
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict) or set(entry) != {"path", "section"}:
+            raise ValueError(
+                "agent file context entry "
+                f"{index} must contain path and section fields"
+            )
+        path = entry["path"]
+        section = entry["section"]
+        if not isinstance(path, str) or not path:
+            raise ValueError(
+                f"agent file context entry {index} path must be a non-empty string"
+            )
+        if not isinstance(section, str):
+            raise ValueError(
+                f"agent file context entry {index} section must be a string"
+            )
+        contexts.append((path, section))
+    return tuple(contexts)
+
+
+def load_reused_agent_readfile_contexts(
+    turn_dir: Path,
+    output: str,
+) -> tuple[tuple[str, str], ...] | None:
+    state_contexts = load_state_agent_file_contexts(turn_dir)
+    if state_contexts is not None:
+        return state_contexts
+    return parse_agent_readfile_contexts(output)
 
 
 def parse_reused_agent_tool_call_value(value: Any) -> AgentToolCall:
@@ -5440,6 +5866,7 @@ def load_reused_session_agent_history(
     turns: list[AgentTurn] = []
     active_task = ""
     active_context = ""
+    task_list: list[dict[str, Any]] = []
 
     for turn_number, turn_dir in sorted(turn_directories):
         response_path = turn_dir / "response"
@@ -5487,7 +5914,10 @@ def load_reused_session_agent_history(
                 )
             )
             readfile_contexts = (
-                parse_agent_readfile_contexts(tool_output)
+                load_reused_agent_readfile_contexts(
+                    turn_dir,
+                    tool_output,
+                )
                 if tool_call.tool == AGENT_READFILE_TOOL
                 else None
             )
@@ -5515,6 +5945,14 @@ def load_reused_session_agent_history(
                     readfile_contexts=readfile_contexts,
                 )
             )
+            if (
+                tool_call.tool == AGENT_META_TASK_LIST_TOOL
+                and not tool_output.startswith("ERROR:")
+                and isinstance(tool_call.arguments, dict)
+            ):
+                task_list = normalize_agent_meta_task_list(
+                    tool_call.arguments.get("tasks")
+                )
             active_task = task
             if tool_call.tool == AGENT_AGENT_TOOL:
                 active_task = tool_call.task
@@ -5529,13 +5967,18 @@ def load_reused_session_agent_history(
         turns=tuple(turns),
         active_task=active_task,
         active_context=active_context,
+        meta_task_list=tuple(task_list),
     )
-
 
 def reused_agent_context_pins(
     file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
- ) -> tuple[set[str], set[int]]:
+    file_expires_in_turns: dict[str, int] | None = None,
+) -> tuple[set[str], set[int]]:
+    if file_expires_in_turns is None:
+        file_expires_in_turns = agent_file_context_expirations(
+            file_contexts
+        )
     pinned_paths: set[str] = set()
     pinned_turn_numbers: set[int] = set()
     replayed_turns: list[AgentTurn] = []
@@ -5544,8 +5987,13 @@ def reused_agent_context_pins(
             replayed_turns,
             pinned_turn_numbers,
         )
+        advance_agent_file_context_expirations(
+            file_contexts,
+            file_expires_in_turns,
+            pinned_paths,
+        )
         if (
-            turn.tool_call.tool == AGENT_CONTEXT_TOOL
+            turn.tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL
             and turn.output
             and not turn.output.startswith("ERROR:")
         ):
@@ -5565,16 +6013,22 @@ def reused_agent_context_pins(
             except ValueError:
                 pass
             else:
-                if target_type == "file":
-                    pinned_paths.add(str(target))
-                else:
-                    pinned_turn_numbers.add(int(target))
+                if turn.tool_call.action == "pin":
+                    if target_type == "file":
+                        pinned_paths.add(str(target))
+                    else:
+                        pinned_turn_numbers.add(int(target))
+                elif turn.tool_call.action == "set_expires_in_turns":
+                    set_agent_context_expires_in_turns(
+                        target_type,
+                        target,
+                        replayed_turns,
+                        file_expires_in_turns,
+                        turn.tool_call.expires_in_turns,
+                    )
         replayed_turns.append(turn)
     turns[:] = replayed_turns
     return pinned_paths, pinned_turn_numbers
-
-
-
 
 
 def build_agent_context_window_prompt(
@@ -5588,12 +6042,23 @@ def build_agent_context_window_prompt(
     active_context: str,
     pinned_paths: set[str],
     pinned_turn_numbers: set[int],
+    file_expires_in_turns: dict[str, int] | None = None,
     revision_instruction: str = "",
     controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
+    meta_task_list: list[dict[str, Any]] | None = None,
+    include_task: bool = True,
 ) -> str:
+    if file_expires_in_turns is None:
+        file_expires_in_turns = agent_file_context_expirations(
+            file_contexts
+        )
     advance_agent_history_purges(turns, pinned_turn_numbers)
-    visible_file_indexes = set(range(len(file_contexts)))
+    advance_agent_file_context_expirations(
+        file_contexts,
+        file_expires_in_turns,
+        pinned_paths,
+    )
     visible_turn_numbers = set(
         agent_history_turn_numbers(
             turns,
@@ -5601,23 +6066,18 @@ def build_agent_context_window_prompt(
         )
     )
     turn_numbers = list(range(1, len(turns) + 1))
+    visible_file_indexes = set(range(len(file_contexts)))
     visible_active_context = active_context
     current_unix_time = int(time.time())
 
     def build_visible_prompt() -> tuple[str, int]:
-        ordered_file_indexes = sorted(visible_file_indexes)
-        visible_file_context = "\n".join(
-            file_contexts[index][1] for index in ordered_file_indexes
-        )
-        readfile_context = format_agent_readfile_contexts(
+        visible_context = build_agent_files_context(
+            file_contexts,
+            file_expires_in_turns,
+            visible_file_indexes,
             turns,
             turn_numbers,
             visible_turn_numbers,
-        )
-        visible_context = "\n".join(
-            value
-            for value in (visible_file_context, readfile_context)
-            if value
         )
         user_prompt = build_agent_followup_prompt(
             task=task,
@@ -5630,6 +6090,8 @@ def build_agent_context_window_prompt(
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
             hook_contents=hook_contents,
+            meta_task_list=meta_task_list,
+            include_task=include_task,
             current_unix_time=current_unix_time,
         )
         return (
@@ -5658,6 +6120,10 @@ def build_agent_context_window_prompt(
         )
         if removable_turn_numbers:
             removed_turn_number = removable_turn_numbers[0]
+            remove_agent_history_turn_file_contexts(
+                turns,
+                removed_turn_number,
+            )
             remove_agent_history_turn(
                 turns,
                 removed_turn_number - 1,
@@ -5697,9 +6163,8 @@ def format_agent_tool_schema_context(
         else controller_tools
     )
     return (
-        "<agent_tool_json_schemas instructions='These are the exact JSON "
-        "schemas for the available controller tool calls. Call exactly one "
-        "tool with arguments matching its parameters schema.'>\n"
+        "<agent_tool_json_schemas instructions='This is the JSON schema "
+        "for the available controller tool calls.'>\n"
         f"{json.dumps(schemas, indent=2, ensure_ascii=False)}\n"
         "</agent_tool_json_schemas>"
     )
@@ -5716,6 +6181,7 @@ def build_agent_followup_prompt(
     pinned_turn_numbers: set[int] | None = None,
     controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
+    meta_task_list: list[dict[str, Any]] | None = None,
     include_task: bool = True,
     current_unix_time: int | None = None,
 ) -> str:
@@ -5724,6 +6190,13 @@ def build_agent_followup_prompt(
     additional_parts: list[str] = [
         format_agent_tool_schema_context(controller_tools),
     ]
+    additional_parts.append(
+        "<meta_task_list instructions='This is the persisted agent-managed "
+        "task list. Use the `meta_task_list` tool to replace it whenever progress "
+        "or scope changes.'>\n"
+        f"{format_agent_meta_task_list(meta_task_list)}\n"
+        "</meta_task_list>"
+    )
 
     for hook_content in hook_contents:
         additional_parts.append(
@@ -5744,8 +6217,8 @@ def build_agent_followup_prompt(
 
     if history:
         additional_parts.append(
-            "<agent_history description='Turn sort order is newest to oldest; "
-            "unpinned turns expire after their expires_in_turns.'>\n"
+            "<agent_history instructions='Turn sort order is newest to oldest; "
+            "unpinned turns expire after their `expires_in_turns`.'>\n"
             f"{history}\n</agent_history>"
         )
     if revision_instruction:
@@ -5840,11 +6313,11 @@ def review_agent_tool_call(
 
 def emit_agent_auto_tool_call(
     settings: AgentRunSettings,
-    tool_call: AgentToolCall,
+    tool_calls: list[AgentToolCall],
     current_turn: int,
 ) -> None:
     output_text = format_agent_tool_call_report(
-        [tool_call],
+        tool_calls,
         current_turn=current_turn,
     )
     if OUTPUT_FILE is not None:
@@ -5995,7 +6468,7 @@ def request_agent_model(
                     error_logger=lambda event: append_agent_log(settings, event),
                     tools=tools,
                     tool_choice="required" if tools else None,
-                    parallel_tool_calls=False if tools else None,
+                    parallel_tool_calls=True if tools else None,
                 )
                 if tools:
                     parsed_tool_calls = tuple(
@@ -6033,11 +6506,9 @@ def request_agent_model(
     )
     append_agent_log(
         settings,
+        f"<agent_response_reasoning>\n{reasoning}\n</agent_response_reasoning>\n"
         f"<agent_response>\n{response}\n</agent_response>\n"
-        f"<agent_response_reasoning>\n{reasoning}\n"
-        "</agent_response_reasoning>\n"
-        f"<agent_response_stats>\n{statsline}\n"
-        "</agent_response_stats>\n",
+        f"<agent_response_stats>\n{statsline}\n</agent_response_stats>\n",
     )
     if VERBOSE:
         print(statsline, file=sys.stderr)
@@ -6159,6 +6630,24 @@ def run_agent_readfile_tool_call(
             "ERROR: Readfile tool received invalid paths."
         )
     return run_agent_readfile_tool(settings, paths)
+
+
+def run_agent_meta_task_list_tool(
+    settings: AgentRunSettings,
+    tasks: list[dict[str, Any]],
+) -> AgentToolExecution:
+    try:
+        task_list = normalize_agent_meta_task_list(tasks)
+        write_state_meta_task_list(settings.state_session_dir, task_list)
+    except Exception as exc:
+        return AgentToolExecution(
+            f"ERROR: Failed to save task list: {exc}"
+        )
+    return AgentToolExecution(
+        "Task list was saved.\n"
+        f"{format_agent_meta_task_list(task_list)}",
+        meta_task_list=tuple(task_list),
+    )
 
 def run_agent_shell_tool(
     settings: AgentRunSettings,
@@ -6330,11 +6819,19 @@ def finish_agent_response(
 def run_agent_mode(settings: AgentRunSettings) -> int:
     turns: list[AgentTurn] = list(settings.initial_turns)
     file_contexts = agent_context_file_sections(settings)
+    file_expires_in_turns = agent_file_context_expirations(
+        file_contexts
+    )
     pinned_paths, pinned_turn_numbers = reused_agent_context_pins(
-        file_contexts, turns
+        file_contexts,
+        turns,
+        file_expires_in_turns,
     )
     active_task = settings.task
     active_context = settings.initial_active_context
+    meta_task_list = normalize_agent_meta_task_list(
+        list(settings.initial_meta_task_list)
+    )
     controller_tools = agent_tool_schemas(settings.agent_profiles)
 
     def request_next(
@@ -6355,11 +6852,14 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             active_context=active_context,
             pinned_paths=pinned_paths,
             pinned_turn_numbers=pinned_turn_numbers,
+            file_expires_in_turns=file_expires_in_turns,
             revision_instruction=revision_instruction,
             controller_tools=controller_tools,
             hook_contents=run_agent_hook_context_scripts(
                 settings.agent_hook_context_scripts
             ),
+            meta_task_list=meta_task_list,
+            include_task=not settings.system_prompt_with_task,
         )
         result = request_agent_model(
             settings,
@@ -6428,7 +6928,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             try:
                 emit_agent_auto_tool_call(
                     settings,
-                    tool_calls[0],
+                    tool_calls,
                     int(model_result.turn_dir.name) + 1,
                 )
             except Exception as exc:
@@ -6440,6 +6940,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         executed_tool_calls: list[AgentToolCall] = []
         tool_outputs: list[str] = []
         tool_revision_instruction = ""
+        readfile_contexts_for_turn: tuple[tuple[str, str], ...] | None = None
         def save_tool_outputs() -> bool:
             if not executed_tool_calls:
                 return True
@@ -6451,6 +6952,11 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                         tool_outputs,
                     ),
                 )
+                if readfile_contexts_for_turn is not None:
+                    write_state_agent_file_contexts(
+                        model_result.turn_dir,
+                        readfile_contexts_for_turn,
+                    )
             except Exception as exc:
                 print(
                     f"ERROR: Failed to save agent tool output: {exc}",
@@ -6483,7 +6989,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
 
             readfile_contexts: tuple[tuple[str, str], ...] | None = None
 
-            if tool_call.tool == AGENT_CONTEXT_TOOL:
+            if tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL:
                 available_turn_numbers = set(
                     agent_history_turn_numbers(
                         turns,
@@ -6500,21 +7006,23 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 except ValueError as exc:
                     tool_output = f"ERROR: Failed to pin context: {exc}"
                 else:
-                    if target_type == "file":
-                        path = str(target)
-                        already_pinned = path in pinned_paths
-                        pinned_paths.add(path)
-                        tool_output = (
-                            f"Context file was {'already ' if already_pinned else ''}"
-                            f"pinned: {path}"
-                        )
+                    tool_output = ""
+                    if tool_call.action == "pin":
+                        if target_type == "file":
+                            path = str(target)
+                            already_pinned = path in pinned_paths
+                            pinned_paths.add(path)
+                        else:
+                            turn_number = int(target)
+                            already_pinned = turn_number in pinned_turn_numbers
+                            pinned_turn_numbers.add(turn_number)
                     else:
-                        turn_number = int(target)
-                        already_pinned = turn_number in pinned_turn_numbers
-                        pinned_turn_numbers.add(turn_number)
-                        tool_output = (
-                            f"Agent turn was {'already ' if already_pinned else ''}"
-                            f"pinned: turn:{turn_number}"
+                        set_agent_context_expires_in_turns(
+                            target_type,
+                            target,
+                            turns,
+                            file_expires_in_turns,
+                            tool_call.expires_in_turns,
                         )
             elif tool_call.tool == AGENT_READFILE_TOOL:
                 execution = run_agent_readfile_tool_call(
@@ -6523,6 +7031,18 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 )
                 tool_output = execution.output
                 readfile_contexts = execution.readfile_contexts
+            elif tool_call.tool == AGENT_META_TASK_LIST_TOOL:
+                arguments = tool_call.arguments
+                if not isinstance(arguments, dict):
+                    tool_output = "ERROR: Task list tool received no tasks."
+                else:
+                    execution = run_agent_meta_task_list_tool(
+                        settings,
+                        arguments.get("tasks"),
+                    )
+                    tool_output = execution.output
+                    if execution.meta_task_list is not None:
+                        meta_task_list = list(execution.meta_task_list)
             elif tool_call.tool == AGENT_PATCH_TOOL:
                 manifest = tool_call.arguments
                 if manifest is None:
@@ -6582,6 +7102,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 )
                 return 1
             if readfile_contexts is not None:
+                readfile_contexts_for_turn = readfile_contexts
                 remove_duplicate_agent_history_context_files(
                     turns,
                     readfile_contexts,
@@ -7588,7 +8109,7 @@ def run_tree_mode(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MinCE: minimal AI assistant for text files"
+        description="MinCE: minimal AI assistant"
     )
 
     mode_group = parser.add_mutually_exclusive_group()
@@ -7668,6 +8189,13 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME[,NAME...]",
         help=("Load one or more stored profiles as individual "
               "agent-prefixed controller tools"),
+    )
+
+    parser.add_argument(
+        "--agent-tool-list",
+        action="store_true",
+        help=("List built-in and selected --agent-profile tool call names "
+              "and descriptions"),
     )
 
     files_group = parser.add_mutually_exclusive_group()
@@ -8598,6 +9126,16 @@ def main() -> int:
     ensure_config_exists()
 
     args = parse_args()
+    if args.profile is not None:
+        if not args.profile.isidentifier():
+            print(f"ERROR: Invalid profile name '{args.profile}'.", file=sys.stderr)
+            return 1
+        if not get_profile_path(args.profile).is_file():
+            print(
+                f"ERROR: Profile '{args.profile}' does not exist.",
+                file=sys.stderr,
+            )
+            return 1
     if args.noninteractive:
         args.log = True
         args.quiet = True
@@ -8608,6 +9146,8 @@ def main() -> int:
         )
     if args.state_print_json is not None:
         return handle_state_print_json(args.state_print_json)
+    if args.agent_tool_list:
+        return handle_agent_tool_list(args.agent_profiles)
     ask_mode = args.ask is not None or args.ask_file is not None
     if ask_mode:
         disable_ask_conflicting_options(args)
@@ -8905,9 +9445,6 @@ def main() -> int:
     if args.prompt_remove is not None:
         return handle_prompt_remove(args.prompt_remove)
 
-    if not base_profile.isidentifier():
-        print(f"ERROR: Invalid profile name '{base_profile}'.", file=sys.stderr)
-        return 1
 
     if args.list_profiles:
         ensure_config_exists()
@@ -9663,7 +10200,13 @@ def main() -> int:
     if agent_mode:
         response_format = "text"
         json_schema = None
-        system_prompt = system_prompt + "\n" + agent_system_prompt
+        system_prompt = (
+            system_prompt
+            + "\n"
+            + agent_system_prompt
+            + "\n"
+            + AGENT_TOOL_CALL_SYSTEM_PROMPT
+        )
         add_line_numbers = True
     if response_format not in ("text", "json", "schema"):
         print(
@@ -10416,6 +10959,11 @@ def main() -> int:
             patch_suffix_argument_provided=args.patch_suffix is not None,
             initial_turns=(
                 reused_agent_history.turns
+                if reused_agent_history is not None
+                else ()
+            ),
+            initial_meta_task_list=(
+                reused_agent_history.meta_task_list
                 if reused_agent_history is not None
                 else ()
             ),
