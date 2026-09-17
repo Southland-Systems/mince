@@ -6309,9 +6309,10 @@ def format_agent_token_estimate_context(
         f"{turn} {token_estimate}"
         for turn, token_estimate in sorted(token_estimates, reverse=True)
     )
+    current_turn = token_estimates[-1][0] + 1 if token_estimates else 1
     return (
         f"<current_token_estimate token_estimate='{current_token_estimate}' "
-        f"token_limit='{token_limit}'/>\n"
+        f"token_limit='{token_limit}' turn='{current_turn}'/>\n"
         "<prior_token_estimates>\n"
         f"{prior_lines}\n"
         "</prior_token_estimates>"
@@ -7668,7 +7669,7 @@ def call_openai(
         kwargs["service_tier"] = openai_service_tier
 
     if explicit_prompt_cache:
-        kwargs["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        kwargs["prompt_cache_options"] = {"mode": "explicit"}
 
     if response_format == "json":
         kwargs["text"] = {"format": {"type": "json_object"}}
