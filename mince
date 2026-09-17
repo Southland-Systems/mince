@@ -124,19 +124,16 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "context with line numbers, paths, turn tracking, and expiry; use it to "
     "inspect desired files that are not already in `<files>`. `meta_task_list` "
     "applies an ordered batch of add, change, and remove operations to the "
-    "persistent task list. Add top-level tasks using tasks, or append subtasks "
-    "using task_number and subtasks. Change operations require a task or "
-    "task.subtask number and a status, and only change that status. Tasks and "
-    "subtasks have status values todo, done, or skip, displayed as [todo], "
-    "[done], or [skip], and parent and subtask statuses are independent. Remove "
-    "operations require a non-empty numbers array of task integers or "
-    "task.subtask strings, such as 2 or \"2.1\". Removing a task also removes "
-    "its subtasks. Keep incomplete tasks and update statuses whenever progress "
-    "changes. Numbers refer to the task list before each operation, and removals "
-    "renumber remaining entries. At most 25 top-level tasks are retained. After "
-    "the entire batch, the oldest done or skip tasks are removed when more "
-    "space is needed; if insufficient space remains, the entire batch is "
-    "rejected without changing the list. The task list never expires, and any "
+    "persistent task list. Add tasks using tasks. Change operations require a "
+    "task number and a status, and only change that status. Tasks have status "
+    "values todo, done, or skip, displayed as [todo], [done], or [skip]. "
+    "Remove operations require a non-empty numbers array of task integers. "
+    "Keep incomplete tasks and update statuses whenever progress changes. "
+    "Numbers refer to the task list before each operation, and removals "
+    "renumber remaining entries. At most 25 tasks are retained. After the "
+    "entire batch, the oldest done or skip tasks are removed when more space is "
+    "needed; if insufficient space remains, the entire batch is rejected "
+    "without changing the list. The task list never expires, and any "
     "expires_in_turns supplied to `meta_task_list` is ignored. `agent` starts "
     "the next controller turn with a non-empty task and optional context. Use "
     "`agent` instead of a no-op continuation. Selected agent profiles are "
@@ -178,6 +175,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "meta_organization": "",
     "meta_project": "",
     "service_tier": "off",
+    "explicit_prompt_cache": "off",
     "safety_identifier": "",
     "system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["system_prompt"],
     "linenum_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["linenum_system_prompt"],
@@ -362,7 +360,7 @@ META_TASK_STATUS_SCHEMA: dict[str, Any] = {
     "type": "string",
     "enum": ["todo", "done", "skip"],
 }
-META_SUBTASK_SCHEMA: dict[str, Any] = {
+META_TASK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -370,27 +368,6 @@ META_SUBTASK_SCHEMA: dict[str, Any] = {
         "status": META_TASK_STATUS_SCHEMA,
     },
     "required": ["task", "status"],
-}
-META_TASK_SCHEMA: dict[str, Any] = {
-    **META_SUBTASK_SCHEMA,
-    "properties": {
-        **META_SUBTASK_SCHEMA["properties"],
-        "subtasks": {
-            "type": "array",
-            "minItems": 0,
-            "items": META_SUBTASK_SCHEMA,
-        },
-    },
-    "required": ["task", "status", "subtasks"],
-}
-META_TASK_NUMBER_SCHEMA: dict[str, Any] = {
-    "anyOf": [
-        {"type": "integer", "minimum": 1},
-        {
-            "type": "string",
-            "pattern": r"^[1-9][0-9]*(?:\.[1-9][0-9]*)?$",
-        },
-    ],
 }
 META_TASK_LIST_OPERATION_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -410,20 +387,6 @@ META_TASK_LIST_OPERATION_SCHEMAS: list[dict[str, Any]] = [
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "action": {"type": "string", "enum": ["add"]},
-            "task_number": {"type": "integer", "minimum": 1},
-            "subtasks": {
-                "type": "array",
-                "minItems": 1,
-                "items": META_SUBTASK_SCHEMA,
-            },
-        },
-        "required": ["action", "task_number", "subtasks"],
-    },
-    {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
             "action": {"type": "string", "enum": ["change"]},
             "tasks": {
                 "type": "array",
@@ -432,7 +395,7 @@ META_TASK_LIST_OPERATION_SCHEMAS: list[dict[str, Any]] = [
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "number": META_TASK_NUMBER_SCHEMA,
+                        "number": {"type": "integer", "minimum": 1},
                         "status": META_TASK_STATUS_SCHEMA,
                     },
                     "required": ["number", "status"],
@@ -449,7 +412,7 @@ META_TASK_LIST_OPERATION_SCHEMAS: list[dict[str, Any]] = [
             "numbers": {
                 "type": "array",
                 "minItems": 1,
-                "items": META_TASK_NUMBER_SCHEMA,
+                "items": {"type": "integer", "minimum": 1},
             },
         },
         "required": ["action", "numbers"],
@@ -472,6 +435,7 @@ META_TASK_LIST_SCHEMA: dict[str, Any] = {
         "required": ["operations"],
     },
 }
+
 
 
 # -------------------------------------------------------------------
@@ -2348,6 +2312,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "meta_project", "Project name or ID (optional)")
     prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
     prompt_config_value(config, "service_tier", "Service tier (off, auto, default, flex, scale, priority)")
+    prompt_config_value(config, "explicit_prompt_cache", "Explicit prompt caching (off, on)")
     prompt_config_value(config, "files", "Context files (eg: /path/file1|file2)")
     prompt_config_value(config, "system_prompt_with_task", "Prepend task to system prompt (off, on)")
     prompt_config_value(config, "system_prompt", "System prompt")
@@ -4656,6 +4621,7 @@ class AgentModelSettings:
     safety_identifier: Any
     api_log: bool
     retry: int = 2
+    explicit_prompt_cache: bool = False
  
  
 @dataclass
@@ -4701,6 +4667,7 @@ class AgentModelResult:
     turn_dir: Path | None
     turn_unix_time: int | None = None
     tool_calls: tuple[AgentToolCall, ...] = ()
+    request_tokens: int = 0
 
 class AgentControllerResponseError(ValueError):
     pass
@@ -4726,11 +4693,8 @@ def parse_agent_expires_in_turns(value: Any) -> int:
 def normalize_agent_meta_task_item(
     value: Any,
     label: str,
-    include_subtasks: bool = False,
 ) -> dict[str, Any]:
     expected_fields = {"task", "status"}
-    if include_subtasks:
-        expected_fields.add("subtasks")
     if not isinstance(value, dict) or set(value) != expected_fields:
         raise ValueError(
             f"{label} must contain only "
@@ -4746,19 +4710,7 @@ def normalize_agent_meta_task_item(
         raise ValueError(f"{label} task must be a non-empty string")
     if status not in META_TASK_STATUS_SCHEMA["enum"]:
         raise ValueError(f"{label} status must be todo, done, or skip")
-    item: dict[str, Any] = {"task": task, "status": status}
-    if include_subtasks:
-        subtasks = value["subtasks"]
-        if not isinstance(subtasks, list):
-            raise ValueError(f"{label} subtasks must be an array")
-        item["subtasks"] = [
-            normalize_agent_meta_task_item(
-                subtask,
-                f"{label} subtask {index}",
-            )
-            for index, subtask in enumerate(subtasks, start=1)
-        ]
-    return item
+    return {"task": task, "status": status}
 
 
 def normalize_agent_meta_task_list(
@@ -4770,22 +4722,19 @@ def normalize_agent_meta_task_list(
         normalize_agent_meta_task_item(
             task,
             f"meta_task_list task {index}",
-            include_subtasks=True,
         )
         for index, task in enumerate(value, start=1)
     ]
 
 
-def normalize_agent_meta_task_number(value: Any) -> str:
-    if isinstance(value, int) and not isinstance(value, bool):
-        value = str(value)
+def normalize_agent_meta_task_number(value: Any) -> int:
     if (
-        not isinstance(value, str)
-        or re.fullmatch(r"[1-9][0-9]*(?:\.[1-9][0-9]*)?", value) is None
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
     ):
         raise ValueError(
-            "meta_task_list number must be a positive task number "
-            "or a task.subtask string"
+            "meta_task_list number must be a positive task number"
         )
     return value
 
@@ -4801,10 +4750,7 @@ def normalize_agent_meta_task_operations(
         if not isinstance(operation, dict):
             raise ValueError(f"{label} must be an object")
         action = operation.get("action")
-        if action == "add" and "subtasks" in operation:
-            entry_field = "subtasks"
-            expected_fields = {"action", "task_number", "subtasks"}
-        elif action in ("add", "change"):
+        if action in ("add", "change"):
             entry_field = "tasks"
             expected_fields = {"action", "tasks"}
         elif action == "remove":
@@ -4823,25 +4769,7 @@ def normalize_agent_meta_task_operations(
             raise ValueError(f"{label} {entry_field} must be a non-empty array")
         normalized: dict[str, Any] = {"action": action}
         if action == "add":
-            if entry_field == "tasks":
-                entries = normalize_agent_meta_task_list(entries)
-            else:
-                task_number = operation["task_number"]
-                if (
-                    isinstance(task_number, bool)
-                    or not isinstance(task_number, int)
-                    or task_number < 1
-                ):
-                    raise ValueError(
-                        f"{label} task_number must be a positive integer"
-                    )
-                normalized["task_number"] = task_number
-                entries = [
-                    normalize_agent_meta_task_item(
-                        subtask, f"{label} subtask {subtask_index}"
-                    )
-                    for subtask_index, subtask in enumerate(entries, start=1)
-                ]
+            entries = normalize_agent_meta_task_list(entries)
         elif action == "change":
             changes: list[dict[str, Any]] = []
             for change in entries:
@@ -4901,47 +4829,28 @@ def apply_agent_meta_task_operations(
     updated_tasks = normalize_agent_meta_task_list(task_list)
     operations = normalize_agent_meta_task_operations(operations)
 
-    def resolve(number: str) -> tuple[list[dict[str, Any]], int]:
-        task_number, separator, subtask_number = number.partition(".")
-        task_index = int(task_number) - 1
-        if task_index >= len(updated_tasks):
-            raise ValueError(f"meta_task_list task does not exist: {number}")
-        if not separator:
-            return updated_tasks, task_index
-        subtasks = updated_tasks[task_index]["subtasks"]
-        subtask_index = int(subtask_number) - 1
-        if subtask_index >= len(subtasks):
-            raise ValueError(f"meta_task_list subtask does not exist: {number}")
-        return subtasks, subtask_index
-
     for operation in operations:
         action = operation["action"]
         if action == "add":
-            if "tasks" in operation:
-                updated_tasks.extend(operation["tasks"])
-            else:
-                entries, index = resolve(str(operation["task_number"]))
-                entries[index]["subtasks"].extend(operation["subtasks"])
+            updated_tasks.extend(operation["tasks"])
         elif action == "change":
             for change in operation["tasks"]:
-                entries, index = resolve(change["number"])
-                if change.get("task") is not None:
-                    entries[index]["task"] = change["task"]
-                if change.get("status") is not None:
-                    entries[index]["status"] = change["status"]
+                task_index = change["number"] - 1
+                if task_index >= len(updated_tasks):
+                    raise ValueError(
+                        "meta_task_list task does not exist: "
+                        f"{change['number']}"
+                    )
+                updated_tasks[task_index]["status"] = change["status"]
         else:
-            # Validate before deleting, then work backwards to keep numbers valid.
-            for number in operation["numbers"]:
-                resolve(number)
-            numbers = {
-                tuple(int(part) for part in number.split("."))
-                for number in operation["numbers"]
-            }
+            numbers = set(operation["numbers"])
+            for number in numbers:
+                if number > len(updated_tasks):
+                    raise ValueError(
+                        f"meta_task_list task does not exist: {number}"
+                    )
             for number in sorted(numbers, reverse=True):
-                if len(number) == 1:
-                    del updated_tasks[number[0] - 1]
-                else:
-                    del updated_tasks[number[0] - 1]["subtasks"][number[1] - 1]
+                del updated_tasks[number - 1]
     return limit_agent_meta_task_list(updated_tasks)
 
 
@@ -5301,22 +5210,6 @@ def format_agent_tool_call(tool_call: AgentToolCall) -> str:
     return json.dumps(tool_call.as_dict(), indent=2, ensure_ascii=False)
 
 
-def format_agent_meta_subtask_list(
-    task_number: int,
-    subtasks: list[dict[str, Any]],
-    subtask_number_start: int = 1,
-    indent: str = "",
-) -> list[str]:
-    return [
-        f"{indent}{task_number}.{subtask_index}. "
-        f"[{subtask['status']}] {subtask['task']}"
-        for subtask_index, subtask in enumerate(
-            subtasks,
-            start=subtask_number_start,
-        )
-    ]
-
-
 def format_agent_meta_task_list(
     task_list: list[dict[str, Any]] | None,
     task_number_start: int = 1,
@@ -5324,22 +5217,13 @@ def format_agent_meta_task_list(
     if not task_list:
         return "No tasks."
 
-    lines: list[str] = []
-    for task_index, task in enumerate(
-        task_list,
-        start=task_number_start,
-    ):
-        lines.append(
-            f"{task_index}. [{task['status']}] {task['task']}"
+    return "\n".join(
+        f"{task_index}. [{task['status']}] {task['task']}"
+        for task_index, task in enumerate(
+            task_list,
+            start=task_number_start,
         )
-        lines.extend(
-            format_agent_meta_subtask_list(
-                task_index,
-                task["subtasks"],
-                indent="   ",
-            )
-        )
-    return "\n".join(lines)
+    )
 
 
 def format_agent_meta_task_operations(
@@ -5357,52 +5241,22 @@ def format_agent_meta_task_operations(
     for operation in operations:
         action = operation["action"]
         if action == "add":
-            if "tasks" in operation:
-                if original_task_list is None:
-                    task_lines: list[str] = []
-                    for task in operation["tasks"]:
-                        task_lines.append(
-                            f"  - [{task['status']}] {task['task']}"
-                        )
-                        task_lines.extend(
-                            f"    - [{subtask['status']}] {subtask['task']}"
-                            for subtask in task["subtasks"]
-                        )
-                else:
-                    task_lines = [
-                        f"  {line}"
-                        for line in format_agent_meta_task_list(
-                            operation["tasks"],
-                            len(original_task_list) + 1,
-                        ).splitlines()
-                    ]
-                blocks.append(
-                    "Add tasks:\n" + "\n".join(task_lines)
-                )
+            if original_task_list is None:
+                task_lines = [
+                    f"  - [{task['status']}] {task['task']}"
+                    for task in operation["tasks"]
+                ]
             else:
-                task_number = operation["task_number"]
-                if (
-                    original_task_list is None
-                    or task_number > len(original_task_list)
-                ):
-                    subtask_lines = [
-                        f"  - [{subtask['status']}] {subtask['task']}"
-                        for subtask in operation["subtasks"]
-                    ]
-                else:
-                    subtask_lines = format_agent_meta_subtask_list(
-                        task_number,
-                        operation["subtasks"],
-                        len(
-                            original_task_list[task_number - 1]["subtasks"]
-                        ) + 1,
-                        indent="  ",
-                    )
-                blocks.append(
-                    "Add subtasks to task "
-                    f"{task_number}:\n"
-                    + "\n".join(subtask_lines)
-                )
+                task_lines = [
+                    f"  {line}"
+                    for line in format_agent_meta_task_list(
+                        operation["tasks"],
+                        len(original_task_list) + 1,
+                    ).splitlines()
+                ]
+            blocks.append(
+                "Add tasks:\n" + "\n".join(task_lines)
+            )
         elif action == "change":
             blocks.append(
                 "Change task statuses:\n"
@@ -6353,19 +6207,15 @@ def load_reused_session_agent_history(
                 and not tool_output.startswith("ERROR:")
                 and isinstance(tool_call.arguments, dict)
             ):
-                if "operations" in tool_call.arguments:
-                    try:
-                        task_list = apply_agent_meta_task_operations(
-                            task_list,
-                            tool_call.arguments["operations"],
-                        )
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"invalid saved meta_task_list operations: {turn_dir}"
-                        ) from exc
-                else:
-                    saved_tasks = tool_call.arguments.get("tasks")
-                    task_list = normalize_agent_meta_task_list(saved_tasks)
+                try:
+                    task_list = apply_agent_meta_task_operations(
+                        task_list,
+                        tool_call.arguments.get("operations"),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid saved meta_task_list operations: {turn_dir}"
+                    ) from exc
             active_task = task
             if tool_call.tool == AGENT_AGENT_TOOL:
                 active_task = tool_call.task
@@ -6444,6 +6294,30 @@ def reused_agent_context_pins(
     return pinned_paths, pinned_turn_numbers
 
 
+AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS = 4
+
+
+def format_agent_token_estimate_context(
+    current_token_estimate: int,
+    token_limit: int,
+    prior_token_estimates: list[tuple[int, int]] | None = None,
+) -> str:
+    token_estimates = (prior_token_estimates or [])[
+        -AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS:
+    ]
+    prior_lines = "\n".join(
+        f"{turn} {token_estimate}"
+        for turn, token_estimate in sorted(token_estimates, reverse=True)
+    )
+    return (
+        f"<current_token_estimate token_estimate='{current_token_estimate}' "
+        f"token_limit='{token_limit}'/>\n"
+        "<prior_token_estimates>\n"
+        f"{prior_lines}\n"
+        "</prior_token_estimates>"
+    )
+
+
 def build_agent_context_window_prompt(
     *,
     model: str,
@@ -6460,6 +6334,7 @@ def build_agent_context_window_prompt(
     controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
     meta_task_list: list[dict[str, Any]] | None = None,
+    prior_token_estimates: list[tuple[int, int]] | None = None,
     include_task: bool = True,
 ) -> str:
     if file_expires_in_turns is None:
@@ -6483,7 +6358,9 @@ def build_agent_context_window_prompt(
     visible_active_context = active_context
     current_unix_time = int(time.time())
 
-    def build_visible_prompt() -> tuple[str, int]:
+    def build_visible_prompt(
+        current_token_estimate: int,
+    ) -> tuple[str, int]:
         visible_context = build_agent_files_context(
             file_contexts,
             file_expires_in_turns,
@@ -6504,6 +6381,9 @@ def build_agent_context_window_prompt(
             controller_tools=controller_tools,
             hook_contents=hook_contents,
             meta_task_list=meta_task_list,
+            current_token_estimate=current_token_estimate,
+            token_limit=token_limit,
+            prior_token_estimates=prior_token_estimates,
             include_task=include_task,
             current_unix_time=current_unix_time,
         )
@@ -6521,8 +6401,23 @@ def build_agent_context_window_prompt(
             ),
         )
 
+    def build_visible_prompt_with_token_estimate() -> tuple[str, int]:
+        current_token_estimate = 0
+        for _ in range(8):
+            user_prompt, request_tokens = build_visible_prompt(
+                current_token_estimate
+            )
+            if request_tokens == current_token_estimate:
+                return user_prompt, request_tokens
+            current_token_estimate = request_tokens
+        raise ValueError(
+            "Unable to calculate a stable agent input token estimate"
+        )
+
     while True:
-        user_prompt, request_tokens = build_visible_prompt()
+        user_prompt, request_tokens = (
+            build_visible_prompt_with_token_estimate()
+        )
         if request_tokens <= token_limit:
             return user_prompt
 
@@ -6594,6 +6489,9 @@ def build_agent_followup_prompt(
     controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
     meta_task_list: list[dict[str, Any]] | None = None,
+    current_token_estimate: int | None = None,
+    token_limit: int | None = None,
+    prior_token_estimates: list[tuple[int, int]] | None = None,
     include_task: bool = True,
     current_unix_time: int | None = None,
 ) -> str:
@@ -6607,6 +6505,14 @@ def build_agent_followup_prompt(
         f"{format_agent_meta_task_list(meta_task_list)}\n"
         "</meta_task_list>"
     )
+    if current_token_estimate is not None and token_limit is not None:
+        additional_parts.append(
+            format_agent_token_estimate_context(
+                current_token_estimate,
+                token_limit,
+                prior_token_estimates,
+            )
+        )
 
     for hook_content in hook_contents:
         additional_parts.append(
@@ -6873,6 +6779,7 @@ def request_agent_model(
                     openai_service_tier=model_settings.openai_service_tier,
                     openai_reasoning=model_settings.openai_reasoning,
                     reasoning_mode=model_settings.reasoning_mode,
+                    explicit_prompt_cache=model_settings.explicit_prompt_cache,
                     extra_body=model_settings.extra_body,
                     llm_timeout=model_settings.llm_timeout,
                     retry=model_settings.retry,
@@ -6932,6 +6839,7 @@ def request_agent_model(
         turn_dir=turn_dir,
         turn_unix_time=turn_unix_time,
         tool_calls=parsed_tool_calls,
+        request_tokens=request_tokens,
     )
 
 
@@ -7249,6 +7157,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         )
     )
     controller_tools = agent_tool_schemas(settings.agent_profiles)
+    prior_token_estimates: list[tuple[int, int]] = []
 
     def request_next(
         revision_instruction: str = "",
@@ -7275,6 +7184,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 settings.agent_hook_context_scripts
             ),
             meta_task_list=meta_task_list,
+            prior_token_estimates=prior_token_estimates,
             include_task=not settings.system_prompt_with_task,
         )
         result = request_agent_model(
@@ -7286,6 +7196,12 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         )
         if result.turn_dir is None:
             raise ValueError("agent controller request did not create a state turn")
+        prior_token_estimates.append(
+            (int(result.turn_dir.name) + 1, result.request_tokens)
+        )
+        del prior_token_estimates[
+            :-AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS
+        ]
         return result
 
     try:
@@ -7690,6 +7606,7 @@ def call_openai(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
     error_logger: Any = None,
+    explicit_prompt_cache: bool = False,
 ) -> tuple[Any, dict[str, Any] | None]:
     http_client = None
     if openai_proxy:
@@ -7749,6 +7666,9 @@ def call_openai(
 
     if openai_service_tier and str(openai_service_tier).lower() != "off":
         kwargs["service_tier"] = openai_service_tier
+
+    if explicit_prompt_cache:
+        kwargs["prompt_cache_breakpoint"] = {"mode": "explicit"}
 
     if response_format == "json":
         kwargs["text"] = {"format": {"type": "json_object"}}
@@ -8125,6 +8045,7 @@ def run_tree_mode(
     system_prompt_with_task: bool = False,
     tree_session_stem: str = "",
     retry: int = 2,
+    explicit_prompt_cache: bool = False,
 ) -> int:
     retry = parse_retry_count(retry)
     log_lock = threading.Lock()
@@ -8308,6 +8229,7 @@ def run_tree_mode(
                 openai_reasoning=openai_reasoning,
                 reasoning_mode=reasoning_mode,
                 extra_body=extra_body,
+                explicit_prompt_cache=explicit_prompt_cache,
                 llm_timeout=llm_timeout,
                 retry=0,
                 safety_identifier=safety_identifier,
@@ -9010,6 +8932,16 @@ def parse_args() -> argparse.Namespace:
         type=parse_bool,
         metavar="BOOL",
         help="Stream text responses as they are generated",
+    )
+
+    parser.add_argument(
+        "--explicit-prompt-cache",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Enable explicit prompt caching (default: off)",
     )
 
     parser.add_argument(
@@ -10641,6 +10573,12 @@ def main() -> int:
         config,
         'stream',
     )
+
+    explicit_prompt_cache = resolve_bool_option(
+        args.explicit_prompt_cache,
+        config,
+        "explicit_prompt_cache",
+    )
     suppress_response_output = args.noninteractive and not ask_mode
     if stream_enabled and (
         response_format != 'text' or suppress_response_output
@@ -10698,6 +10636,7 @@ def main() -> int:
             openai_service_tier=openai_service_tier,
             openai_reasoning=openai_reasoning,
             reasoning_mode=reasoning_mode,
+            explicit_prompt_cache=explicit_prompt_cache,
             extra_body=extra_body,
             llm_timeout=llm_timeout,
             retry=retry,
@@ -11053,6 +10992,7 @@ def main() -> int:
             openai_service_tier=openai_service_tier,
             openai_reasoning=openai_reasoning,
             reasoning_mode=reasoning_mode,
+            explicit_prompt_cache=explicit_prompt_cache,
             extra_body=extra_body,
             llm_timeout=llm_timeout,
             retry=retry,
@@ -11346,6 +11286,7 @@ def main() -> int:
                 openai_service_tier=openai_service_tier,
                 openai_reasoning=openai_reasoning,
                 reasoning_mode=reasoning_mode,
+                explicit_prompt_cache=explicit_prompt_cache,
                 extra_body=extra_body,
                 llm_timeout=llm_timeout,
                 retry=retry,

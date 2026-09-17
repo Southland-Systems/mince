@@ -445,6 +445,10 @@ If token costs are set in the configuration and `--model` is specified, `--token
 
 ## Known Issues and Reporting ⚠️
 
+**Agent using incorrect tool calls**
+
+Ensure the default agent system prompt does not contain tool call instructions, use `--prompt-reset-default agent` to reset the agent system prompt.
+
 **Command line arguments may clash**
 
 Mixing combinations of command line arguments may lead to unexpected behaviour.
