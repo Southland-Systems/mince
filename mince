@@ -6913,6 +6913,28 @@ def run_agent_profile_tool(
     return AgentToolExecution(result.response)
 
 
+def limit_agent_readfile_sections(
+    sections: list[tuple[str, str]],
+    model: str,
+    token_limit: int,
+) -> list[tuple[str, str]]:
+    encoding = token_encoding_for_model(model)
+    limited_sections: list[tuple[str, str]] = []
+    for path, section in sections:
+        if section.startswith("<file ") and len(encoding.encode(section)) > token_limit:
+            header = section.split("\n", 1)[0]
+            section = (
+                header.replace(
+                    "<file ",
+                    "<file read_error='File content exceeds the token limit' ",
+                    1,
+                )
+                + "\n</file>"
+            )
+        limited_sections.append((path, section))
+    return limited_sections
+
+
 def run_agent_readfile_tool(
     settings: AgentRunSettings,
     path_texts: list[str],
@@ -6925,6 +6947,9 @@ def run_agent_readfile_tool(
             add_line_numbers=True,
             include_last_modified_time=True,
             include_last_refreshed_time=True,
+        )
+        sections = limit_agent_readfile_sections(
+            sections, settings.model_settings.model, settings.token_limit
         )
     except Exception as exc:
         return AgentToolExecution(f"ERROR: Readfile tool failed: {exc}")
