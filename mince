@@ -38,6 +38,7 @@ TIKTOKEN_CACHE_DIR = Path.home() / ".local/state/mince/tiktoken"
 os.environ["TIKTOKEN_CACHE_DIR"] = str(TIKTOKEN_CACHE_DIR)
 
 import tiktoken
+import json_repair
 from openai import (
     OpenAI,
     APIError,
@@ -89,8 +90,8 @@ DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
 CONFIG_FILE = DEFAULT_CONFIG_FILE
 
 DEFAULT_SYSTEM_PROMPT = "You are a concise and technically accurate software engineering assistant."
-DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from the start of each line."
-DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a text block based patch using the provided JSON Schema named `line_replace_manifest` for one or more text files."
+DEFAULT_LINENUM_SYSTEM_PROMPT = "Remove the line number and single space from the start of each line when using file context from `<files>`."
+DEFAULT_PATCH_SYSTEM_PROMPT = "Generate a text block based patch using the provided JSON Schema named `line_replace_manifest` for one or more text files. Ensure file patches are grouped together."
 DEFAULT_PLAN_SYSTEM_PROMPT = "Create a clear, self-contained AI prompt for the next step and design it only for the provided context and task. Return only the prompt, without commentary or code fences."
 DEFAULT_SHELL_SYSTEM_PROMPT = (
     "Generate safe, necessary shell commands for the task. Return commands "
@@ -113,10 +114,11 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "`<agent_tool_json_schemas>` context contains the JSON schemas for the "
     "available controller tool calls. Available tools are `patch`, `shell`, "
     "`readfile`, `meta_task_list`, `agent`, `session`, and "
-    "`meta_context_control`. `patch` directly accepts the `patch` JSON schema, "
+    "`meta_context_control`. `patch` directly accepts the 'patch' JSON schema, "
     "applies its file modification manifest, and automatically appends a "
-    "`readfile` companion call for every document in the manifest. `shell` "
-    "directly accepts the `shell_commands` schema and generates commands for "
+    "`readfile` companion call for every document in the manifest. Always use `patch` "
+    "when modifying files or creating new files. "
+    "`shell` directly accepts the `shell_commands` schema and generates commands for "
     "review and execution. Every shell command requires a concise, non-empty "
     "reason. Use a lines array only when the command needs standard input; its "
     "entries are sent in order. `readfile` accepts one or more file paths and "
@@ -126,7 +128,7 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "applies an ordered batch of add, change, and remove operations to the "
     "persistent task list. Add tasks using tasks. Change operations require a "
     "task number and a status, and only change that status. Tasks have status "
-    "values todo, done, or skip, displayed as [todo], [done], or [skip]. "
+    "values displayed as [todo], [done], or [skip]. "
     "Remove operations require a non-empty numbers array of task integers. "
     "Keep incomplete tasks and update statuses whenever progress changes. "
     "Numbers refer to the task list before each operation, and removals "
@@ -167,6 +169,8 @@ DEFAULT_PROMPT_LIBRARY_REFERENCES: dict[str, str] = {
     "shell_system_prompt": "./mce_shell.md",
     "agent_system_prompt": "./mce_agent.md",
 }
+DEFAULT_AGENT_CONTEXT_EXPIRES = (12, 6, 24)
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.6-luna",
     "api_key": "",
@@ -183,6 +187,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "plan_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["plan_system_prompt"],
     "shell_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["shell_system_prompt"],
     "agent_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["agent_system_prompt"],
+    "agent_context_expires": " ".join(str(value) for value in DEFAULT_AGENT_CONTEXT_EXPIRES),
     "system_prompt_with_task": "off",
     "line_numbers": "on",
     "prompt_expansion": "off",
@@ -206,6 +211,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_file_size_kb": 512,
     "files": "",
     "response_format": "text",
+    "response_json_repair": "off",
     "stream": "off",
     "response_verbosity": "off",
     "llm_timeout": 300,
@@ -464,17 +470,6 @@ def _inherit_profile_name(
         ) from exc
 
 
-def _read_config_document_for_merge(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"cannot read configuration file {path} ({exc})") from exc
-    if not isinstance(raw, dict):
-        raise ValueError(f"configuration file {path} must contain a JSON object")
-    return raw
-
 
 def _merged_config_from_path(
     path: Path,
@@ -486,7 +481,7 @@ def _merged_config_from_path(
     active_paths.add(resolved_path)
     try:
         config = DEFAULT_CONFIG.copy()
-        raw = _read_config_document_for_merge(path)
+        raw = read_config_document(path, missing_ok=True)
         parent_name = _inherit_profile_name(raw, path)
         if parent_name is not None:
             parent_path = get_profile_path(parent_name)
@@ -587,10 +582,7 @@ def save_config(config: dict[str, Any]) -> None:
         output_config = DEFAULT_CONFIG.copy()
         output_config.update(migrated_config)
 
-    CONFIG_FILE.write_text(
-        json.dumps(output_config, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    write_config_document(CONFIG_FILE, output_config)
 
 PROMPT_TYPE_ALIASES: dict[str, str] = {
     "system": "system_prompt",
@@ -638,10 +630,10 @@ def validate_session_name(name: str) -> str:
         raise ValueError("invalid session name")
     return name
 
-def next_state_turn_index(state_session_dir: Path) -> int:
+def state_turn_directories(state_session_dir: Path) -> list[tuple[int, Path]]:
     if not state_session_dir.is_dir():
-        return 0
-    turn_numbers: list[int] = []
+        return []
+    turn_dirs: list[tuple[int, Path]] = []
     for entry in state_session_dir.iterdir():
         if not entry.is_dir() or entry.is_symlink():
             continue
@@ -650,8 +642,15 @@ def next_state_turn_index(state_session_dir: Path) -> int:
         except ValueError:
             continue
         if turn >= 0:
-            turn_numbers.append(turn)
-    return max(turn_numbers, default=-1) + 1
+            turn_dirs.append((turn, entry))
+    return turn_dirs
+
+
+def next_state_turn_index(state_session_dir: Path) -> int:
+    return max(
+        (turn for turn, _ in state_turn_directories(state_session_dir)),
+        default=-1,
+    ) + 1
 
 def last_completed_state_turn(
     state_session_dir: Path,
@@ -676,18 +675,10 @@ def last_completed_state_turn(
                 f"{state_session_dir}"
             )
         return turn_dir
-    turn_dirs: list[tuple[int, Path]] = []
-    for entry in state_session_dir.iterdir():
-        if not entry.is_dir() or entry.is_symlink():
-            continue
-        try:
-            turn = int(entry.name)
-        except ValueError:
-            continue
-        if turn >= 0:
-            turn_dirs.append((turn, entry))
     for _, turn_dir in sorted(
-        turn_dirs, key=lambda item: item[0], reverse=True
+        state_turn_directories(state_session_dir),
+        key=lambda item: item[0],
+        reverse=True,
     ):
         if (turn_dir / required_file).is_file():
             return turn_dir
@@ -832,7 +823,10 @@ def handle_state_print_json(values: list[str]) -> int:
         return 1
     return 0
 
-def handle_shell_session_print_json(values: list[str]) -> int:
+def handle_shell_session_print_json(
+    values: list[str],
+    response_json_repair: bool = False,
+) -> int:
     try:
         if len(values) not in (1, 2):
             raise ValueError(
@@ -861,7 +855,7 @@ def handle_shell_session_print_json(values: list[str]) -> int:
             requested_turn,
         )
         response = read_state_artifact(turn_dir / 'response')
-        response_json = json.loads(clean_json_response(response))
+        response_json = parse_json_response(response, response_json_repair)
         if not isinstance(response_json, dict):
             raise ValueError('shell session response must be a JSON object')
         print(json.dumps(response_json, indent=2, ensure_ascii=False))
@@ -1054,27 +1048,22 @@ def load_reused_session_shell_turn(
 def load_reused_session_shell_command_turn(
     state_session_dir: Path,
     turn: int | None = None,
+    response_json_repair: bool = False,
 ) -> ReusedShellTurn:
     selected_turn_dir = last_completed_state_turn(
         state_session_dir,
         turn,
     )
     selected_turn = int(selected_turn_dir.name)
-    candidate_turns: list[int] = []
-    for entry in state_session_dir.iterdir():
-        if not entry.is_dir() or entry.is_symlink():
-            continue
-        try:
-            candidate_turn = int(entry.name)
-        except ValueError:
-            continue
-        response_path = entry / "response"
+    candidate_turns = [
+        candidate_turn
+        for candidate_turn, entry in state_turn_directories(state_session_dir)
         if (
-            0 <= candidate_turn <= selected_turn
-            and response_path.is_file()
-            and not response_path.is_symlink()
-        ):
-            candidate_turns.append(candidate_turn)
+            candidate_turn <= selected_turn
+            and (entry / "response").is_file()
+            and not (entry / "response").is_symlink()
+        )
+    ]
 
     for candidate_turn in sorted(candidate_turns, reverse=True):
         try:
@@ -1083,7 +1072,7 @@ def load_reused_session_shell_command_turn(
                 candidate_turn,
             )
             commands, _ = parse_reused_shell_response(
-                shell_turn.response
+                shell_turn.response, response_json_repair
             )
         except ValueError:
             continue
@@ -1659,7 +1648,6 @@ AGENT_PROFILE_BUILTIN_SCHEMAS: dict[str, dict[str, Any]] = {
 AGENT_PROFILE_TYPES = (
     "custom",
     *AGENT_PROFILE_BUILTIN_SCHEMAS,
-    "text",
 )
 AGENT_PROFILE_LEGACY_TYPE_ALIASES = {"schema": "custom"}
 AGENT_PROFILE_DIRECTORY = APP_DIR / "agents"
@@ -1759,13 +1747,9 @@ def read_agent_profile_with_document(
             f"agent profile description must be a string: {path}"
         )
     profile_type = normalize_agent_profile_type(profile_type_value)
-    if (
-        "content" not in document
-        and profile_type in ("text", "custom")
-    ):
+    if "content" not in document and profile_type == "custom":
         raise ValueError(
-            "text and custom agent profiles must contain content: "
-            f"{path}"
+            f"custom agent profiles must contain content: {path}"
         )
     return (
         AgentProfile(
@@ -1848,10 +1832,7 @@ def resolved_agent_profile_content(profile: AgentProfile) -> str:
 
 def agent_profile_response_schema(
     profile: AgentProfile,
- ) -> dict[str, Any] | None:
-    profile_type = normalize_agent_profile_type(profile.profile_type)
-    if profile_type == "text":
-        return None
+ ) -> dict[str, Any]:
     try:
         response_schema = json.loads(
             resolved_agent_profile_content(profile)
@@ -1883,23 +1864,40 @@ def agent_profile_tool_name(name: str) -> str:
     return f"agent_{validate_agent_profile_name(name)}"
 
 
-def agent_agent_tool_schema(profile: AgentProfile) -> dict[str, Any]:
+def agent_agent_tool_schema(
+    profile: AgentProfile,
+    expires_schema: dict[str, Any] | None = None,
+ ) -> dict[str, Any]:
+    parameters = AGENT_AGENT_CALL_ARGUMENT_SCHEMA
+    if expires_schema is not None:
+        parameters = agent_tool_argument_schema(parameters, expires_schema)
     return {
         "type": "function",
         "name": agent_profile_tool_name(profile.name),
         "description": f"Agent profile '{profile.name}'.",
-        "parameters": AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
+        "parameters": parameters,
         "strict": True,
     }
 
 
 def agent_tool_schemas(
     profiles: tuple[AgentProfile, ...] = (),
-) -> list[dict[str, Any]]:
-    schemas = list(AGENT_TOOL_SCHEMAS)
+    expires_schema: dict[str, Any] | None = None,
+ ) -> list[dict[str, Any]]:
+    schemas = [
+        {
+            **schema,
+            "parameters": agent_tool_argument_schema(
+                schema["parameters"], expires_schema
+            ),
+        }
+        if expires_schema is not None and schema["name"] != AGENT_META_TASK_LIST_TOOL
+        else schema
+        for schema in AGENT_TOOL_SCHEMAS
+    ]
     tool_names = {schema["name"] for schema in schemas}
     for profile in profiles:
-        schema = agent_agent_tool_schema(profile)
+        schema = agent_agent_tool_schema(profile, expires_schema)
         if schema["name"] in tool_names:
             raise ValueError(
                 f"duplicate agent tool name: {schema['name']}"
@@ -2163,6 +2161,8 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
 
     if canonical_name == "patch_branch":
         return name, parse_patch_branch_value(raw_value)
+    if canonical_name == "agent_context_expires":
+        return name, normalize_agent_context_expires(raw_value)
     if canonical_name == "retry":
         return name, parse_retry_count(raw_value)
     expected = (
@@ -2256,15 +2256,11 @@ def prompt_config_value(
 ) -> None:
     current = config.get(key)
 
-    if mask and isinstance(current, str) and current:
-        if len(current) > 8:
-            # Show first 4, asterisks for the middle, last 4.
-            masked = f"{current[:4]}{'*' * (len(current) - 8)}{current[-4:]}"
-        else:
-            # Very short keys – just hide everything.
-            masked = "*" * len(current)
-    else:
-        masked = current
+    masked = (
+        mask_api_key(current)
+        if mask and isinstance(current, str) and current
+        else current
+    )
     value = input(f"{label} [{masked}]: ").strip()
 
     if not value:
@@ -2321,6 +2317,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
     prompt_config_value(config, "shell_system_prompt", "System prompt for shell command mode")
     prompt_config_value(config, "agent_system_prompt", "System prompt for agent mode")
+    prompt_config_value(config, "agent_context_expires", "Agent context expiry (DEFAULT [MIN] [MAX])", normalize_agent_context_expires)
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "shell", "Shell mode (off, on)")
@@ -2333,6 +2330,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0 or off)")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0 or off)")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
+    prompt_config_value(config, "response_json_repair", "Repair JSON responses (off, on)")
     prompt_config_value(config, "stream", "Streaming text responses (off, on)")
     prompt_config_value(config, "reasoning", "Reasoning (off, none, minimal, low, medium, high, xhigh, max)")
     prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
@@ -2535,17 +2533,11 @@ def append_suffix_to_path(original_path: Path, suffix: str) -> Path:
 
 def git_repository_root(cwd: Path | None = None) -> Path | None:
     working_directory = cwd or Path.cwd()
-    try:
-        completed = subprocess.run(
-            ['git', 'rev-parse', '--show-toplevel'],
-            cwd=working_directory,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise ValueError('git executable was not found') from exc
+    completed = run_git_command(
+        working_directory,
+        ['rev-parse', '--show-toplevel'],
+        check=False,
+    )
     if completed.returncode != 0:
         return None
     output = completed.stdout.strip()
@@ -2653,25 +2645,26 @@ def git_relative_path(repo_root: Path, path: Path) -> str:
         raise ValueError(f'patch path is not a worktree file: {path}')
     return relative_path.as_posix()
 
+def git_commit_uncommitted_patch_branch(
+    repo_root: Path,
+    branch_name: str,
+ ) -> None:
+    uncommitted_status = run_git_command(
+        repo_root,
+        ['status', '--porcelain=v1', '--untracked-files=no'],
+    ).stdout.strip()
+    if uncommitted_status:
+        run_git_command(
+            repo_root,
+            ['commit', '-a', '-m', f'Uncommitted {branch_name} changes.'],
+        )
+
+
 def prepare_patch_branch(repo_root: Path, branch_name: str) -> None:
-    branch_name = resolve_patch_branch_name(branch_name)
     branch_name = validate_git_branch_name(repo_root, branch_name)
     if git_branch_exists(repo_root, branch_name):
         if git_current_branch(repo_root) == branch_name:
-            uncommitted_status = run_git_command(
-                repo_root,
-                ['status', '--porcelain=v1', '--untracked-files=no'],
-            ).stdout.strip()
-            if uncommitted_status:
-                run_git_command(
-                    repo_root,
-                    [
-                        'commit',
-                        '-a',
-                        '-m',
-                        f'Uncommitted {branch_name} changes.',
-                    ],
-                )
+            git_commit_uncommitted_patch_branch(repo_root, branch_name)
         else:
             git_worktree_is_clean(repo_root)
             run_git_command(repo_root, ['switch', '--', branch_name])
@@ -2722,20 +2715,7 @@ def handle_patch_merge(branch_name: str, commit_message: str) -> int:
         if current_branch is None:
             raise ValueError('patch merge requires a checked-out branch')
         if current_branch == branch_name:
-            uncommitted_status = run_git_command(
-                repo_root,
-                ['status', '--porcelain=v1', '--untracked-files=no'],
-            ).stdout.strip()
-            if uncommitted_status:
-                run_git_command(
-                    repo_root,
-                    [
-                        'commit',
-                        '-a',
-                        '-m',
-                        f"Uncommitted {branch_name} changes.",
-                    ],
-                )
+            git_commit_uncommitted_patch_branch(repo_root, branch_name)
             run_git_command(repo_root, ['switch', '-'])
             current_branch = git_current_branch(repo_root)
             if current_branch is None:
@@ -2905,9 +2885,6 @@ def normalize_shell_commands(values: Any) -> list[ShellStep]:
     ]
 
 
-def _parse_shell_response_json(raw: str) -> Any:
-    return json.loads(clean_json_response(raw))
-
 
 def _parse_shell_manifest_value(manifest: Any) -> list[ShellStep]:
     if not isinstance(manifest, dict):
@@ -2917,8 +2894,13 @@ def _parse_shell_manifest_value(manifest: Any) -> list[ShellStep]:
     return normalize_shell_commands(manifest["commands"])
 
 
-def parse_shell_manifest(raw: str) -> list[ShellStep]:
-    return _parse_shell_manifest_value(_parse_shell_response_json(raw))
+def parse_shell_manifest(
+    raw: str,
+    response_json_repair: bool = False,
+) -> list[ShellStep]:
+    return _parse_shell_manifest_value(
+        parse_json_response(raw, response_json_repair)
+    )
 
 
 def _parse_shell_followup_value(
@@ -2948,14 +2930,18 @@ def _parse_shell_followup_value(
 
 def parse_shell_followup_response(
     raw: str,
- ) -> tuple[str, list[ShellStep] | None, str | None]:
-    return _parse_shell_followup_value(_parse_shell_response_json(raw))
+    response_json_repair: bool = False,
+) -> tuple[str, list[ShellStep] | None, str | None]:
+    return _parse_shell_followup_value(
+        parse_json_response(raw, response_json_repair)
+    )
 
 
 def parse_reused_shell_response(
     raw: str,
- ) -> tuple[list[ShellStep] | None, str | None]:
-    response = _parse_shell_response_json(raw)
+    response_json_repair: bool = False,
+) -> tuple[list[ShellStep] | None, str | None]:
+    response = parse_json_response(raw, response_json_repair)
     if isinstance(response, dict) and "action" in response:
         action, commands, reason = _parse_shell_followup_value(response)
         if action == "session_end":
@@ -2975,12 +2961,15 @@ def shell_heredoc_delimiter(lines: tuple[str, ...]) -> str:
     return delimiter
 
 
-def format_shell_commands(commands: list[ShellStep]) -> str:
+def format_shell_commands(
+    commands: list[ShellStep],
+    include_reasons: bool = True,
+ ) -> str:
     blocks: list[str] = []
     for index, step in enumerate(commands, start=1):
         reason_prefix = (
             f"{step.reason}\n"
-            if step.reason
+            if include_reasons and step.reason
             else ""
         )
         if step.lines:
@@ -2996,21 +2985,6 @@ def format_shell_commands(commands: list[ShellStep]) -> str:
     return "\n\n".join(blocks)
 
 
-def format_shell_command_context(commands: list[ShellStep]) -> str:
-    blocks: list[str] = []
-    for index, step in enumerate(commands, start=1):
-        if step.lines:
-            delimiter = shell_heredoc_delimiter(step.lines)
-            block = (
-                f"[{index}] $ {step.command} <<'{delimiter}'\n"
-                + "\n".join(step.lines)
-                + f"\n{delimiter}"
-            )
-        else:
-            block = f"[{index}] $ {step.command}"
-        blocks.append(block)
-    return "\n\n".join(blocks)
-
 def format_shell_command_archive(
     archived_turns: list[ShellTurn],
  ) -> str:
@@ -3020,7 +2994,7 @@ def format_shell_command_archive(
             continue
         turn_blocks.append(
             f"<shell_turn index='{len(turn_blocks) + 1}'>\n"
-            f"{format_shell_command_context(list(turn.commands))}\n"
+            f"{format_shell_commands(list(turn.commands), include_reasons=False)}\n"
             "</shell_turn>"
         )
     return "\n".join(turn_blocks)
@@ -3194,6 +3168,7 @@ def build_shell_followup_prompt(
     shell_output: list[ShellTurn | str] | str,
     json_schema: dict[str, Any] | None = None,
     shell_command_archive: list[ShellTurn] | None = None,
+    include_task: bool = True,
  ) -> str:
     schema_block = ""
     if json_schema is not None:
@@ -3227,10 +3202,10 @@ def build_shell_followup_prompt(
         "</shell_turn>"
         for index, turn in enumerate(output_history, start=1)
     )
+    task_block = f"The task was:\n\n{task}\n\n\n" if include_task else ""
     return (
-        "The task was:\n"
-        f"\n{task}\n\n\n"
-        "The accepted shell commands from each turn have now been executed. "
+        task_block
+        + "The accepted shell commands from each turn have now been executed. "
         "Their actual output is below.\n"
         f"{archive_block}{shell_turn_blocks}\n"
         "Decide whether more commands are needed or end the session. Use "
@@ -3297,15 +3272,10 @@ def build_shell_revision_editor_text(
     previous_task: str = '',
  ) -> str:
     return build_patch_revision_editor_text(
-        format_shell_command_context(commands),
+        format_shell_commands(commands, include_reasons=False),
         previous_task,
     )
 
-
-
-def prefix_line_numbers(text: str) -> str:
-    lines = text.splitlines(keepends=True)
-    return "".join(f"{i} {line}" for i, line in enumerate(lines, start=1))
 
 @dataclass(frozen=True)
 class PatchRange:
@@ -3551,16 +3521,8 @@ def resolve_patch_file_argument(
     state_session_dir = STATE_DIR / session_name
     if turn is not None or state_session_dir.is_dir():
         if option_name == "--patch-file-apply" and state_session_dir.is_dir():
-            for entry in state_session_dir.iterdir():
-                if not entry.is_dir() or entry.is_symlink():
-                    continue
-                try:
-                    applied_turn = int(entry.name)
-                except ValueError:
-                    continue
-                if applied_turn >= 0 and (
-                    entry / "response_schema_patch_applied"
-                ).is_file():
+            for applied_turn, entry in state_turn_directories(state_session_dir):
+                if (entry / "response_schema_patch_applied").is_file():
                     raise ValueError(
                         "response_schema_patch_applied already exists in "
                         f"patch session {state_session_dir}/{applied_turn}"
@@ -4124,7 +4086,7 @@ def resolve_prompt_setting(
     prompt_expansion_enabled: bool,
     strip_configured_result: bool = False,
  ) -> str:
-    if explicit_value:
+    if explicit_value is not None:
         prompt = str(explicit_value).strip()
     elif prompt_file is not None:
         prompt = read_file(prompt_file).strip()
@@ -4135,7 +4097,7 @@ def resolve_prompt_setting(
         )
 
     expanded = expand_prompt_names(prompt, prompt_expansion_enabled)
-    if strip_configured_result and not explicit_value and prompt_file is None:
+    if strip_configured_result and explicit_value is None and prompt_file is None:
         return expanded.strip()
     return expanded
 
@@ -4319,6 +4281,15 @@ def clean_json_response(raw: str) -> str:
     return re.sub(r'^(?:<\|[^|]+\|>).+(?:<\|message\|>)', '', raw).strip()
 
 
+def parse_json_response(
+    raw: str,
+    response_json_repair: bool = False,
+) -> Any:
+    cleaned = clean_json_response(raw)
+    if response_json_repair:
+        return json_repair.loads(cleaned)
+    return json.loads(cleaned)
+
 def pretty_json(raw: Any) -> str:
     try:
         value = json.loads(raw) if isinstance(raw, str) else raw
@@ -4366,7 +4337,7 @@ def append_task_to_system_prompt(
 ) -> str:
     if not enabled or not task:
         return system_prompt
-    return f"{task}\n{system_prompt}"
+    return f"{task}\n{system_prompt}" if system_prompt else task
 
 def build_user_prompt(
     task: str,
@@ -4429,13 +4400,22 @@ AGENT_TOOL_NAMES = (
     "session",
     "meta_context_control",
 )
-AGENT_EXPIRES_IN_TURNS_DEFAULT = 12
-AGENT_EXPIRES_IN_TURNS_SCHEMA: dict[str, Any] = {
-    "type": "integer",
-    "minimum": 6,
-    "maximum": 24,
-    "default": AGENT_EXPIRES_IN_TURNS_DEFAULT,
-}
+AGENT_EXPIRES_IN_TURNS_DEFAULT = DEFAULT_AGENT_CONTEXT_EXPIRES[0]
+
+
+def agent_expires_in_turns_schema(
+    context_expires: tuple[int, int, int] = DEFAULT_AGENT_CONTEXT_EXPIRES,
+ ) -> dict[str, Any]:
+    default, minimum, maximum = context_expires
+    return {
+        "type": "integer",
+        "minimum": minimum,
+        "maximum": maximum,
+        "default": default,
+    }
+
+
+AGENT_EXPIRES_IN_TURNS_SCHEMA: dict[str, Any] = agent_expires_in_turns_schema()
 AGENT_PATCH_TOOL = "patch"
 AGENT_SHELL_TOOL = "shell"
 AGENT_READFILE_TOOL = "readfile"
@@ -4447,14 +4427,15 @@ AGENT_META_CONTEXT_CONTROL_TOOL = "meta_context_control"
 
 def agent_tool_argument_schema(
     schema: dict[str, Any],
-) -> dict[str, Any]:
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+ ) -> dict[str, Any]:
     return {
         **schema,
         "properties": {
             **schema["properties"],
-            "expires_in_turns": AGENT_EXPIRES_IN_TURNS_SCHEMA,
+            "expires_in_turns": expires_schema,
         },
-        "required": [*schema["required"], "expires_in_turns"],
+        "required": list(dict.fromkeys((*schema["required"], "expires_in_turns"))),
     }
 
 
@@ -4622,6 +4603,7 @@ class AgentModelSettings:
     api_log: bool
     retry: int = 2
     explicit_prompt_cache: bool = False
+    response_json_repair: bool = False
  
  
 @dataclass
@@ -4653,7 +4635,9 @@ class AgentRunSettings:
     print_reasoning: bool
     suppress_response_output: bool
     agent_profiles: tuple[AgentProfile, ...] = ()
+    agent_context_expires: tuple[int, int, int] = DEFAULT_AGENT_CONTEXT_EXPIRES
     patch_suffix_argument_provided: bool = False
+    pinned_file_paths: tuple[str, ...] = ()
     initial_turns: tuple[AgentTurn, ...] = ()
     initial_meta_task_list: tuple[dict[str, Any], ...] = ()
     initial_active_context: str = ""
@@ -4678,11 +4662,48 @@ AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR = (
  )
 
 
-def parse_agent_expires_in_turns(value: Any) -> int:
-    if not isinstance(value, int):
-        value = AGENT_EXPIRES_IN_TURNS_SCHEMA["default"]
-    minimum = AGENT_EXPIRES_IN_TURNS_SCHEMA["minimum"]
-    maximum = AGENT_EXPIRES_IN_TURNS_SCHEMA["maximum"]
+def parse_agent_context_expires(value: Any) -> tuple[int, int, int]:
+    parts = value.split() if isinstance(value, str) else value
+    if not isinstance(parts, (list, tuple)) or not 1 <= len(parts) <= 3:
+        raise ValueError(
+            "agent_context_expires requires DEFAULT [MIN] [MAX]"
+        )
+    numbers: list[int] = []
+    for part in parts:
+        if isinstance(part, bool) or not (
+            isinstance(part, int)
+            or isinstance(part, str) and re.fullmatch(r"[0-9]+", part)
+        ):
+            raise ValueError(
+                "agent_context_expires values must be non-negative integers"
+            )
+        numbers.append(int(part))
+    default = numbers[0]
+    minimum = (
+        numbers[1] if len(numbers) > 1 else DEFAULT_AGENT_CONTEXT_EXPIRES[1]
+    )
+    maximum = (
+        numbers[2] if len(numbers) > 2 else DEFAULT_AGENT_CONTEXT_EXPIRES[2]
+    )
+    if not minimum <= default <= maximum:
+        raise ValueError(
+            "agent_context_expires requires MIN <= DEFAULT <= MAX"
+        )
+    return default, minimum, maximum
+
+
+def normalize_agent_context_expires(value: Any) -> str:
+    return " ".join(str(number) for number in parse_agent_context_expires(value))
+
+
+def parse_agent_expires_in_turns(
+    value: Any,
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+ ) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        value = expires_schema["default"]
+    minimum = expires_schema["minimum"]
+    maximum = expires_schema["maximum"]
     if value < minimum:
         return minimum
     if value > maximum:
@@ -4854,11 +4875,12 @@ def apply_agent_meta_task_operations(
     return limit_agent_meta_task_list(updated_tasks)
 
 
-def parse_agent_tool_arguments(
+def _parse_agent_tool_arguments_value(
     tool: str,
     value: Any,
     agent_profiles: tuple[AgentProfile, ...] = (),
-) -> AgentToolCall:
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+ ) -> AgentToolCall:
     profile_name = next(
         (
             profile.name
@@ -4868,32 +4890,16 @@ def parse_agent_tool_arguments(
         None,
     )
     if profile_name is not None:
-        parsed = parse_agent_tool_arguments(AGENT_AGENT_TOOL, value)
-        return AgentToolCall(
-            tool=parsed.tool,
-            reason=parsed.reason,
-            task=parsed.task,
-            context=parsed.context,
-            context_id=parsed.context_id,
-            action=parsed.action,
-            expires_in_turns=parsed.expires_in_turns,
-            profile_name=profile_name,
-            arguments=parsed.arguments,
+        return parse_agent_profile_tool_call(
+            profile_name, value, expires_schema
         )
     if tool not in AGENT_TOOL_NAMES:
         raise ValueError(f"unknown agent tool: {tool}")
     if not isinstance(value, dict):
         raise ValueError(f"agent {tool} arguments must be a JSON object")
     if tool == AGENT_PATCH_TOOL:
-        if set(value) != {
-            "files", "commit_message", "expires_in_turns"
-        }:
-            raise ValueError(
-                "agent patch arguments must contain only files, commit_message, "
-                "and expires_in_turns"
-            )
         expires_in_turns = parse_agent_expires_in_turns(
-            value["expires_in_turns"]
+            value["expires_in_turns"], expires_schema
         )
         if not isinstance(value["files"], list) or not value["files"]:
             raise ValueError(
@@ -4907,7 +4913,7 @@ def parse_agent_tool_arguments(
             raise ValueError(
                 "agent patch arguments require a non-empty commit_message"
             )
-        return AgentToolCall(
+        tool_call = AgentToolCall(
             tool=tool,
             expires_in_turns=expires_in_turns,
             arguments={
@@ -4915,15 +4921,12 @@ def parse_agent_tool_arguments(
                 "commit_message": commit_message,
             },
         )
+        agent_patch_readfile_paths(tool_call)
+        return tool_call
  
     if tool == AGENT_SHELL_TOOL:
-        if set(value) != {"commands", "expires_in_turns"}:
-            raise ValueError(
-                "agent shell arguments must contain only commands and "
-                "expires_in_turns"
-            )
         expires_in_turns = parse_agent_expires_in_turns(
-            value["expires_in_turns"]
+            value["expires_in_turns"], expires_schema
         )
         try:
             _parse_shell_manifest_value({"commands": value["commands"]})
@@ -4936,11 +4939,6 @@ def parse_agent_tool_arguments(
         )
 
     if tool == AGENT_META_TASK_LIST_TOOL:
-        if set(value) - {"expires_in_turns"} != {"operations"}:
-            raise ValueError(
-                "agent meta_task_list arguments must contain only operations; "
-                "expires_in_turns is ignored"
-            )
         try:
             operations = normalize_agent_meta_task_operations(value["operations"])
         except ValueError as exc:
@@ -4953,13 +4951,8 @@ def parse_agent_tool_arguments(
         )
  
     if tool == AGENT_READFILE_TOOL:
-        if set(value) != {"paths", "expires_in_turns"}:
-            raise ValueError(
-                "agent readfile arguments must contain only paths and "
-                "expires_in_turns"
-            )
         expires_in_turns = parse_agent_expires_in_turns(
-            value["expires_in_turns"]
+            value["expires_in_turns"], expires_schema
         )
         paths = value["paths"]
         if not isinstance(paths, list) or not paths:
@@ -4998,7 +4991,7 @@ def parse_agent_tool_arguments(
             "fields (" + "; ".join(details) + ")"
         )
     expires_in_turns = parse_agent_expires_in_turns(
-        value["expires_in_turns"]
+        value["expires_in_turns"], expires_schema
     )
     for name in expected_fields:
         if name == "expires_in_turns":
@@ -5036,6 +5029,53 @@ def parse_agent_tool_arguments(
     return tool_call
 
 
+def parse_agent_tool_arguments(
+    tool: str,
+    value: Any,
+    agent_profiles: tuple[AgentProfile, ...] = (),
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+    response_json_repair: bool = False,
+) -> AgentToolCall:
+    try:
+        if isinstance(value, str):
+            value = parse_agent_response_json(
+                value, f"agent {tool} arguments", response_json_repair
+            )
+        if (
+            isinstance(value, dict)
+            and tool != AGENT_META_TASK_LIST_TOOL
+            and "expires_in_turns" not in value
+        ):
+            value = {**value, "expires_in_turns": expires_schema["default"]}
+        return _parse_agent_tool_arguments_value(
+            tool,
+            value,
+            agent_profiles=agent_profiles,
+            expires_schema=expires_schema,
+        )
+    except AgentControllerResponseError:
+        raise
+    except (ValueError, TypeError, KeyError) as exc:
+        raise AgentControllerResponseError(str(exc)) from exc
+
+
+def parse_agent_profile_tool_call(
+    profile_name: str,
+    value: Any,
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+    response_json_repair: bool = False,
+) -> AgentToolCall:
+    return replace(
+        parse_agent_tool_arguments(
+            AGENT_AGENT_TOOL,
+            value,
+            expires_schema=expires_schema,
+            response_json_repair=response_json_repair,
+        ),
+        profile_name=profile_name,
+    )
+
+
 def normalize_agent_tool_calls(
     tool_calls: list[AgentToolCall],
 ) -> list[AgentToolCall]:
@@ -5049,7 +5089,7 @@ def normalize_agent_tool_calls(
 def normalize_agent_controller_tool_calls(
     tool_calls: list[AgentToolCall],
 ) -> list[AgentToolCall]:
-    if not tool_calls:
+    if not tool_calls or tool_calls[0].tool == AGENT_META_CONTEXT_CONTROL_TOOL:
         raise AgentControllerResponseError(
             AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
         )
@@ -5083,16 +5123,54 @@ def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
             raise ValueError(
                 f"agent patch files entry {index} must be an object"
             )
-        document = file_entry.get("document")
-        if not isinstance(document, dict):
+        if set(file_entry) != {"document", "patches"}:
             raise ValueError(
-                f"agent patch files entry {index} requires a document object"
+                f"agent patch files entry {index} requires document and patches"
             )
-        path = document.get("path")
-        if not isinstance(path, str) or not path.strip():
+        document = file_entry["document"]
+        if not isinstance(document, dict) or set(document) != {
+            "path", "encoding", "line_ending"
+        }:
+            raise ValueError(
+                f"agent patch files entry {index} requires document metadata"
+            )
+        path = document["path"]
+        if not isinstance(path, str) or not path.strip() or "\x00" in path:
             raise ValueError(
                 f"agent patch files entry {index} document requires a path"
             )
+        if document["encoding"] != "utf-8":
+            raise ValueError("agent patch document encoding must be utf-8")
+        if document["line_ending"] not in ("lf", "crlf"):
+            raise ValueError("agent patch document line_ending must be lf or crlf")
+        patches = file_entry["patches"]
+        if not isinstance(patches, list) or not patches:
+            raise ValueError(
+                f"agent patch files entry {index} requires a non-empty patches array"
+            )
+        for patch_index, patch in enumerate(patches, start=1):
+            label = f"agent patch files entry {index} patch {patch_index}"
+            for field in ("block_id", "summary_message"):
+                if not isinstance(patch[field], str) or not patch[field].strip():
+                    raise ValueError(f"{label} requires a non-empty {field}")
+            content_lines = patch["content_line_array"]
+            if not isinstance(content_lines, list) or any(
+                not isinstance(line, str) or "\r" in line or "\n" in line
+                for line in content_lines
+            ):
+                raise ValueError(
+                    f"{label} content_line_array must contain strings without line endings"
+                )
+        total_lines = max(
+            (
+                patch["end_line"]
+                for patch in patches
+                if isinstance(patch["end_line"], int)
+                and not isinstance(patch["end_line"], bool)
+            ),
+            default=0,
+        )
+        validate_patch_ranges(patches, total_lines)
         paths.append(path.strip())
     return paths
 
@@ -5101,21 +5179,24 @@ def append_agent_patch_readfile_tool_calls(
     tool_calls: list[AgentToolCall],
 ) -> list[AgentToolCall]:
     appended_tool_calls: list[AgentToolCall] = []
-    for tool_call in tool_calls:
+    for index, tool_call in enumerate(tool_calls, start=1):
         appended_tool_calls.append(tool_call)
         if tool_call.tool != AGENT_PATCH_TOOL:
             continue
+        try:
+            paths = agent_patch_readfile_paths(tool_call)
+        except ValueError as exc:
+            raise AgentControllerResponseError(
+                f"agent tool call {index}: {exc}"
+            ) from exc
         appended_tool_calls.append(
             AgentToolCall(
                 tool=AGENT_READFILE_TOOL,
                 expires_in_turns=tool_call.expires_in_turns,
-                arguments={
-                    "paths": agent_patch_readfile_paths(tool_call),
-                },
+                arguments={"paths": paths},
             )
         )
     return appended_tool_calls
-
 
 def is_agent_patch_readfile_companion(
     patch_tool_call: AgentToolCall,
@@ -5133,16 +5214,79 @@ def is_agent_patch_readfile_companion(
     except ValueError:
         return False
 
-def response_agent_tool_calls(
-    response_obj: Any,
-    agent_profiles: tuple[AgentProfile, ...] = (),
-) -> list[AgentToolCall]:
+def agent_response_output_text(response_obj: Any) -> str:
     output_text_value = (
         response_obj.get("output_text", "")
         if isinstance(response_obj, dict)
         else getattr(response_obj, "output_text", "")
     )
-    output_text = str(output_text_value or "")
+    return str(output_text_value or "")
+
+
+def parse_agent_response_json(
+    raw: str,
+    label: str,
+    response_json_repair: bool = False,
+) -> Any:
+    try:
+        value = parse_json_response(raw, response_json_repair)
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError) as exc:
+        raise AgentControllerResponseError(
+            f"{label} must be valid JSON: {exc}"
+        ) from exc
+    return value
+
+
+def normalize_agent_json_response(
+    raw: str,
+    json_schema: dict[str, Any] | None = None,
+    response_json_repair: bool = False,
+) -> str:
+    if not isinstance(raw, str):
+        raise AgentControllerResponseError("agent JSON response must be text")
+    response = clean_json_response(raw)
+    if not response:
+        raise AgentControllerResponseError(
+            "agent JSON response cannot be empty"
+        )
+    value = parse_agent_response_json(
+        response, "agent JSON response", response_json_repair
+    )
+    if json_schema is not None:
+        schema = json_schema.get("schema")
+        expected_type = schema.get("type") if isinstance(schema, dict) else None
+        expected_types: dict[str, Any] = {
+            "object": dict,
+            "array": list,
+            "string": str,
+            "boolean": bool,
+            "integer": int,
+            "number": (int, float),
+            "null": type(None),
+        }
+        if isinstance(expected_type, str) and expected_type in expected_types:
+            if (
+                not isinstance(value, expected_types[expected_type])
+                or expected_type in ("integer", "number")
+                and isinstance(value, bool)
+            ):
+                raise AgentControllerResponseError(
+                    f"agent JSON response must contain a JSON {expected_type}"
+                )
+    if response_json_repair:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+    return response
+
+
+def response_agent_tool_calls(
+    response_obj: Any,
+    agent_profiles: tuple[AgentProfile, ...] = (),
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+    error_logger: Any = None,
+    response_json_repair: bool = False,
+) -> list[AgentToolCall]:
+    output_text = agent_response_output_text(response_obj)
     if output_text.strip():
         raise AgentControllerResponseError(
             AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
@@ -5153,7 +5297,9 @@ def response_agent_tool_calls(
         else getattr(response_obj, "output", [])
     )
     if not isinstance(output_items, (list, tuple)):
-        raise ValueError("agent controller response output must be an array")
+        raise AgentControllerResponseError(
+            "agent controller response output must be an array"
+        )
     tool_calls: list[AgentToolCall] = []
     for item in output_items:
         item_type = (
@@ -5178,29 +5324,25 @@ def response_agent_tool_calls(
             if isinstance(item, dict)
             else getattr(item, "arguments", None)
         )
-        if isinstance(arguments, str):
-            try:
-                argument_value = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"agent {tool} arguments must be valid JSON"
-                ) from exc
-        elif isinstance(arguments, dict):
-            argument_value = arguments
-        else:
-            raise ValueError(f"agent {tool} arguments must be JSON")
         try:
-            tool_calls.append(
-                parse_agent_tool_arguments(
-                    str(tool or ""),
-                    argument_value,
-                    agent_profiles,
-                )
+            tool_call = parse_agent_tool_arguments(
+                tool,
+                arguments,
+                agent_profiles=agent_profiles,
+                expires_schema=expires_schema,
+                response_json_repair=response_json_repair,
             )
-        except ValueError as exc:
-            raise ValueError(
-                f"agent tool call {len(tool_calls) + 1}: {exc}"
-            ) from exc
+        except AgentControllerResponseError as exc:
+            message = f"ERROR: Failed to parse agent {tool} arguments: {exc}"
+            failure_message = (
+                f"{message}\n"
+                f"Response: {pretty_json(arguments)}"
+            )
+            if VERBOSE:
+                print(message, file=sys.stderr)
+            _log_api_request_event(error_logger, failure_message)
+            continue
+        tool_calls.append(tool_call)
     return append_agent_patch_readfile_tool_calls(
         normalize_agent_controller_tool_calls(tool_calls)
     )
@@ -5300,7 +5442,6 @@ def format_agent_patch_manifest(manifest: dict[str, Any]) -> str:
             file_entry["patches"],
             start=1,
         ):
-            replacement = "\n".join(patch["content_line_array"])
             patch_blocks.append(
                 f"  Change {patch_index}: lines {patch['start_line']}-"
                 f"{patch['end_line']}\n"
@@ -5490,17 +5631,6 @@ def agent_file_context_section(
     )
 
 
-def agent_readfile_context_section(
-    section: str,
-    expires_in_turns: int,
-    turn: int = AGENT_INITIAL_FILE_CONTEXT_TURN,
-) -> str:
-    return agent_file_context_section(
-        section,
-        expires_in_turns,
-        turn,
-    )
-
 
 def format_agent_readfile_contexts(
     turns: list[AgentTurn],
@@ -5513,7 +5643,7 @@ def format_agent_readfile_contexts(
             continue
         for _, section in turn.readfile_contexts or ():
             sections.append(
-                agent_readfile_context_section(
+                agent_file_context_section(
                     section,
                     turn.expires_in_turns,
                     turn_number,
@@ -5724,9 +5854,10 @@ def agent_context_file_sections(
 
 def agent_file_context_expirations(
     file_contexts: list[tuple[str, str]],
-) -> dict[str, int]:
+    default: int = AGENT_EXPIRES_IN_TURNS_DEFAULT,
+ ) -> dict[str, int]:
     return {
-        path: AGENT_EXPIRES_IN_TURNS_DEFAULT
+        path: default
         for path, _ in file_contexts
     }
 
@@ -5891,7 +6022,7 @@ def remove_agent_history_turn_file_contexts(
                 turn_number,
             )
             or agent_file_context_matches_turn(
-                agent_readfile_context_section(
+                agent_file_context_section(
                     context_section[1],
                     turn.expires_in_turns,
                     turn_number,
@@ -5985,7 +6116,10 @@ def load_reused_agent_readfile_contexts(
     return parse_agent_readfile_contexts(output)
 
 
-def parse_reused_agent_tool_call_value(value: Any) -> AgentToolCall:
+def parse_reused_agent_tool_call_value(
+    value: Any,
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+ ) -> AgentToolCall:
     if not isinstance(value, dict):
         raise ValueError("reused agent response must contain a JSON object")
     tool_name = value.get("tool")
@@ -6010,27 +6144,22 @@ def parse_reused_agent_tool_call_value(value: Any) -> AgentToolCall:
             raise ValueError(
                 f"reused agent profile tool has an invalid name: {tool_name}"
             ) from exc
-        parsed = parse_agent_tool_arguments(
-            AGENT_AGENT_TOOL, arguments
+        return parse_agent_profile_tool_call(
+            profile_name, arguments, expires_schema
         )
-        return AgentToolCall(
-            tool=parsed.tool,
-            reason=parsed.reason,
-            task=parsed.task,
-            context=parsed.context,
-            context_id=parsed.context_id,
-            action=parsed.action,
-            expires_in_turns=parsed.expires_in_turns,
-            profile_name=profile_name,
-            arguments=parsed.arguments,
-        )
-    return parse_agent_tool_arguments(tool_name, arguments)
+    return parse_agent_tool_arguments(
+        tool_name, arguments, expires_schema=expires_schema
+    )
 
 
-def parse_reused_agent_tool_calls(response: str) -> list[AgentToolCall]:
+def parse_reused_agent_tool_calls(
+    response: str,
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+    response_json_repair: bool = False,
+) -> list[AgentToolCall]:
     try:
-        value = json.loads(clean_json_response(response))
-    except json.JSONDecodeError as exc:
+        value = parse_json_response(response, response_json_repair)
+    except (ValueError, TypeError) as exc:
         raise ValueError(
             "reused agent response must contain a JSON tool call"
         ) from exc
@@ -6048,7 +6177,7 @@ def parse_reused_agent_tool_calls(response: str) -> list[AgentToolCall]:
         tool_call_values = [value]
     return normalize_agent_tool_calls(
         [
-            parse_reused_agent_tool_call_value(tool_call_value)
+            parse_reused_agent_tool_call_value(tool_call_value, expires_schema)
             for tool_call_value in tool_call_values
         ]
     )
@@ -6098,27 +6227,22 @@ def parse_reused_agent_tool_outputs(
 def load_reused_session_agent_history(
     state_session_dir: Path,
     turn: int | None = None,
+    expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
+    response_json_repair: bool = False,
 ) -> ReusedAgentHistory:
     selected_turn_dir = last_completed_state_turn(
         state_session_dir, turn
     )
     selected_turn = int(selected_turn_dir.name)
-    turn_directories: list[tuple[int, Path]] = []
-    for entry in state_session_dir.iterdir():
-        if not entry.is_dir() or entry.is_symlink():
-            continue
-        try:
-            turn_number = int(entry.name)
-        except ValueError:
-            continue
-        response_path = entry / "response"
+    turn_directories = [
+        (turn_number, entry)
+        for turn_number, entry in state_turn_directories(state_session_dir)
         if (
-            0 <= turn_number <= selected_turn
-            and response_path.is_file()
-            and not response_path.is_symlink()
-        ):
-            turn_directories.append((turn_number, entry))
-
+            turn_number <= selected_turn
+            and (entry / "response").is_file()
+            and not (entry / "response").is_symlink()
+        )
+    ]
     turns: list[AgentTurn] = []
     active_task = ""
     active_context = ""
@@ -6129,7 +6253,11 @@ def load_reused_session_agent_history(
         response = read_state_artifact(response_path)
         turn_unix_time = state_artifact_last_modified_time(response_path)
         try:
-            tool_calls = parse_reused_agent_tool_calls(response)
+            tool_calls = parse_reused_agent_tool_calls(
+                response,
+                expires_schema,
+                response_json_repair,
+            )
         except ValueError as exc:
             if turn_number == selected_turn:
                 raise ValueError(
@@ -6237,12 +6365,13 @@ def reused_agent_context_pins(
     file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
     file_expires_in_turns: dict[str, int] | None = None,
+    initial_pinned_paths: set[str] | None = None,
 ) -> tuple[set[str], set[int]]:
     if file_expires_in_turns is None:
         file_expires_in_turns = agent_file_context_expirations(
             file_contexts
         )
-    pinned_paths: set[str] = set()
+    pinned_paths = set(initial_pinned_paths or ())
     pinned_turn_numbers: set[int] = set()
     replayed_turns: list[AgentTurn] = []
     for turn_number, turn in enumerate(turns, start=1):
@@ -6574,9 +6703,6 @@ def run_agent_hook_context_scripts(
     return tuple(hook_contents)
 
 
-def agent_review_usage() -> str:
-    return "Usage: [y]es, [n]o, [p]ager, [h]elp, [e]dit, E <prompt>"
-
 
 def review_agent_tool_calls(
     tool_calls: list[AgentToolCall],
@@ -6594,16 +6720,13 @@ def review_agent_tool_calls(
     print()
     print(tool_text)
     while True:
-        choice = input(
-            "Run these agent tool calls? [y/n/p/h/e/E <prompt>]: "
-        ).strip()
+        choice = process_shell_review_input(
+            input("Run these agent tool calls? [y/n/p/h/e/E <prompt>]: "),
+            tool_text,
+        )
+        if choice is None:
+            continue
         normalized_choice = choice.lower()
-        if not choice or normalized_choice == "h":
-            print(agent_review_usage())
-            continue
-        if normalized_choice == "p":
-            page_or_print(tool_text)
-            continue
         if normalized_choice in ("y", "yes"):
             return "accept", None
         if normalized_choice in ("n", "no"):
@@ -6622,12 +6745,6 @@ def review_agent_tool_calls(
             continue
         print("Please answer y, n, p, h, e, or E followed by a prompt.")
 
-
-def review_agent_tool_call(
-    tool_call: AgentToolCall,
-    accept_automatically: bool,
- ) -> tuple[str, str | None]:
-    return review_agent_tool_calls([tool_call], accept_automatically)
 
 
 def emit_agent_auto_tool_call(
@@ -6759,6 +6876,8 @@ def request_agent_model(
     start_time = time.perf_counter()
     model_settings = settings.model_settings
     parsed_tool_calls: tuple[AgentToolCall, ...] = ()
+    response_failures = 0
+    error_logger = lambda event: append_agent_log(settings, event)
     try:
         while True:
             try:
@@ -6786,7 +6905,7 @@ def request_agent_model(
                     retry=model_settings.retry,
                     safety_identifier=model_settings.safety_identifier,
                     store=model_settings.api_log,
-                    error_logger=lambda event: append_agent_log(settings, event),
+                    error_logger=error_logger,
                     tools=tools,
                     tool_choice="required" if tools else None,
                     parallel_tool_calls=True if tools else None,
@@ -6796,13 +6915,39 @@ def request_agent_model(
                         response_agent_tool_calls(
                             response_obj,
                             settings.agent_profiles,
+                            agent_expires_in_turns_schema(
+                                settings.agent_context_expires
+                            ),
+                            error_logger=error_logger,
+                            response_json_repair=model_settings.response_json_repair,
                         )
                     )
-                    response = format_agent_tool_calls(list(parsed_tool_calls))
+                    try:
+                        response = format_agent_tool_calls(list(parsed_tool_calls))
+                    except (TypeError, ValueError, KeyError, UnicodeError, RecursionError, OverflowError) as exc:
+                        raise AgentControllerResponseError(
+                            f"agent tool calls could not be serialized: {exc}"
+                        ) from exc
+                    parse_agent_response_json(response, "agent tool calls")
                 else:
-                    response = str(getattr(response_obj, "output_text", "") or "")
+                    response = agent_response_output_text(response_obj)
+                    if json_schema is not None:
+                        response = normalize_agent_json_response(
+                            response,
+                            json_schema,
+                            model_settings.response_json_repair,
+                        )
                 reasoning = response_reasoning_text(response_obj)
-            except AgentControllerResponseError:
+            except AgentControllerResponseError as exc:
+                response_failures += 1
+                failure_message = (
+                    "ERROR: Agent response failed "
+                    f"(attempt {response_failures}/{model_settings.retry + 1}): {exc}"
+                )
+                print(failure_message, file=sys.stderr)
+                _log_api_request_event(error_logger, failure_message)
+                if response_failures > model_settings.retry:
+                    raise
                 continue
             break
     except Exception as exc:
@@ -6871,8 +7016,6 @@ def run_agent_profile_tool(
             worker_system_prompt += "\n" + settings.patch_system_prompt
         elif profile_type == "shell":
             worker_system_prompt += "\n" + settings.shell_system_prompt
-        elif profile_type == "text" and profile.content.strip():
-            worker_system_prompt += "\n" + profile.content.strip()
         if profile.description.strip():
             worker_system_prompt += "\n" + profile.description.strip()
         worker_system_prompt = append_task_to_system_prompt(
@@ -6888,7 +7031,7 @@ def run_agent_profile_tool(
         worker_user_prompt = build_user_prompt(
             task=task,
             context=settings.context,
-            response_format=("schema" if response_schema is not None else "text"),
+            response_format="schema",
             json_schema=response_schema,
             include_task=not settings.system_prompt_with_task,
             additional_prompt=worker_context,
@@ -6905,10 +7048,6 @@ def run_agent_profile_tool(
     except Exception as exc:
         return AgentToolExecution(
             f"ERROR: Agent profile tool failed: {exc}"
-        )
-    if not result.response.strip():
-        return AgentToolExecution(
-            "ERROR: Agent profile worker returned an empty response."
         )
     return AgentToolExecution(result.response)
 
@@ -7030,7 +7169,7 @@ def run_agent_shell_tool(
     if review_action == "save":
         return AgentToolExecution(
             "Shell commands were saved without execution.\n"
-            f"<shell_commands>\n{format_shell_command_context(commands)}\n"
+            f"<shell_commands>\n{format_shell_commands(commands, include_reasons=False)}\n"
             "</shell_commands>"
         )
     if review_action != "accept":
@@ -7168,12 +7307,13 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
     turns: list[AgentTurn] = list(settings.initial_turns)
     file_contexts = agent_context_file_sections(settings)
     file_expires_in_turns = agent_file_context_expirations(
-        file_contexts
+        file_contexts, settings.agent_context_expires[0]
     )
     pinned_paths, pinned_turn_numbers = reused_agent_context_pins(
         file_contexts,
         turns,
         file_expires_in_turns,
+        initial_pinned_paths=set(settings.pinned_file_paths),
     )
     active_task = settings.task
     active_context = settings.initial_active_context
@@ -7182,7 +7322,10 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             list(settings.initial_meta_task_list),
         )
     )
-    controller_tools = agent_tool_schemas(settings.agent_profiles)
+    controller_tools = agent_tool_schemas(
+        settings.agent_profiles,
+        agent_expires_in_turns_schema(settings.agent_context_expires),
+    )
     prior_token_estimates: list[tuple[int, int]] = []
 
     def request_next(
@@ -7828,9 +7971,6 @@ def expand_tree_prompt_values(
     )
 
 
-def read_tree_system_prompts(path: Path) -> tuple[dict[str, str], str | None, str | None]:
-    return read_tree_prompt_file(path)
-
 
 def tree_prompt_for_path(
     path: Path,
@@ -7860,13 +8000,6 @@ def tree_prompt_for_path(
         return f"{default_prompt}\n{selected_prompt}"
     return selected_prompt
 
-
-def tree_system_prompt_for_path(
-    path: Path,
-    prompts: tuple[dict[str, str], str | None, str | None],
-    fallback: str,
- ) -> str:
-    return tree_prompt_for_path(path, prompts, fallback)
 
 
 
@@ -7997,10 +8130,6 @@ def response_reasoning_text(response_obj: Any) -> str:
         return ""
     return str(reasoning or "")
 
-def _tree_reasoning(response_obj: Any) -> str:
-    return response_reasoning_text(response_obj)
-
-
 
 def _tree_exception_message(exc: BaseException) -> str:
     text = str(exc).strip()
@@ -8072,6 +8201,7 @@ def run_tree_mode(
     tree_session_stem: str = "",
     retry: int = 2,
     explicit_prompt_cache: bool = False,
+    response_json_repair: bool = False,
 ) -> int:
     retry = parse_retry_count(retry)
     log_lock = threading.Lock()
@@ -8268,10 +8398,13 @@ def run_tree_mode(
                 error_text = "LLM returned an empty response"
                 error_type = "temp"
             if response_format in ("json", "schema") and result.strip():
-                cleaned_result = clean_json_response(result)
                 try:
-                    result = json.dumps(json.loads(cleaned_result), indent=2, ensure_ascii=False)
-                except json.JSONDecodeError as exc:
+                    result = json.dumps(
+                        parse_json_response(result, response_json_repair),
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                except (ValueError, TypeError) as exc:
                     error_text = f"Failed to parse JSON response: {exc}"
                     error_type = "temp"
         except BaseException as exc:
@@ -8283,7 +8416,7 @@ def run_tree_mode(
             else:
                 error_type = "perm"
         elapsed = time.perf_counter() - start_time
-        reasoning = _tree_reasoning(response_obj) if response_obj is not None else ""
+        reasoning = response_reasoning_text(response_obj) if response_obj is not None else ""
         stored_result = result
         if not stored_result:
             stored_result = f"ERROR: {error_text}" if error_text else ""
@@ -8540,6 +8673,13 @@ def parse_args() -> argparse.Namespace:
             "execution; agent patches overwrite source files unless "
             "--patch-suffix is specified"
         ),
+    )
+
+    parser.add_argument(
+        "--agent-context-expires",
+        nargs="+",
+        metavar="TURNS",
+        help="Set agent context expiry DEFAULT [MIN] [MAX] in turns (default: 12 6 24)",
     )
 
     parser.add_argument(
@@ -8950,6 +9090,15 @@ def parse_args() -> argparse.Namespace:
         help="LLM response format in text, JSON or JSON-Schema",
     )
 
+    parser.add_argument(
+        "--response-json-repair",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
+        help="Repair malformed JSON responses (default: off)",
+    )
     parser.add_argument(
         "--stream",
         nargs="?",
@@ -9449,6 +9598,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "plan_system_prompt": None,
         "agent": False,
         "agent_auto": False,
+        "agent_context_expires": None,
         "agent_hook_context": None,
         "agent_profiles": None,
         "patch": False,
@@ -9478,6 +9628,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "tree_show_only": False,
         "tree_parallel": None,
         "linenum_system_prompt": None,
+        "system_prompt_with_task": False,
         "no_line_numbers": None,
     }
     for option_name, value in disabled_options.items():
@@ -9522,7 +9673,12 @@ def main() -> int:
 
     if args.shell_session_print_json is not None:
         return handle_shell_session_print_json(
-            args.shell_session_print_json
+            args.shell_session_print_json,
+            resolve_bool_option(
+                args.response_json_repair,
+                merged_config(get_profile_path(args.profile or "config")),
+                "response_json_repair",
+            ),
         )
     if args.state_print_json is not None:
         return handle_state_print_json(args.state_print_json)
@@ -9599,6 +9755,10 @@ def main() -> int:
             ("--plan", args.plan is not None),
             ("--agent", args.agent),
             ("--agent-auto", args.agent_auto),
+            (
+                "--agent-context-expires",
+                args.agent_context_expires is not None,
+            ),
             (
                 "--agent-hook-context",
                 args.agent_hook_context is not None,
@@ -9827,9 +9987,7 @@ def main() -> int:
 
 
     if args.list_profiles:
-        ensure_config_exists()
-        profiles = sorted(p.stem for p in APP_DIR.glob("*.json"))
-        for name in profiles:
+        for name in sorted(configuration_profile_names()):
             print(name)
         return 0
 
@@ -10190,6 +10348,23 @@ def main() -> int:
     )
     agent_mode = args.agent
     agent_auto = args.agent_auto
+    if args.agent_context_expires is not None and not agent_mode:
+        print("ERROR: --agent-context-expires requires --agent", file=sys.stderr)
+        return 1
+    agent_context_expires = DEFAULT_AGENT_CONTEXT_EXPIRES
+    if agent_mode:
+        try:
+            agent_context_expires = parse_agent_context_expires(
+                args.agent_context_expires
+                if args.agent_context_expires is not None
+                else config.get(
+                    "agent_context_expires",
+                    DEFAULT_CONFIG["agent_context_expires"],
+                )
+            )
+        except ValueError as exc:
+            print(f"ERROR: Invalid agent context expiry: {exc}", file=sys.stderr)
+            return 1
     if (
         not tree_mode
         and not ask_mode
@@ -10547,6 +10722,11 @@ def main() -> int:
 
     openai_service_tier = str(args.service_tier or config.get("service_tier", "off")).strip()
     response_format: str = args.response_format or str(config.get("response_format", "text"))
+    response_json_repair = resolve_bool_option(
+        args.response_json_repair,
+        config,
+        "response_json_repair",
+    )
     if args.model is not None and args.token_cost is None:
         token_cost_raw = "off"
     else:
@@ -10741,6 +10921,7 @@ def main() -> int:
                                 load_reused_session_shell_command_turn(
                                     state_session_dir,
                                     turn=reuse_session_turn,
+                                    response_json_repair=response_json_repair,
                                 )
                             )
                             task = expand_prompt_names(
@@ -10761,6 +10942,10 @@ def main() -> int:
                             load_reused_session_agent_history(
                                 state_session_dir,
                                 turn=reuse_session_turn,
+                                expires_schema=agent_expires_in_turns_schema(
+                                    agent_context_expires
+                                ),
+                                response_json_repair=response_json_repair,
                             )
                         )
                         reused_agent_active_context = (
@@ -10959,7 +11144,7 @@ def main() -> int:
         try:
             if args.tree_system_prompt_file:
                 tree_system_prompts = expand_tree_prompt_values(
-                    read_tree_system_prompts(args.tree_system_prompt_file),
+                    read_tree_prompt_file(args.tree_system_prompt_file),
                     prompt_expansion_enabled,
                 )
             else:
@@ -11010,6 +11195,7 @@ def main() -> int:
             openai_organization=openai_organization,
             openai_project=openai_project,
             response_format=response_format,
+            response_json_repair=response_json_repair,
             json_schema=json_schema,
             response_verbosity=response_verbosity,
             temperature=temperature,
@@ -11038,16 +11224,21 @@ def main() -> int:
     if ask_mode:
         context = ""
         if args.ask is not None:
-            user_prompt = expand_prompt_names(
+            ask_prompt = expand_prompt_names(
                 read_prompt_argument(args.ask),
                 prompt_expansion_enabled,
             )
         else:
-            user_prompt = expand_prompt_names(
+            ask_prompt = expand_prompt_names(
                 read_prompt_files(args.ask_file).strip(),
                 prompt_expansion_enabled,
             )
-        full_system_prompt = system_prompt
+        full_system_prompt = append_task_to_system_prompt(
+            system_prompt,
+            ask_prompt,
+            system_prompt_with_task,
+        )
+        user_prompt = ask_prompt
     else:
         file_paths = resolve_context_file_paths(file_names)
         max_file_size_kb=coerce_int(config.get("max_file_size_kb", 512), 512)
@@ -11106,11 +11297,6 @@ def main() -> int:
         )
         if reused_patch_turn is not None:
             user_prompt += "\n" + patch_system_prompt
-        if patch_mode:
-            if not file_names:
-                print("ERROR: Patch mode requires readable input files.", file=sys.stderr)
-                return 1
-            original_texts: dict[str, str] = {}
         if patch_mode:
             if not file_names:
                 print("ERROR: Patch mode requires readable input files.", file=sys.stderr)
@@ -11318,6 +11504,7 @@ def main() -> int:
                 retry=retry,
                 safety_identifier=safety_identifier,
                 api_log=api_log,
+                response_json_repair=response_json_repair,
             ),
             token_limit=token_limit,
             token_cost=token_cost,
@@ -11345,7 +11532,13 @@ def main() -> int:
             print_reasoning=print_reasoning,
             suppress_response_output=suppress_response_output,
             agent_profiles=selected_agent_profiles,
+            agent_context_expires=agent_context_expires,
             patch_suffix_argument_provided=args.patch_suffix is not None,
+            pinned_file_paths=(
+                tuple(path for path, _ in context_sections)
+                if args.files is not None
+                else ()
+            ),
             initial_turns=(
                 reused_agent_history.turns
                 if reused_agent_history is not None
@@ -11528,7 +11721,7 @@ def main() -> int:
                 'keep everything as-is that was not changed by the updated user instructions.">\n'
                 f'<previous_task>\n{previous_task}\n</previous_task>\n'
                 '<previous_commands>\n'
-                f'{format_shell_command_context(shell_commands)}\n'
+                f'{format_shell_commands(shell_commands, include_reasons=False)}\n'
                 '</previous_commands>\n'
                 '</shell_revision>'
             ),
@@ -11643,9 +11836,14 @@ def main() -> int:
                 shell_output=shell_turn_history,
                 json_schema=followup_schema,
                 shell_command_archive=archived_shell_turns,
+                include_task=not system_prompt_with_task,
             )
             followup_system_prompt = (
-                full_system_prompt
+                append_task_to_system_prompt(
+                    base_full_system_prompt,
+                    task,
+                    system_prompt_with_task,
+                )
                 + "\nAfter shell output, choose whether to run more commands "
                 + "or use session_end with a reason that completes the session."
             )
@@ -11704,6 +11902,7 @@ def main() -> int:
                     shell_output=candidate_history,
                     json_schema=followup_schema,
                     shell_command_archive=archived_shell_turns,
+                    include_task=not system_prompt_with_task,
                 )
                 candidate_request_tokens = (
                     estimate_request_tokens(
@@ -11733,6 +11932,7 @@ def main() -> int:
                     shell_output=empty_history,
                     json_schema=followup_schema,
                     shell_command_archive=archived_shell_turns,
+                    include_task=not system_prompt_with_task,
                 )
                 empty_request_tokens = (
                     estimate_request_tokens(
@@ -11845,7 +12045,9 @@ def main() -> int:
         try:
             if resume_reused_shell_turn:
                 shell_steps, reused_session_end_reason = (
-                    parse_reused_shell_response(str(result or ''))
+                    parse_reused_shell_response(
+                        str(result or ''), response_json_repair
+                    )
                 )
                 if reused_session_end_reason is not None:
                     return finish_shell_response(
@@ -11855,7 +12057,9 @@ def main() -> int:
                 if shell_steps is None:
                     raise ValueError("reused shell turn returned no commands")
             else:
-                shell_steps = parse_shell_manifest(str(result or ''))
+                shell_steps = parse_shell_manifest(
+                    str(result or ''), response_json_repair
+                )
         except Exception as exc:
             print(f'ERROR: Failed to parse shell command manifest: {exc}', file=sys.stderr)
             return 1
@@ -11908,7 +12112,9 @@ def main() -> int:
                     print(f'API error: {exc}', file=sys.stderr)
                     return 1
                 try:
-                    shell_steps = parse_shell_manifest(str(result or ''))
+                    shell_steps = parse_shell_manifest(
+                        str(result or ''), response_json_repair
+                    )
                 except Exception as exc:
                     print(
                         f'ERROR: Failed to parse shell command manifest: {exc}',
@@ -11974,7 +12180,7 @@ def main() -> int:
                     next_shell_steps,
                     session_reason,
                 ) = parse_shell_followup_response(
-                    result
+                    result, response_json_repair
                 )
             except Exception as exc:
                 print(f"ERROR: Failed to parse shell follow-up response: {exc}", file=sys.stderr)
@@ -12174,9 +12380,14 @@ def main() -> int:
                     )
                     return 1
 
-                result = clean_json_response(result)
-                manifest = json.loads(result)
-            except json.JSONDecodeError as exc:
+                cleaned_result = clean_json_response(result)
+                manifest = parse_json_response(result, response_json_repair)
+                result = (
+                    json.dumps(manifest, indent=2, ensure_ascii=False)
+                    if response_json_repair
+                    else cleaned_result
+                )
+            except (ValueError, TypeError) as exc:
                 print('<invalid_json_patch>')
                 print(result)
                 print('</invalid_json_patch>')
@@ -12378,9 +12589,8 @@ def main() -> int:
                 print("ERROR: LLM returned empty response", file=sys.stderr)
                 return 1
 
-            result = clean_json_response(result)
-            result = json.loads(result)
-        except json.JSONDecodeError as exc:
+            result = parse_json_response(result, response_json_repair)
+        except (ValueError, TypeError) as exc:
             print(result)
             if VERBOSE:
                 print(statsline, file=sys.stderr)
