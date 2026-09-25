@@ -3316,13 +3316,6 @@ def validate_patch_ranges(
                 raise ValueError(
                     f'{patch_id}: empty documents only support line 1 insertion'
                 )
-        elif end_line > total_lines and not (
-            start_line == end_line == total_lines + 1
-        ):
-            raise ValueError(
-                f'{patch_id}: end_line cannot exceed document total_lines '
-                f'({total_lines})'
-            )
 
         ranges.append(
             PatchRange(
