@@ -509,7 +509,7 @@ def merged_config(config_path: Path | None = None) -> dict[str, Any]:
 
 
 def inherited_config_names(config_path: Path) -> set[str]:
-    document = _read_config_document_for_merge(config_path)
+    document = read_config_document(config_path, missing_ok=True)
     parent_name = _inherit_profile_name(document, config_path)
     if parent_name is None:
         return set()
@@ -5146,14 +5146,14 @@ def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
             for field in ("block_id", "summary_message"):
                 if not isinstance(patch[field], str) or not patch[field].strip():
                     raise ValueError(f"{label} requires a non-empty {field}")
-            content_lines = patch["content_line_array"]
-            if not isinstance(content_lines, list) or any(
-                not isinstance(line, str) or "\r" in line or "\n" in line
-                for line in content_lines
-            ):
-                raise ValueError(
-                    f"{label} content_line_array must contain strings without line endings"
-                )
+#            content_lines = patch["content_line_array"]
+#            if not isinstance(content_lines, list) or any(
+#                not isinstance(line, str) or "\r" in line or "\n" in line
+#                for line in content_lines
+#            ):
+#                raise ValueError(
+#                    f"{label} content_line_array must contain strings without line endings"
+#                )
         total_lines = max(
             (
                 patch["end_line"]

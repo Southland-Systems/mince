@@ -59,10 +59,13 @@ install-user:
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 	chmod 755 "$(USER_LAUNCH)"; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
-	chmod 755 "$(USER_CONTAIN_LAUNCH)"
+	chmod 755 "$(USER_CONTAIN_LAUNCH)"; \
+	ln -sfn "$(PROGRAM)" "$(USER_BIN)/mce"; \
+	ln -sfn "$(CONTAIN_PROGRAM)" "$(USER_BIN)/mcec"; \
+	ln -sfn "$(CONTAIN_PROGRAM)" "$(USER_BIN)/mincec"
 
 uninstall-user:
-	@rm -f "$(USER_LAUNCH)" "$(USER_CONTAIN_LAUNCH)"; \
+	@rm -f "$(USER_LAUNCH)" "$(USER_CONTAIN_LAUNCH)" "$(USER_BIN)/mce" "$(USER_BIN)/mcec" "$(USER_BIN)/mincec"; \
 	rm -rf "$(USER_DIR)"; \
 	rm -rf "$(HOME)/.local/state/$(PROGRAM)"
 
@@ -87,6 +90,9 @@ update-user:
 		chmod 755 "$(USER_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
 		chmod 755 "$(USER_CONTAIN_LAUNCH)"; \
+		ln -sfn "$(PROGRAM)" "$(USER_BIN)/mce"; \
+		ln -sfn "$(CONTAIN_PROGRAM)" "$(USER_BIN)/mcec"; \
+		ln -sfn "$(CONTAIN_PROGRAM)" "$(USER_BIN)/mincec"; \
 	fi
 
 install-global:
@@ -106,10 +112,13 @@ install-global:
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 	$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \
-	$(SUDO) chmod 755 "$(GLOBAL_CONTAIN_LAUNCH)"
+	$(SUDO) chmod 755 "$(GLOBAL_CONTAIN_LAUNCH)"; \
+	$(SUDO) ln -sfn "$(PROGRAM)" "$(GLOBAL_BIN)/mce"; \
+	$(SUDO) ln -sfn "$(CONTAIN_PROGRAM)" "$(GLOBAL_BIN)/mcec"; \
+	$(SUDO) ln -sfn "$(CONTAIN_PROGRAM)" "$(GLOBAL_BIN)/mincec"
 
 uninstall-global:
-	@$(SUDO) rm -f "$(GLOBAL_LAUNCH)" "$(GLOBAL_CONTAIN_LAUNCH)"; \
+	@$(SUDO) rm -f "$(GLOBAL_LAUNCH)" "$(GLOBAL_CONTAIN_LAUNCH)" "$(GLOBAL_BIN)/mce" "$(GLOBAL_BIN)/mcec" "$(GLOBAL_BIN)/mincec"; \
 	$(SUDO) rm -rf "$(GLOBAL_DIR)"; \
 	rm -rf "$(HOME)/.local/state/$(PROGRAM)"
 
@@ -134,6 +143,9 @@ update-global:
 		$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \
 		$(SUDO) chmod 755 "$(GLOBAL_CONTAIN_LAUNCH)"; \
+		$(SUDO) ln -sfn "$(PROGRAM)" "$(GLOBAL_BIN)/mce"; \
+		$(SUDO) ln -sfn "$(CONTAIN_PROGRAM)" "$(GLOBAL_BIN)/mcec"; \
+		$(SUDO) ln -sfn "$(CONTAIN_PROGRAM)" "$(GLOBAL_BIN)/mincec"; \
 	fi
 
 install: install-user

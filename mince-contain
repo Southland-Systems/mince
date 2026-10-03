@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run mince in a configurable systemd filesystem sandbox."""
+"""Run mince or $SHELL in a configurable systemd filesystem sandbox."""
 
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ class WrapperOptions:
     network_mode: str = "host"
     runtime_seconds: int | None = None
     allow_namespaces: bool = False
+    use_shell: bool = False
     dry_run: bool = False
     show_help: bool = False
 
@@ -71,14 +72,14 @@ def print_usage() -> None:
     print(
         "Usage: mince-contain [CONTAINMENT_OPTIONS...] [--] "
         "[MINCE_ARGS...]\n\n"
-        "Run MinCE through a transient systemd user service. ProtectSystem "
-        "makes the host filesystem read-only, PrivateTmp supplies private "
-        "writable temporary directories, and only MinCE's state directory "
-        "plus explicitly granted paths remain writable.\n\n"
+        "Run mce through a transient systemd user service. "
+        "ProtectSystem makes the host filesystem read-only, PrivateTmp "
+        "supplies private writable temporary directories, and only mce's "
+        "state directory plus explicitly granted paths remain writable.\n\n"
         "Containment options:\n"
         "  --contain-write-path PATH\n"
         "      Allow writes to an existing file or directory. Repeat as "
-        "needed; grant a parent directory when MinCE must create a file.\n"
+        "needed; grant a parent directory when mce must create a file.\n"
         "  --contain-read-path PATH\n"
         "  --contain-read-only-path PATH\n"
         "      Expose an existing path read-only when a private home or "
@@ -90,14 +91,14 @@ def print_usage() -> None:
         "      Bind an existing source at a writable destination. May be "
         "repeated.\n"
         "  --contain-working-directory PATH\n"
-        "      Run MinCE in this existing directory instead of the current "
-        "directory.\n"
+        "      Run the contained process in this existing directory instead "
+        "of the current directory.\n"
         "  --contain-home MODE\n"
         "      Set ProtectHome visibility: read-only (default), tmpfs, "
         "inaccessible, or off. The working directory, runtime files, state, "
         "and explicit grants are exposed again when necessary.\n"
         "  --contain-state MODE\n"
-        "      Use persistent (default), ephemeral, or read-only MinCE state. "
+        "      Use persistent (default), ephemeral, or read-only mce state. "
         "Ephemeral state is a writable tmpfs and does not expose saved "
         "configuration or sessions.\n"
         "  --contain-private-tmp MODE\n"
@@ -112,15 +113,19 @@ def print_usage() -> None:
         "  --contain-allow-namespaces\n"
         "      Permit the contained process to create namespaces. This may "
         "weaken filesystem containment and is disabled by default.\n"
+        "  --contain-use-shell\n"
+        "      Run $SHELL in the contained environment instead of mce. "
+        "Useful for testing security. SHELL must name an executable.\n"
         "  --contain-dry-run\n"
         "      Print the systemd-run command instead of executing it.\n"
         "  --contain-help\n"
         "      Show this help.\n\n"
-        "All non-containment arguments are passed to mince unchanged. Use "
-        "-- to stop wrapper option parsing, and use mince's --help option "
-        "for Mince command-line help. This wrapper primarily confines "
-        "filesystem writes; host networking and the invoking environment "
-        "remain available unless explicitly restricted."
+        "All non-containment arguments are passed to mce unchanged unless "
+        "--contain-use-shell is set. Use -- to stop wrapper option parsing, "
+        "and use mce --help option for mce command-line help. This "
+        "wrapper primarily confines filesystem writes; host networking and "
+        "the invoking environment remain available unless explicitly "
+        "restricted."
     )
 
 
@@ -222,6 +227,10 @@ def parse_wrapper_arguments(
             continue
         if argument == "--contain-allow-namespaces":
             options.allow_namespaces = True
+            index += 1
+            continue
+        if argument == "--contain-use-shell":
+            options.use_shell = True
             index += 1
             continue
         if argument == "--contain-no-private-tmp":
@@ -490,6 +499,28 @@ def runtime_path_grants(
     return grants
 
 
+def resolve_contained_command(
+    options: WrapperOptions,
+    mince_arguments: list[str],
+    invocation_directory: Path,
+) -> tuple[list[str], list[PathGrant]]:
+    if not options.use_shell:
+        return ["mince", *mince_arguments], runtime_path_grants(
+            find_python(), invocation_directory
+        )
+
+    shell = os.environ.get("SHELL")
+    if not shell:
+        raise ValueError("--contain-use-shell requires SHELL to be set")
+    shell_command = shutil.which(shell)
+    if shell_command is None:
+        raise ValueError(f"SHELL executable was not found: {shell}")
+    shell_grant = resolve_existing_grant(
+        shell_command, invocation_directory, "shell"
+    )
+    return [str(shell_grant.destination)], [shell_grant]
+
+
 def path_is_below(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -562,7 +593,7 @@ def build_systemd_command(
     writable_paths: list[Path],
     bindings: list[Binding],
     temporary_filesystems: list[Path],
-    mince_arguments: list[str],
+    command_arguments: list[str],
     options: WrapperOptions,
 ) -> list[str]:
     command = [
@@ -657,7 +688,7 @@ def build_systemd_command(
         ):
             command.append(f"--setenv={name}")
     command.append(f"--setenv=PWD={working_directory}")
-    command.extend(["--", "mince", *mince_arguments])
+    command.extend(["--", *command_arguments])
     return command
 
 
@@ -684,7 +715,9 @@ def main() -> int:
         working_directory = resolve_working_directory(
             options.working_directory, invocation_directory
         )
-        python_path = find_python()
+        command_arguments, runtime_grants = resolve_contained_command(
+            options, mince_arguments, invocation_directory
+        )
 
         read_grants = [
             resolve_existing_grant(
@@ -813,9 +846,7 @@ def main() -> int:
             add_binding(working_grant)
             add_read_only_path(working_directory)
 
-        for grant in runtime_path_grants(
-            python_path, invocation_directory
-        ):
+        for grant in runtime_grants:
             if (
                 path_needs_visibility_binding(
                     grant, options.home_mode, options.private_tmp
@@ -868,7 +899,7 @@ def main() -> int:
             writable_paths=list(writable_paths),
             bindings=list(bindings_by_destination.values()),
             temporary_filesystems=temporary_filesystems,
-            mince_arguments=mince_arguments,
+            command_arguments=command_arguments,
             options=options,
         )
         if options.dry_run:
