@@ -1,4 +1,4 @@
-![MinCE logo](mince.png)
+![MinCE logo](mce.webp)
 
 ## What it does ✨
 
