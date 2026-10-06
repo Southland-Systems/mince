@@ -2,8 +2,11 @@
 """Run deterministic, offline integration tests for mince."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 
 
 class TestFailure(Exception):
@@ -38,12 +41,34 @@ class MockResponsesAPI:
         self.url = ""
 
     @staticmethod
+    def tool_response(*calls: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "output_items": [
+                {
+                    "id": f"fc_offline_{index}",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": f"call_offline_{index}",
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                }
+                for index, (name, arguments) in enumerate(calls)
+            ]
+        }
+
+    @staticmethod
     def _payload(value: Any, index: int) -> bytes:
+        usage: dict[str, Any] = {}
+        output_items = None
         if isinstance(value, str):
             output_text = value
-            usage: dict[str, Any] = {}
         elif isinstance(value, dict):
-            if "output_text" in value:
+            if "output_items" in value:
+                output_items = value["output_items"]
+                if not isinstance(output_items, list):
+                    raise ValueError("mock output_items must be an array")
+                output_text = ""
+            elif "output_text" in value:
                 output_text = value["output_text"]
             elif "output" in value:
                 output_text = json.dumps(
@@ -52,12 +77,29 @@ class MockResponsesAPI:
                     ensure_ascii=False,
                 )
             else:
-                raise ValueError("mock response requires output or output_text")
+                raise ValueError("mock response requires output, output_text, or output_items")
             usage = value.get("usage", {})
         else:
             raise ValueError("mock response must be a string or object")
         if not isinstance(output_text, str):
             raise ValueError("mock response output must be text")
+        if output_items is None:
+            output_items = [
+                {
+                    "id": f"msg_offline_{index}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": output_text,
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                }
+            ]
         if not isinstance(usage, dict) or not usage:
             usage = {
                 "input_tokens": 8,
@@ -79,22 +121,7 @@ class MockResponsesAPI:
             "max_tool_calls": None,
             "metadata": {},
             "model": "offline-test-model",
-            "output": [
-                {
-                    "id": f"msg_offline_{index}",
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": output_text,
-                            "annotations": [],
-                            "logprobs": [],
-                        }
-                    ],
-                }
-            ],
+            "output": output_items,
             "parallel_tool_calls": True,
             "previous_response_id": None,
             "prompt": None,
@@ -130,29 +157,60 @@ class MockResponsesAPI:
                 with owner._lock:
                     owner.requests.append(request)
                     index = len(owner.requests) - 1
-                    response_value = owner.responses[min(index, len(owner.responses) - 1)]
+                    if index < len(owner.responses):
+                        response_value = owner.responses[index]
+                    else:
+                        response_value = {
+                            "http_status": 400,
+                            "error": {
+                                "message": "offline mock response sequence exhausted",
+                                "type": "invalid_request_error",
+                                "code": "mock_exhausted",
+                            },
+                        }
+                status = (
+                    response_value.get("http_status", 200)
+                    if isinstance(response_value, dict)
+                    else 200
+                )
+                if status != 200:
+                    payload = json.dumps(
+                        {"error": response_value["error"]},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 response_payload = json.loads(
                     owner._payload(response_value, index).decode("utf-8")
                 )
                 if request.get("stream") is True:
                     output_text = response_payload["output"][0]["content"][0]["text"]
+                    midpoint = max(1, len(output_text) // 2)
+                    chunks = [output_text[:midpoint], output_text[midpoint:]]
                     events = [
                         {
                             "type": "response.output_text.delta",
                             "content_index": 0,
-                            "delta": output_text,
+                            "delta": chunk,
                             "item_id": f"msg_offline_{index}",
                             "logprobs": [],
                             "obfuscation": "",
                             "output_index": 0,
-                            "sequence_number": 0,
-                        },
+                            "sequence_number": sequence_number,
+                        }
+                        for sequence_number, chunk in enumerate(chunks)
+                    ]
+                    events.append(
                         {
                             "type": "response.completed",
                             "response": response_payload,
-                            "sequence_number": 1,
-                        },
-                    ]
+                            "sequence_number": len(events),
+                        }
+                    )
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
@@ -209,7 +267,26 @@ class OfflineTests:
         self.work = self.root / "work"
         self.home.mkdir()
         self.work.mkdir()
-        self.command = ["mince"]
+        self.command = [ 'mince' ]
+        cache_name = hashlib.sha1(
+            b"https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+        ).hexdigest()
+        cache_directories = [
+            Path.home() / ".local/state/mince/tiktoken",
+            Path(tempfile.gettempdir()) / "data-gym-cache",
+        ]
+        for variable in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR"):
+            if os.environ.get(variable):
+                cache_directories.insert(0, Path(os.environ[variable]))
+        self._token_cache_available = False
+        for directory in cache_directories:
+            source = directory / cache_name
+            if source.is_file():
+                destination = self.home / ".local/state/mince/tiktoken" / cache_name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                self._token_cache_available = True
+                break
 
     def run(
         self,
@@ -233,7 +310,24 @@ class OfflineTests:
                 "all_proxy": "",
             }
         )
-        command = [*self.command, *(str(argument) for argument in arguments)]
+        tokenizing_options = {
+            "--ask", "--ask-file", "--task", "--task-file",
+            "--reuse-session", "--tree-task", "--tree-task-file",
+        }
+        if any(str(argument) in tokenizing_options for argument in arguments):
+            require(
+                self._token_cache_available,
+                "Offline tokenizer cache is missing. Before running mince-test, "
+                "prewarm o200k_base using: "
+                "TIKTOKEN_CACHE_DIR=\"$HOME/.local/state/mince/tiktoken\" "
+                "python3 -c 'import tiktoken; tiktoken.get_encoding(\"o200k_base\")'",
+            )
+        command = [
+            *self.command,
+            "--base-url", "http://127.0.0.1:1/v1",
+            "--retry", "0",
+            *(str(argument) for argument in arguments),
+        ]
         completed = subprocess.run(
             command,
             cwd=cwd or ROOT,
@@ -271,11 +365,30 @@ class OfflineTests:
         )
         return response
 
+    def state_artifacts(
+        self,
+        session_name: str,
+        *values: object,
+    ) -> dict[str, str]:
+        result = self.run("--state-print-json", session_name, *values)
+        try:
+            artifacts = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TestFailure(
+                f"state artifact JSON could not be decoded: {exc}"
+            ) from exc
+        require(
+            isinstance(artifacts, dict)
+            and all(isinstance(value, str) for value in artifacts.values()),
+            "state artifact JSON was not an object of strings",
+        )
+        return artifacts
+
     def test_default_config(self) -> None:
         result = self.run("--print-default-config")
         config = json.loads(result.stdout)
         require(
-            config["model"] == "gpt-5.6-luna",
+            config["model"] == "gpt-6-luna",
             "default model is incorrect",
         )
         require(
@@ -285,6 +398,14 @@ class OfflineTests:
         require(
             config["patch"] == "off",
             "patch mode default is incorrect",
+        )
+        require(
+            config["retry"] == 2
+            and config["agent_context_expires"] == "12 6 24"
+            and config["shell_networking"] == "off"
+            and config["response_json_repair"] == "off"
+            and config["explicit_prompt_cache"] == "off",
+            "retry, agent expiry, networking, repair, or cache defaults are incorrect",
         )
 
     def test_inherited_profile_overrides(self) -> None:
@@ -296,7 +417,7 @@ class OfflineTests:
             "model",
         )
         require(
-            inherited.stdout.strip() == "model=gpt-5.6-luna",
+            inherited.stdout.strip() == "^model=gpt-6-luna",
             "inherited profile did not expose the parent model",
         )
         self.run(
@@ -340,7 +461,7 @@ class OfflineTests:
             "model",
         )
         require(
-            restored.stdout.strip() == "model=gpt-5.6-luna",
+            restored.stdout.strip() == "^model=gpt-6-luna",
             "parent value was not restored after resetting the child",
         )
         self.run("--remove-profile", "child")
@@ -370,7 +491,7 @@ class OfflineTests:
         tree.mkdir()
         (tree / "a.py").write_text("alpha\n", encoding="utf-8")
         (tree / "b.txt").write_text("bravo\n", encoding="utf-8")
-        with MockResponsesAPI(["tree answer"]) as mock:
+        with MockResponsesAPI(["tree answer", "tree answer"]) as mock:
             result = self.run(
                 "--tree-files",
                 tree,
@@ -434,7 +555,7 @@ class OfflineTests:
             "*: General system instruction\n.py: Python-specific system instruction\n",
             encoding="utf-8",
         )
-        with MockResponsesAPI(["tree prompt answer"]) as mock:
+        with MockResponsesAPI(["tree prompt answer", "tree prompt answer"]) as mock:
             self.run(
                 "--tree-files",
                 tree,
@@ -489,18 +610,29 @@ class OfflineTests:
             prompts == {"offline": "Offline prompt"},
             "prompt JSON output is incorrect",
         )
-        self.run("--prompt-assign", "offline", "config", "system")
+        self.run("--profile", "config", "--prompt-assign", "offline", "system")
         configured = self.run("--get-config", "system_prompt")
         require(
-            "./offline.md" in configured.stdout,
-            "prompt assignment was not saved",
+            configured.stdout.strip() == "system_prompt=./offline.md|./mce_system.md",
+            "prompt assignment did not prepend the library reference",
         )
-        self.run("--prompt-unassign", "offline", "config", "system")
+        detail = self.run("--get-config-detail", "system_prompt")
+        require(
+            "[Offline prompt You are a concise" in detail.stdout,
+            "config detail did not resolve the assigned prompt files",
+        )
+        self.run("--profile", "config", "--prompt-unassign", "offline", "system")
         restored = self.run("--get-config", "system_prompt")
         require(
-            "You are a concise" in restored.stdout,
-            "prompt unassignment did not restore the default",
+            restored.stdout.strip() == "system_prompt=./mce_system.md",
+            "prompt unassignment did not retain the default library reference",
         )
+        self.run("--prompt-remove", "offline")
+        require(
+            not (self.home / ".local/state/mince/prompts/offline.md").exists(),
+            "removed prompt library entry still exists",
+        )
+
     def test_prompt_expansion(self) -> None:
         self.run("--prompt-edit", "leaf", "Expanded leaf prompt")
         self.run(
@@ -628,6 +760,7 @@ class OfflineTests:
 
     def test_streaming_text_response_to_output_file(self) -> None:
         output_file = self.work / "streamed-output.txt"
+        output_file.write_text("stale output", encoding="utf-8")
         with MockResponsesAPI(["offline streamed file response"]) as mock:
             result = self.run(
                 "--ask",
@@ -660,6 +793,7 @@ class OfflineTests:
 
     def test_streaming_from_configuration(self) -> None:
         profile_name = "streaming"
+        self.run("--copy-profile", profile_name)
         self.run(
             "--profile",
             profile_name,
@@ -697,7 +831,6 @@ class OfflineTests:
     def _patch_file_entry(
         path: Path,
         *,
-        total_lines: int,
         line_ending: str = "lf",
         patches: list[dict[str, Any]],
     ) -> dict[str, Any]:
@@ -706,7 +839,6 @@ class OfflineTests:
                 "path": str(path),
                 "encoding": "utf-8",
                 "line_ending": line_ending,
-                "total_lines": total_lines,
             },
             "patches": patches,
         }
@@ -716,19 +848,28 @@ class OfflineTests:
         path: Path,
         *,
         line_ending: str = "lf",
-        total_lines: int = 3,
         patches: list[dict[str, Any]],
     ) -> dict[str, Any]:
         return {
             "files": [
                 self._patch_file_entry(
                     path,
-                    total_lines=total_lines,
                     line_ending=line_ending,
                     patches=patches,
                 )
             ],
             "commit_message": "Apply offline test patch",
+        }
+
+    @staticmethod
+    def _replacement_patch(content: list[str]) -> dict[str, Any]:
+        return {
+            "patch_id": "offline-p1",
+            "block_id": "offline-b1",
+            "start_line": 1,
+            "end_line": 1,
+            "content_line_array": content,
+            "summary_message": "Replace the offline fixture",
         }
 
     def test_multifile_patch_and_new_file(self) -> None:
@@ -739,7 +880,6 @@ class OfflineTests:
             "files": [
                 self._patch_file_entry(
                     existing,
-                    total_lines=2,
                     patches=[
                         {
                             "patch_id": "multi-p1",
@@ -747,15 +887,12 @@ class OfflineTests:
                             "start_line": 1,
                             "end_line": 1,
                             "content_line_array": ["first-updated"],
-                            "summary": "Update the existing file",
-                            "confidence": 1.0,
-                            "needs_manual_review": False,
+                            "summary_message": "Update the existing file",
                         }
                     ],
                 ),
                 self._patch_file_entry(
                     created,
-                    total_lines=1,
                     patches=[
                         {
                             "patch_id": "multi-p2",
@@ -763,9 +900,7 @@ class OfflineTests:
                             "start_line": 1,
                             "end_line": 1,
                             "content_line_array": ["created-content"],
-                            "summary": "Create the missing file",
-                            "confidence": 1.0,
-                            "needs_manual_review": False,
+                            "summary_message": "Create the missing file",
                         }
                     ],
                 ),
@@ -803,7 +938,6 @@ class OfflineTests:
         target.write_bytes(b"")
         manifest = self._patch_manifest(
             target,
-            total_lines=1,
             patches=[
                 {
                     "patch_id": "empty-p1",
@@ -814,9 +948,7 @@ class OfflineTests:
                         "inserted",
                         "without-final-newline",
                     ],
-                    "summary": "Insert content into an empty file",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Insert content into an empty file",
                 }
             ],
         )
@@ -848,9 +980,7 @@ class OfflineTests:
                     "start_line": 2,
                     "end_line": 2,
                     "content_line_array": ["beta-updated"],
-                    "summary": "Update beta",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Update beta",
                 }
             ],
         )
@@ -897,9 +1027,7 @@ class OfflineTests:
                     "start_line": 2,
                     "end_line": 2,
                     "content_line_array": ["two-updated"],
-                    "summary": "Update CRLF text",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Update CRLF text",
                 }
             ],
         )
@@ -930,9 +1058,7 @@ class OfflineTests:
                 "start_line": 1,
                 "end_line": 2,
                 "content_line_array": ["replacement"],
-                "summary": "Invalid overlap",
-                "confidence": 1.0,
-                "needs_manual_review": False,
+                "summary_message": "Invalid overlap",
             }
         )
         bad_manifest_path = self.work / "overlap.json"
@@ -963,7 +1089,6 @@ class OfflineTests:
                 "files": [
                     self._patch_file_entry(
                         target,
-                        total_lines=2,
                         patches=[
                             {
                                 "patch_id": "review-p1",
@@ -971,9 +1096,7 @@ class OfflineTests:
                                 "start_line": 2,
                                 "end_line": 2,
                                 "content_line_array": ["review-updated"],
-                                "summary": "Update the reviewed line",
-                                "confidence": 1.0,
-                                "needs_manual_review": False,
+                                "summary_message": "Update the reviewed line",
                             }
                         ],
                     )
@@ -1077,7 +1200,6 @@ class OfflineTests:
                             "path": str(target),
                             "encoding": "utf-8",
                             "line_ending": "lf",
-                            "total_lines": 3,
                         },
                         "patches": [
                             {
@@ -1086,9 +1208,7 @@ class OfflineTests:
                                 "start_line": 2,
                                 "end_line": 2,
                                 "content_line_array": ["middle-updated"],
-                                "summary": "Update middle line",
-                                "confidence": 1.0,
-                                "needs_manual_review": False,
+                                "summary_message": "Update middle line",
                             }
                         ],
                     }
@@ -1133,7 +1253,6 @@ class OfflineTests:
                 "files": [
                     self._patch_file_entry(
                         target,
-                        total_lines=1,
                         patches=[
                             {
                                 "patch_id": "reuse-p1",
@@ -1141,9 +1260,7 @@ class OfflineTests:
                                 "start_line": 1,
                                 "end_line": 1,
                                 "content_line_array": ["updated"],
-                                "summary": "Update the reused file",
-                                "confidence": 1.0,
-                                "needs_manual_review": False,
+                                "summary_message": "Update the reused file",
                             }
                         ],
                     )
@@ -1227,52 +1344,58 @@ class OfflineTests:
             },
         ]
         with MockResponsesAPI(responses) as mock:
-            result = self.run(
-                "--task",
-                "Run the offline check.",
-                "--shell",
-                "--noninteractive",
-                "--model",
-                "offline-test-model",
-                "--base-url",
-                mock.url,
-                "--log",
-                "off",
-                "--no-api-log",
+            saved = self.run(
+                "--task", "Run the offline check.",
+                "--shell", "--noninteractive",
+                "--model", "offline-test-model",
+                "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
             )
-        session_name = session_name_from_result(
-            result,
-            noninteractive=True,
-        )
-        shell_response = self.shell_session_response(session_name)
+            session_name = session_name_from_result(saved, noninteractive=True)
+            require(
+                len(mock.requests) == 1,
+                "a fresh noninteractive shell session should only save commands",
+            )
+            turn_dir = self.home / ".local/state/mince/state" / session_name / "0"
+            require(
+                not (turn_dir / "response_shell_output").exists(),
+                "fresh noninteractive shell commands were unexpectedly executed",
+            )
+            saved_response = self.shell_session_response(session_name)
+            require(
+                saved_response == responses[0]["output"],
+                "unexecuted shell commands were not saved",
+            )
+            resumed = self.run(
+                "--shell", "--reuse-session", session_name, "0",
+                "--noninteractive",
+                "--model", "offline-test-model",
+                "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
         require(
-            shell_response.get("action") == "session_end"
-            and shell_response.get("reason")
-            == "Offline shell session completed",
+            session_name_from_result(resumed, noninteractive=True) == session_name,
+            "resumed shell session changed its name",
+        )
+        require(
+            self.shell_session_response(session_name) == responses[1]["output"],
             "shell session completion reason was not saved",
         )
-        require(
-            len(mock.requests) == 2,
-            "expected initial shell and follow-up requests",
-        )
+        require(len(mock.requests) == 2, "expected saved commands and one follow-up request")
         followup_input = str(mock.requests[1].get("input", ""))
         require(
-            "<shell_output>" in followup_input,
-            "shell output was not sent to follow-up",
-        )
-        require(
-            "offline-shell" in followup_input,
-            "script output was not sent to follow-up",
+            "<shell_output>" in followup_input
+            and "<stdout>\noffline-shell\n</stdout>" in followup_input,
+            "actual script output was not sent to the follow-up",
         )
         state = self.run(
-            "--state-print-json",
-            session_name,
-            "0",
-            "response_shell_output",
+            "--state-print-json", session_name, "0", "response_shell_output",
         )
+        artifacts = json.loads(state.stdout)
         require(
-            "offline-shell" in state.stdout,
-            "shell output was not saved in state",
+            "<exit_status>0</exit_status>" in artifacts["response_shell_output"]
+            and "<stdout>\noffline-shell\n</stdout>" in artifacts["response_shell_output"],
+            "executed shell output was not saved in the original state turn",
         )
 
     def test_shell_followup_commands_and_failures(self) -> None:
@@ -1312,7 +1435,6 @@ class OfflineTests:
                 "--task",
                 "Run two offline shell checks.",
                 "--shell",
-                "--noninteractive",
                 "--llm-timeout",
                 "5",
                 "--model",
@@ -1322,10 +1444,11 @@ class OfflineTests:
                 "--log",
                 "off",
                 "--no-api-log",
+                input_text="y\ny\n",
             )
         session_name = session_name_from_result(
             result,
-            noninteractive=True,
+            noninteractive=False,
         )
         shell_response = self.shell_session_response(session_name)
         require(
@@ -1370,7 +1493,6 @@ class OfflineTests:
                 "--task",
                 "Run the timeout check.",
                 "--shell",
-                "--noninteractive",
                 "--llm-timeout",
                 "1",
                 "--model",
@@ -1380,10 +1502,11 @@ class OfflineTests:
                 "--log",
                 "off",
                 "--no-api-log",
+                input_text="y\n",
             )
         session_name = session_name_from_result(
             result,
-            noninteractive=True,
+            noninteractive=False,
         )
         shell_response = self.shell_session_response(session_name)
         require(
@@ -1436,7 +1559,6 @@ class OfflineTests:
                             "path": str(target.resolve()),
                             "encoding": "utf-8",
                             "line_ending": "lf",
-                            "total_lines": 2,
                         },
                         "patches": [
                             {
@@ -1445,9 +1567,7 @@ class OfflineTests:
                                 "start_line": 2,
                                 "end_line": 2,
                                 "content_line_array": ["branch-updated"],
-                                "summary": "Update the branch fixture",
-                                "confidence": 1.0,
-                                "needs_manual_review": False,
+                                "summary_message": "Update the branch fixture",
                             }
                         ],
                     }
@@ -1500,9 +1620,14 @@ class OfflineTests:
         result = self.run("--state-print-json")
         artifact_types = json.loads(result.stdout)
         require(
-            "request_files" in artifact_types
-            and "response_schema_patch" in artifact_types
-            and "response_shell_output" in artifact_types,
+            {
+                "request_files",
+                "meta_task_list",
+                "response_schema_patch",
+                "response_shell_output",
+                "response_agent_tool_output",
+                "response_agent_file_contexts",
+            }.issubset(artifact_types),
             "state artifact type listing is incomplete",
         )
 
@@ -1602,7 +1727,6 @@ class OfflineTests:
         target.write_text("keep\nchange\n", encoding="utf-8")
         manifest = self._patch_manifest(
             target,
-            total_lines=2,
             patches=[
                 {
                     "patch_id": "artifact-p1",
@@ -1610,9 +1734,7 @@ class OfflineTests:
                     "start_line": 2,
                     "end_line": 2,
                     "content_line_array": ["change-updated"],
-                    "summary": "Update the artifact fixture",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Update the artifact fixture",
                 }
             ],
         )
@@ -1707,7 +1829,6 @@ class OfflineTests:
         )
         manifest = self._patch_manifest(
             target,
-            total_lines=5,
             patches=[
                 {
                     "patch_id": "range-delete-first",
@@ -1715,9 +1836,7 @@ class OfflineTests:
                     "start_line": 1,
                     "end_line": 1,
                     "content_line_array": [],
-                    "summary": "Delete the first line",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Delete the first line",
                 },
                 {
                     "patch_id": "range-expand-second",
@@ -1725,9 +1844,7 @@ class OfflineTests:
                     "start_line": 2,
                     "end_line": 2,
                     "content_line_array": ["two-a", "two-b"],
-                    "summary": "Expand the second line",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Expand the second line",
                 },
                 {
                     "patch_id": "range-delete-last",
@@ -1735,9 +1852,7 @@ class OfflineTests:
                     "start_line": 5,
                     "end_line": 5,
                     "content_line_array": [],
-                    "summary": "Delete the last line",
-                    "confidence": 1.0,
-                    "needs_manual_review": False,
+                    "summary_message": "Delete the last line",
                 },
             ],
         )
@@ -1786,7 +1901,6 @@ class OfflineTests:
                 "--task",
                 "Run the first offline shell session.",
                 "--shell",
-                "--noninteractive",
                 "--model",
                 "offline-test-model",
                 "--base-url",
@@ -1794,10 +1908,11 @@ class OfflineTests:
                 "--log",
                 "off",
                 "--no-api-log",
+                input_text="y\n",
             )
             session_name = session_name_from_result(
                 first,
-                noninteractive=True,
+                noninteractive=False,
             )
             second = self.run(
                 "--shell",
@@ -1903,6 +2018,1360 @@ class OfflineTests:
             "patch branch removal did not delete the branch",
         )
 
+    def test_patch_rejects_invalid_inputs(self) -> None:
+        cases = [
+            ("boolean-range", b"one\ntwo\n", "lf", {"start_line": True}, "integer"),
+            ("reversed-range", b"one\ntwo\n", "lf", {"start_line": 2}, "greater than"),
+            ("embedded-newline", b"one\ntwo\n", "lf",
+             {"content_line_array": ["bad\nline"]}, "line endings"),
+            ("nonstring-content", b"one\ntwo\n", "lf",
+             {"content_line_array": [1]}, "array of strings"),
+            ("wrong-eol", b"one\r\ntwo\r\n", "lf", {}, "does not match"),
+            ("mixed-eol", b"one\r\ntwo\n", "lf", {}, "mixed line endings"),
+            ("empty-range", b"", "lf", {"start_line": 2, "end_line": 2}, "line 1"),
+        ]
+        for name, source, line_ending, updates, diagnostic in cases:
+            target = self.work / f"invalid-{name}.txt"
+            target.write_bytes(source)
+            patch = self._replacement_patch(["updated"])
+            patch.update(updates)
+            manifest = self._patch_manifest(target, line_ending=line_ending, patches=[patch])
+            manifest_path = self.work / f"invalid-{name}.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            failed = self.run(
+                "--patch-file-apply", manifest_path, "--patch-suffix", ".invalid",
+                check=False,
+            )
+            require(
+                failed.returncode != 0 and diagnostic in failed.stderr,
+                f"{name} was accepted or its diagnostic was missing: {failed.stderr}",
+            )
+            require(
+                target.read_bytes() == source
+                and not target.with_name(target.name + ".invalid").exists(),
+                f"{name} modified files despite validation failure",
+            )
+        target = self.work / "duplicate-path.txt"
+        target.write_text("original\n", encoding="utf-8")
+        manifest = self._patch_manifest(target, patches=[self._replacement_patch(["updated"])])
+        duplicate = json.loads(json.dumps(manifest["files"][0]))
+        duplicate["document"]["path"] = target.name
+        manifest["files"].append(duplicate)
+        manifest_path = self.work / "duplicate-path.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        failed = self.run(
+            "--patch-file-apply", manifest_path, "--patch-suffix", ".invalid",
+            cwd=self.work, check=False,
+        )
+        require(
+            failed.returncode != 0 and "duplicate document path" in failed.stderr,
+            "duplicate resolved document paths were accepted",
+        )
+        require(
+            target.read_text(encoding="utf-8") == "original\n"
+            and not target.with_name(target.name + ".invalid").exists(),
+            "duplicate-path rejection wrote a file",
+        )
+
+    def test_saved_patch_session_apply_once(self) -> None:
+        target = self.work / "session-patch.txt"
+        target.write_text("original\n", encoding="utf-8")
+        manifest = self._patch_manifest(target, patches=[self._replacement_patch(["updated"])])
+        with MockResponsesAPI([{"output": manifest}]) as mock:
+            saved = self.run(
+                "--task", "Save a patch without applying it.",
+                "--files", target, "--patch", "--noninteractive",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--no-api-log",
+            )
+        require(len(mock.requests) == 1, "expected one saved-patch request")
+        session_name = session_name_from_result(saved, noninteractive=True)
+        require(
+            target.read_text(encoding="utf-8") == "original\n"
+            and not target.with_name(target.name + ".mcepatched").exists(),
+            "noninteractive patch generation unexpectedly wrote source files",
+        )
+        printed = self.run("--patch-file-print", session_name, "0")
+        require("+updated" in printed.stdout, "session patch diff was not printed")
+        self.run("--patch-file-apply", session_name, "0", "--patch-suffix", ".session")
+        output = target.with_name(target.name + ".session")
+        require(
+            output.read_text(encoding="utf-8") == "updated\n",
+            "session patch was not applied",
+        )
+        state = json.loads(self.run(
+            "--state-print-json", session_name, "0", "response_schema_patch_applied",
+        ).stdout)
+        require(
+            state["response_schema_patch_applied"] == str(output),
+            "session patch application marker omitted its output path",
+        )
+        failed = self.run(
+            "--patch-file-apply", session_name, "0", "--patch-suffix", ".twice",
+            check=False,
+        )
+        require(
+            failed.returncode != 0
+            and "response_schema_patch_applied already exists" in failed.stderr
+            and not target.with_name(target.name + ".twice").exists(),
+            "an already applied session patch was applied again",
+        )
+        require(
+            "+updated" in self.run("--patch-file-print", session_name, "0").stdout,
+            "application marker should not prevent printing the session patch",
+        )
+
+    def test_json_repair_and_explicit_prompt_cache(self) -> None:
+        malformed = "{answer: 'repaired',}"
+        with MockResponsesAPI([malformed, malformed, '{"answer":"strict"}']) as mock:
+            common = (
+                "--ask", "Return a JSON answer.", "--response-format", "json",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+            strict = self.run(*common, "--response-json-repair", "off", check=False)
+            repaired = self.run(
+                *common, "--response-json-repair", "on", "--explicit-prompt-cache",
+            )
+            disabled = self.run(*common, "--explicit-prompt-cache", "off")
+        require(
+            strict.returncode != 0 and "Failed to parse JSON" in strict.stderr,
+            "malformed JSON was accepted with repair disabled",
+        )
+        require(
+            json.loads(repaired.stdout) == {"answer": "repaired"}
+            and json.loads(disabled.stdout) == {"answer": "strict"},
+            "JSON repair or strict JSON formatting produced the wrong result",
+        )
+        require(len(mock.requests) == 3, "unexpected JSON repair request count")
+        require(
+            mock.requests[1].get("prompt_cache_options") == {"mode": "explicit"}
+            and "prompt_cache_options" not in mock.requests[0]
+            and "prompt_cache_options" not in mock.requests[2],
+            "explicit prompt cache was not enabled and omitted as requested",
+        )
+
+    def test_api_retry_classification(self) -> None:
+        transient = {
+            "http_status": 503,
+            "error": {"message": "offline transient failure", "type": "server_error"},
+        }
+        permanent = {
+            "http_status": 401,
+            "error": {"message": "offline authentication failure", "type": "invalid_request_error"},
+        }
+        with MockResponsesAPI([transient, "recovered response"]) as mock:
+            recovered = self.run(
+                "--ask", "Exercise transient retries.",
+                "--retry", "1", "--model", "offline-test-model",
+                "--base-url", mock.url, "--no-api-log",
+            )
+        require(
+            recovered.stdout == "recovered response\n" and len(mock.requests) == 2,
+            "transient API failure was not retried exactly once",
+        )
+        require(
+            "attempt 1/2" in recovered.stderr
+            and "succeeded after 1 retry" in recovered.stderr
+            and mock.requests[0] == mock.requests[1],
+            "retry diagnostics or request preservation were incorrect",
+        )
+        session_name = session_name_from_result(recovered, noninteractive=False)
+        log = (self.home / ".local/state/mince/logs" / f"{session_name}.txt").read_text(
+            encoding="utf-8",
+        )
+        require(
+            "<api_retry>" in log and "retry counter reset" in log,
+            "API retry events were not logged",
+        )
+        for response, retry in ((transient, "0"), (permanent, "2")):
+            with MockResponsesAPI([response]) as mock:
+                failed = self.run(
+                    "--ask", "Exercise terminal API failure.",
+                    "--retry", retry, "--model", "offline-test-model",
+                    "--base-url", mock.url, "--log", "off", "--no-api-log",
+                    check=False,
+                )
+            require(
+                failed.returncode != 0 and len(mock.requests) == 1,
+                "zero-retry or permanent API failure made an extra request",
+            )
+
+    def test_ask_disables_task_modes(self) -> None:
+        missing = self.work / "ask-must-not-read.txt"
+        with MockResponsesAPI(["ask-only response"]) as mock:
+            result = self.run(
+                "--ask", "Ask without task-mode machinery.",
+                "--files", missing, "--plan", "--patch", "--shell",
+                "--agent", "--agent-auto",
+                "--reuse-session", "nonexistent-session",
+                "--system-prompt", "ask system", "--system-prompt-with-task",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(result.stdout == "ask-only response\n", "ask response was not emitted")
+        require(len(mock.requests) == 1, "ask mode ran another task-mode request")
+        request = mock.requests[0]
+        require(
+            request["input"] == "Ask without task-mode machinery."
+            and request["instructions"] == "ask system"
+            and request["text"]["format"] == {"type": "text"}
+            and "tools" not in request
+            and not missing.exists(),
+            "ask mode did not disable conflicting context, placement, and tool options",
+        )
+
+    def test_shell_session_revision(self) -> None:
+        original = {
+            "commands": [{"command": "printf old-output", "reason": "Original check"}],
+        }
+        ended = {"action": "session_end", "commands": [], "reason": "Original check completed"}
+        revised = {
+            "commands": [{"command": "printf revised-output", "reason": "Revised check"}],
+        }
+        with MockResponsesAPI([{"output": original}, {"output": ended}, {"output": revised}]) as mock:
+            first = self.run(
+                "--task", "Run the original check.", "--shell",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log", input_text="y\n",
+            )
+            session_name = session_name_from_result(first, noninteractive=False)
+            second = self.run(
+                "--shell", "--reuse-session", session_name, "1",
+                "--task", "Use the revised output instead.", "--noninteractive",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--no-api-log",
+            )
+        require(
+            session_name_from_result(second, noninteractive=True) == session_name
+            and len(mock.requests) == 3,
+            "shell revision changed sessions or made an unwanted follow-up request",
+        )
+        revision_input = str(mock.requests[2]["input"])
+        require(
+            "<shell_revision" in revision_input
+            and "<previous_task>\nRun the original check.\n</previous_task>" in revision_input
+            and "printf old-output" in revision_input
+            and "Use the revised output instead." in revision_input,
+            "revision did not recover the last command turn before session_end",
+        )
+        state = json.loads(self.run(
+            "--state-print-json", session_name, "2",
+            "request_task", "response_shell_output",
+        ).stdout)
+        require(
+            state["request_task"] == "Use the revised output instead."
+            and "<stdout>\nrevised-output</stdout>" in state["response_shell_output"],
+            "revised commands were not executed and stored in a new turn",
+        )
+        original_state = json.loads(self.run(
+            "--state-print-json", session_name, "0", "response_shell_output",
+        ).stdout)
+        require(
+            "<stdout>\nold-output</stdout>" in original_state["response_shell_output"],
+            "shell revision overwrote the original command output",
+        )
+
+    def test_shell_network_address_families(self) -> None:
+        script = [
+            "import errno, socket",
+            "with socket.socket(socket.AF_UNIX):",
+            "    print('unix-ok')",
+            "try:",
+            "    sock = socket.socket(socket.AF_INET)",
+            "except OSError as exc:",
+            "    print('inet-denied' if exc.errno == errno.EAFNOSUPPORT else 'unexpected-error')",
+            "else:",
+            "    sock.close()",
+            "    print('inet-allowed')",
+        ]
+        manifest = {
+            "commands": [{
+                "command": shlex.quote(sys.executable),
+                "lines": script,
+                "reason": "Inspect socket creation without making network connections",
+            }],
+        }
+        ended = {"action": "session_end", "commands": [], "reason": "Socket check completed"}
+        for networking, expected in (("off", "inet-denied"), ("on", "inet-allowed")):
+            with MockResponsesAPI([{"output": manifest}, {"output": ended}]) as mock:
+                result = self.run(
+                    "--task", "Check shell address-family restrictions.",
+                    "--shell", "--shell-networking", networking,
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log", input_text="y\n",
+                )
+            require(len(mock.requests) == 2, "expected a socket check and follow-up")
+            session_name = session_name_from_result(result, noninteractive=False)
+            state = json.loads(self.run(
+                "--state-print-json", session_name, "0", "response_shell_output",
+            ).stdout)
+            output = state["response_shell_output"]
+            require(
+                f"<stdout>\nunix-ok\n{expected}\n</stdout>" in output
+                and "<exit_status>0</exit_status>" in output,
+                f"shell networking={networking} did not enforce the expected address families",
+            )
+
+    def test_agent_patch_readfile_companion(self) -> None:
+        target = self.work / "agent-patch.txt"
+        target.write_text("original\n", encoding="utf-8")
+        manifest = self._patch_manifest(target, patches=[self._replacement_patch(["agent-updated"])])
+        responses = [
+            MockResponsesAPI.tool_response(("patch", {**manifest, "expires_in_turns": 999})),
+            MockResponsesAPI.tool_response(("session", {"action": "end", "reason": "Agent patch completed"})),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Apply an agent patch.", "--agent", "--agent-auto",
+                "--agent-context-expires", "3", "1", "4",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 2, "expected two agent controller requests")
+        require(
+            target.read_text(encoding="utf-8") == "agent-updated\n"
+            and not target.with_name(target.name + ".mcepatched").exists(),
+            "automatic agent patch did not overwrite the source by default",
+        )
+        request = mock.requests[0]
+        require(
+            request.get("tool_choice") == "required"
+            and request.get("parallel_tool_calls") is True,
+            "agent controller did not require native tool calls",
+        )
+        schemas = {tool["name"]: tool["parameters"] for tool in request["tools"]}
+        require(
+            schemas["patch"]["properties"]["expires_in_turns"]
+            == {"type": "integer", "minimum": 1, "maximum": 4, "default": 3}
+            and "expires_in_turns" not in schemas["meta_task_list"]["properties"],
+            "configured expiry schema or persistent task-list schema was incorrect",
+        )
+        patch_schema = schemas["patch"]["properties"]["files"]["items"]["properties"]
+        require(
+            set(patch_schema["document"]["properties"]) == {"path", "encoding", "line_ending"}
+            and set(patch_schema["patches"]["items"]["properties"])
+            == {"patch_id", "block_id", "start_line", "end_line", "content_line_array", "summary_message"},
+            "agent patch tool exposed obsolete manifest fields",
+        )
+        followup = str(mock.requests[1]["input"])
+        require(
+            "1 agent-updated" in followup
+            and "<file turn='1' expires_in_turns='3'" in followup
+            and "last_modified_time='" in followup
+            and "last_refreshed_time='" in followup
+            and "<current_unix_time>" in followup,
+            "patch companion did not refresh numbered, timestamped file context",
+        )
+        history = followup.split("<agent_history>\n", 1)[1].split("\n</agent_history>", 1)[0]
+        require(
+            history.count("<agent_turn") == 1,
+            "patch readfile companion incorrectly created a separate history turn",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        state = self.state_artifacts(
+            session_name, "0", "response",
+            "response_agent_file_contexts", "response_schema_patch_applied",
+        )
+        calls = json.loads(state["response"])["tool_calls"]
+        require(
+            [call["tool"] for call in calls] == ["patch", "readfile"]
+            and all(call["expires_in_turns"] == 4 for call in calls)
+            and calls[1]["paths"] == [str(target)]
+            and state["response_schema_patch_applied"] == str(target),
+            "patch companion, clamped expiry, or application paths were not saved",
+        )
+        contexts = json.loads(state["response_agent_file_contexts"])
+        require(
+            len(contexts) == 1 and contexts[0]["path"] == str(target)
+            and "1 agent-updated" in contexts[0]["section"],
+            "refreshed agent file context was not persisted",
+        )
+
+    def test_agent_task_list_atomic_capacity(self) -> None:
+        tasks = [{"task": f"Capacity task {number}", "status": "todo"} for number in range(1, 26)]
+        replacement = {"task": "Replacement capacity task", "status": "todo"}
+        responses = [
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "add", "tasks": tasks},
+            ]})),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "change", "tasks": [{"number": 1, "status": "done"}]},
+                {"action": "change", "tasks": [{"number": 99, "status": "skip"}]},
+            ]})),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "add", "tasks": [replacement]},
+                {"action": "change", "tasks": [{"number": 1, "status": "done"}]},
+            ]})),
+            MockResponsesAPI.tool_response(("session", {"action": "end", "reason": "Task list completed"})),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Maintain an atomic task list.", "--agent", "--agent-auto",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 4, "unexpected task-list controller request count")
+        failed_followup = str(mock.requests[2]["input"])
+        task_block = failed_followup.split("<meta_task_list>\n", 1)[1].split("\n</meta_task_list>", 1)[0]
+        require(
+            task_block.splitlines()[0] == "1. [todo] Capacity task 1"
+            and len(task_block.splitlines()) == 25
+            and "ERROR: Failed to update task list" in failed_followup,
+            "failed task-list batch partially changed the persistent tasks",
+        )
+        final_followup = str(mock.requests[3]["input"])
+        final_block = final_followup.split("<meta_task_list>\n", 1)[1].split("\n</meta_task_list>", 1)[0]
+        require(
+            len(final_block.splitlines()) == 25
+            and final_block.splitlines()[0] == "1. [todo] Capacity task 2"
+            and final_block.splitlines()[-1] == "25. [todo] Replacement capacity task",
+            "capacity was not enforced after the whole batch by pruning the oldest completed task",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        state = json.loads(self.run(
+            "--state-print-json", session_name, "meta_task_list",
+        ).stdout)
+        require(
+            json.loads(state["meta_task_list"]) == tasks[1:] + [replacement],
+            "persistent task-list snapshot differs from the controller context",
+        )
+
+    def test_agent_controller_retries(self) -> None:
+        ended = MockResponsesAPI.tool_response(("session", {
+            "action": "end", "reason": "Controller recovered",
+        }))
+        with MockResponsesAPI(["Invalid plain-text controller answer", ended]) as mock:
+            result = self.run(
+                "--task", "Exercise controller response recovery.",
+                "--agent", "--agent-auto", "--retry", "1",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--no-api-log",
+            )
+        require(
+            len(mock.requests) == 2 and mock.requests[0] == mock.requests[1]
+            and "Agent response failed (attempt 1/2)" in result.stderr,
+            "invalid controller response was not retried with the same request",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        session_dir = self.home / ".local/state/mince/state" / session_name
+        require(
+            sorted(path.name for path in session_dir.iterdir() if path.is_dir()) == ["0"],
+            "controller response retries created extra state turns",
+        )
+        state = json.loads(self.run(
+            "--state-print-json", session_name, "0", "response",
+        ).stdout)
+        require(
+            json.loads(state["response"])["tool"] == "session",
+            "successful controller retry was not saved",
+        )
+        log = (self.home / ".local/state/mince/logs" / f"{session_name}.txt").read_text(
+            encoding="utf-8",
+        )
+        require("Agent response failed (attempt 1/2)" in log, "controller retry was not logged")
+        meta_only = MockResponsesAPI.tool_response(("meta_context_control", {
+            "action": "pin", "context_id": "turn:1", "reason": "No executable call",
+        }))
+        for invalid in (meta_only, MockResponsesAPI.tool_response(
+            ("session", {"action": "end", "reason": "Invalid extra call"}),
+            ("meta_context_control", {"action": "pin", "context_id": "turn:1", "reason": "Extra"}),
+        )):
+            with MockResponsesAPI([invalid]) as mock:
+                failed = self.run(
+                    "--task", "Reject an invalid controller call batch.",
+                    "--agent", "--agent-auto", "--retry", "0",
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log", check=False,
+                )
+            require(
+                failed.returncode != 0 and len(mock.requests) == 1
+                and "Agent response failed (attempt 1/1)" in failed.stderr,
+                "invalid controller ordering or session companion was accepted",
+            )
+
+    def test_agent_profile_worker(self) -> None:
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        names = ("offline_worker", "offline_worker_copy", "offline_worker_renamed")
+        try:
+            self.run("--agent-profile-edit", names[0], json.dumps(schema))
+            self.run("--agent-profile-description", names[0], "Produce an offline structured answer.")
+            self.run("--agent-profile-copy", names[0], names[1])
+            self.run("--agent-profile-rename", names[1], names[2])
+            self.run("--agent-profile-type", names[2], "patch")
+            profiles = json.loads(self.run("--agent-profile-print-json", names[0], names[2]).stdout)
+            require(
+                profiles[names[0]]["type"] == "custom"
+                and json.loads(profiles[names[0]]["content"]) == schema
+                and profiles[names[2]]["type"] == "patch"
+                and profiles[names[2]]["description"] == profiles[names[0]]["description"],
+                "agent profile copy, rename, type, or description was not retained",
+            )
+            listed = self.run("--agent-profile-list")
+            require(
+                f"{names[0]} Produce an offline structured answer." in listed.stdout,
+                "agent profile listing omitted the description",
+            )
+            tool_name = f"agent_{names[0]}"
+            responses = [
+                MockResponsesAPI.tool_response((tool_name, {
+                    "task": "Return the worker answer.",
+                    "context": "Worker-only context",
+                    "reason": "Delegate the structured answer",
+                })),
+                {"output": {"answer": "worker result"}},
+                MockResponsesAPI.tool_response(("session", {
+                    "action": "end", "reason": "Worker completed",
+                })),
+            ]
+            with MockResponsesAPI(responses) as mock:
+                result = self.run(
+                    "--task", "Delegate to the selected worker.",
+                    "--agent", "--agent-auto", "--agent-profile", names[0],
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log",
+                )
+            require(len(mock.requests) == 3, "expected controller, worker, and controller requests")
+            require(
+                tool_name in {tool["name"] for tool in mock.requests[0]["tools"]},
+                "selected profile was not exposed as a controller tool",
+            )
+            worker_request = mock.requests[1]
+            require(
+                worker_request["text"]["format"] == {
+                    "type": "json_schema", "name": tool_name, "strict": True, "schema": schema,
+                }
+                and "tools" not in worker_request
+                and "Worker-only context" in worker_request["input"]
+                and "Produce an offline structured answer." in worker_request["instructions"],
+                "worker schema, context, or description was not propagated",
+            )
+            require(
+                "worker result" in mock.requests[2]["input"],
+                "worker result was not returned to the controller history",
+            )
+            session_name = session_name_from_result(result, noninteractive=False)
+            session_dir = self.home / ".local/state/mince/state" / session_name
+            require(
+                sorted(path.name for path in session_dir.iterdir() if path.is_dir()) == ["0", "1"],
+                "worker request should not create a separate controller state turn",
+            )
+        finally:
+            for name in names:
+                self.run("--agent-profile-remove", name, check=False)
+
+    def test_plan_review_and_saved_state(self) -> None:
+        target = self.work / "plan-context.txt"
+        target.write_text("offline plan context\n", encoding="utf-8")
+        original_task = "Prepare the original offline planning task."
+        planned_task = "Use the reviewed offline plan as the next task."
+        cases = [
+            ("accepted", "y\n", False),
+            ("rejected", "n\n", False),
+            ("saved", None, True),
+        ]
+        for name, review_input, noninteractive in cases:
+            accepted = name == "accepted"
+            responses = [planned_task, "offline planned answer"] if accepted else [planned_task]
+            with MockResponsesAPI(responses) as mock:
+                result = self.run(
+                    "--task", original_task, "--files", target, "--plan",
+                    "--system-prompt", "offline planning system",
+                    "--system-prompt-with-task",
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log",
+                    *(("--noninteractive",) if noninteractive else ()),
+                    input_text=review_input,
+                )
+            require(
+                len(mock.requests) == (2 if accepted else 1),
+                f"{name} plan made an unexpected number of API requests",
+            )
+            require(
+                original_task in mock.requests[0]["instructions"]
+                and original_task not in mock.requests[0]["input"]
+                and "1 offline plan context" in mock.requests[0]["input"],
+                f"{name} plan omitted context or misplaced the original task",
+            )
+            session_name = session_name_from_result(result, noninteractive=noninteractive)
+            session_dir = self.home / ".local/state/mince/state" / session_name
+            require(
+                sorted(path.name for path in session_dir.iterdir() if path.is_dir())
+                == (["0", "1"] if accepted else ["0"]),
+                f"{name} plan created unexpected state turns",
+            )
+            state = json.loads(self.run(
+                "--state-print-json", session_name, "0", "request_task", "response",
+            ).stdout)
+            require(
+                state["request_task"] == original_task and state["response"] == planned_task,
+                f"{name} plan did not preserve its original task and generated prompt",
+            )
+            if accepted:
+                require(
+                    planned_task in mock.requests[1]["instructions"]
+                    and original_task not in mock.requests[1]["instructions"]
+                    and planned_task not in mock.requests[1]["input"]
+                    and "offline planned answer" in result.stdout,
+                    "accepted plan was not used as the next system task",
+                )
+                next_state = json.loads(self.run(
+                    "--state-print-json", session_name, "1", "request_task", "response",
+                ).stdout)
+                require(
+                    next_state["request_task"] == planned_task
+                    and next_state["response"] == "offline planned answer",
+                    "accepted plan task and answer were not saved in the next turn",
+                )
+            elif noninteractive:
+                require(
+                    result.stdout == f"{session_name}\n",
+                    "noninteractive planning should save the plan and print only its session name",
+                )
+
+    def test_patch_revision_navigation(self) -> None:
+        target = self.work / "revision-navigation.txt"
+        target.write_text("original\n", encoding="utf-8")
+        original_task = "Review the original offline patch proposal."
+        revision_task = "Use the revised replacement instead."
+        original = self._patch_manifest(
+            target, patches=[self._replacement_patch(["first-proposal"])],
+        )
+        revised = self._patch_manifest(
+            target, patches=[self._replacement_patch(["revised-proposal"])],
+        )
+        with MockResponsesAPI([{"output": original}, {"output": revised}]) as mock:
+            result = self.run(
+                "--task", original_task, "--files", target,
+                "--patch", "--patch-review", "--patch-save", "off",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+                input_text=f"E {revision_task}\n<\n>\ny\n",
+            )
+        require(len(mock.requests) == 2, "patch navigation made an extra revision request")
+        revision_input = str(mock.requests[1]["input"])
+        require(
+            f"<json_patch_task>\n{original_task}\n</json_patch_task>" in revision_input
+            and "first-proposal" in revision_input
+            and revision_task in revision_input
+            and "1 original" in revision_input,
+            "patch revision omitted the previous task, proposal, or original file context",
+        )
+        require(
+            target.read_text(encoding="utf-8") == "revised-proposal\n"
+            and not target.with_name(target.name + ".mcepatched").exists(),
+            "patch navigation did not apply the selected revised proposal to the source",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        session_dir = self.home / ".local/state/mince/state" / session_name
+        require(
+            not (session_dir / "0" / "response_schema_patch_applied").exists(),
+            "patch navigation marked the unaccepted original proposal as applied",
+        )
+        state = json.loads(self.run(
+            "--state-print-json", session_name, "1", "request_task",
+            "response_diff_patch", "response_schema_patch_applied",
+        ).stdout)
+        require(
+            state["request_task"] == revision_task
+            and "+revised-proposal" in state["response_diff_patch"]
+            and state["response_schema_patch_applied"] == str(target),
+            "patch navigation associated the applied patch with the wrong state turn",
+        )
+
+    def test_shell_reuse_keeps_existing_output(self) -> None:
+        counter = self.work / "shell-reuse-executions.txt"
+        manifest = {
+            "commands": [{
+                "command": (
+                    f"printf 'execution\\n' >> {shlex.quote(str(counter))}; "
+                    "printf saved-shell-output"
+                ),
+                "reason": "Record execution and produce reusable offline output",
+            }],
+        }
+        ended = {"action": "session_end", "commands": [], "reason": "Initial shell check completed"}
+        reused_end = {"action": "session_end", "commands": [], "reason": "Saved shell output inspected"}
+        with MockResponsesAPI([
+            {"output": manifest}, {"output": ended}, {"output": reused_end},
+        ]) as mock:
+            first = self.run(
+                "--task", "Inspect reusable shell output.", "--shell",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log", input_text="y\n",
+            )
+            session_name = session_name_from_result(first, noninteractive=False)
+            turn_dir = self.home / ".local/state/mince/state" / session_name / "0"
+            saved_output = (turn_dir / "response_shell_output").read_text(encoding="utf-8")
+            resumed = self.run(
+                "--shell", "--reuse-session", session_name, "0", "--noninteractive",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(
+            session_name_from_result(resumed, noninteractive=True) == session_name
+            and len(mock.requests) == 3,
+            "resuming saved shell output changed sessions or regenerated commands",
+        )
+        require(
+            counter.read_text(encoding="utf-8") == "execution\n",
+            "resuming a command turn with saved output executed the command again",
+        )
+        require(
+            "<stdout>\nsaved-shell-output</stdout>" in saved_output
+            and saved_output in mock.requests[2]["input"]
+            and (turn_dir / "response_shell_output").read_text(encoding="utf-8") == saved_output,
+            "shell reuse omitted or overwrote the previously saved command output",
+        )
+        require(
+            self.shell_session_response(session_name) == reused_end,
+            "shell reuse did not save the new follow-up completion response",
+        )
+
+    def test_agent_context_control_and_expiry(self) -> None:
+        retained = self.work / "retained-agent-context.txt"
+        transient = self.work / "transient-agent-context.txt"
+        retained.write_text("retained-agent-context\n", encoding="utf-8")
+        transient.write_text("transient-agent-context\n", encoding="utf-8")
+        task = "Exercise offline agent context retention."
+        continuation = {
+            "task": task, "context": "", "reason": "Advance the context retention check",
+        }
+        responses = [
+            MockResponsesAPI.tool_response(("readfile", {"paths": [str(retained)]})),
+            MockResponsesAPI.tool_response(
+                ("readfile", {"paths": [str(transient)]}),
+                ("meta_context_control", {
+                    "action": "pin", "context_id": "turn:1",
+                    "reason": "Retain the first readfile turn",
+                }),
+            ),
+            MockResponsesAPI.tool_response(
+                ("agent", continuation),
+                ("meta_context_control", {
+                    "action": "set_expires_in_turns", "context_id": "turn:2",
+                    "reason": "Extend the second readfile turn", "expires_in_turns": 2,
+                }),
+            ),
+            MockResponsesAPI.tool_response(("agent", continuation)),
+            MockResponsesAPI.tool_response(("agent", continuation)),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Context retention checked",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            self.run(
+                "--task", task, "--agent", "--agent-auto",
+                "--agent-context-expires", "1", "0", "2",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 6, "unexpected context-retention controller request count")
+        file_contexts = [
+            str(request["input"]).split("<files ", 1)[1].split("\n</files>", 1)[0]
+            for request in mock.requests
+        ]
+        require(
+            all("1 retained-agent-context" in context for context in file_contexts[1:]),
+            "pinning a readfile turn did not retain its file context after expiry",
+        )
+        require(
+            all("1 transient-agent-context" in file_contexts[index] for index in (2, 3, 4))
+            and "<file turn='2' expires_in_turns='1'" in file_contexts[3]
+            and "<file turn='2' expires_in_turns='0'" in file_contexts[4]
+            and str(transient) not in file_contexts[5],
+            "updated readfile expiry did not retain and then remove the unpinned file context",
+        )
+        final_input = str(mock.requests[5]["input"])
+        require(
+            " pinned index='1' " in final_input
+            and "expires_in_turns limit was reached" in final_input
+            and "purge_in_turns='1'" in final_input,
+            "agent history omitted the pinned turn or the expired-turn removal notice",
+        )
+
+    def test_agent_reuse_restores_selected_history(self) -> None:
+        target = self.work / "reused-agent-context.txt"
+        target.write_text("Persisted readfile context\n", encoding="utf-8")
+        task = "Resume the selected offline agent history."
+        tasks = [{"task": "Inspect the resumed fixture", "status": "todo"}]
+        completed_tasks = [{**item, "status": "done"} for item in tasks]
+        change = {"action": "change", "tasks": [{"number": 1, "status": "done"}]}
+        responses = [
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "add", "tasks": tasks},
+            ]})),
+            MockResponsesAPI.tool_response(("readfile", {"paths": [str(target)]})),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [change]})),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Initial agent history completed",
+            })),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [change]})),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Selected agent history resumed",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            first = self.run(
+                "--task", task, "--agent", "--agent-auto",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+            session_name = session_name_from_result(first, noninteractive=False)
+            initial_state = self.state_artifacts(session_name, "meta_task_list")
+            require(
+                json.loads(initial_state["meta_task_list"]) == completed_tasks,
+                "initial agent session did not persist its completed task list",
+            )
+            target.write_text("Current disk context\n", encoding="utf-8")
+            resumed = self.run(
+                "--agent", "--agent-auto", "--reuse-session", session_name, "1",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(
+            session_name_from_result(resumed, noninteractive=False) == session_name
+            and len(mock.requests) == 6,
+            "agent reuse changed sessions or replayed completed tool calls",
+        )
+        resumed_input = str(mock.requests[4]["input"])
+        task_block = resumed_input.split("<meta_task_list>\n", 1)[1].split("\n</meta_task_list>", 1)[0]
+        history = resumed_input.split("<agent_history>\n", 1)[1].split("\n</agent_history>", 1)[0]
+        require(
+            task_block == "1. [todo] Inspect the resumed fixture"
+            and history.count("<agent_turn") == 2
+            and task in resumed_input,
+            "agent reuse did not reconstruct the selected turn's task list and history",
+        )
+        require(
+            "1 Persisted readfile context" in resumed_input
+            and "1 Current disk context" not in resumed_input,
+            "agent reuse replaced persisted readfile context with current disk content",
+        )
+        require(
+            "1. [done] Inspect the resumed fixture" in mock.requests[5]["input"],
+            "resumed task-list changes were not returned to the controller",
+        )
+        session_dir = self.home / ".local/state/mince/state" / session_name
+        require(
+            sorted(path.name for path in session_dir.iterdir() if path.is_dir())
+            == ["0", "1", "2", "3", "4", "5"],
+            "agent reuse overwrote old turns instead of appending new state turns",
+        )
+        final_state = self.state_artifacts(session_name, "meta_task_list")
+        require(
+            json.loads(final_state["meta_task_list"]) == completed_tasks,
+            "resumed agent task-list snapshot was not persisted",
+        )
+
+    def test_api_key_redaction(self) -> None:
+        profile_name = "key_redaction"
+        secret = "abcd-secret-wxyz"
+        masked = "abcd********wxyz"
+        self.run("--copy-profile", profile_name)
+        try:
+            self.run(
+                "--profile", profile_name, "--set-config", f"api_key={secret}",
+            )
+            outputs = [
+                self.run("--profile", profile_name, "--get-config", "api_key"),
+                self.run("--profile", profile_name, "--get-config-detail", "api_key"),
+                self.run("--profile", profile_name, "--print-current-config"),
+                self.run("--print-profiles-json", profile_name),
+                self.run("--print-profiles", profile_name, "--noninteractive"),
+            ]
+            for result in outputs:
+                require(
+                    masked in result.stdout
+                    and secret not in result.stdout + result.stderr,
+                    "configuration output exposed an API key or omitted its masked value",
+                )
+            profile_path = self.home / ".local/state/mince" / f"{profile_name}.json"
+            require(
+                json.loads(profile_path.read_text(encoding="utf-8"))["api_key"] == secret,
+                "printing configuration replaced the stored API key with its masked value",
+            )
+            with MockResponsesAPI(["offline redaction answer"]) as mock:
+                result = self.run(
+                    "--profile", profile_name, "--ask", "Check offline key redaction.",
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "on", "--no-api-log",
+                )
+            require(
+                len(mock.requests) == 1 and result.stdout == "offline redaction answer\n",
+                "redaction check made an unexpected request or omitted the response",
+            )
+            session_name = session_name_from_result(result, noninteractive=False)
+            log = (self.home / ".local/state/mince/logs" / f"{session_name}.txt").read_text(
+                encoding="utf-8",
+            )
+            require(
+                masked in log and secret not in log + result.stdout + result.stderr,
+                "session logging exposed the configured API key",
+            )
+            self.run("--profile", profile_name, "--set-config", "api_key=tiny")
+            short_key = self.run("--profile", profile_name, "--get-config", "api_key")
+            require(
+                short_key.stdout.strip() == "api_key=****",
+                "short API keys were not completely masked",
+            )
+        finally:
+            self.run("--remove-profile", profile_name)
+
+    def test_text_and_json_output_files(self) -> None:
+        output_file = self.work / "response-output" / "answer.txt"
+        answer = {"answer": "offline café"}
+        cases = [
+            ("text", "offline file response\nSecond line", "offline file response\nSecond line"),
+            ("json", {"output": answer}, json.dumps(answer, indent=2, ensure_ascii=False)),
+        ]
+        with MockResponsesAPI([response for _, response, _ in cases]) as mock:
+            for response_format, _, expected in cases:
+                if output_file.exists():
+                    output_file.write_text(
+                        "stale output that must be completely overwritten\n",
+                        encoding="utf-8",
+                    )
+                result = self.run(
+                    "--ask", "Write the offline answer to a file.",
+                    "--response-format", response_format, "--output-file", output_file,
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log",
+                )
+                require(
+                    result.stdout == ""
+                    and output_file.read_text(encoding="utf-8") == expected,
+                    f"{response_format} output was duplicated on stdout or written incorrectly",
+                )
+        require(len(mock.requests) == 2, "expected one request per output-file format")
+        require(
+            mock.requests[0]["text"]["format"] == {"type": "text"}
+            and mock.requests[1]["text"]["format"] == {"type": "json_object"},
+            "output-file requests did not preserve their response formats",
+        )
+
+    def test_input_token_estimation_and_limit(self) -> None:
+        target = self.work / "token-limit-context.txt"
+        source = "Offline token estimation context\n"
+        target.write_text(source, encoding="utf-8")
+        with MockResponsesAPI(["This response must not be requested"]) as mock:
+            common = (
+                "--task", "Estimate the offline request.", "--files", target,
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+            estimated = self.run(*common, "--estimate-only")
+            bounded_estimate = self.run(
+                *common, "--estimate-only", "--token-limit", "1",
+            )
+            failed = self.run(*common, "--token-limit", "1", check=False)
+        require(
+            estimated.stdout.strip().isdigit()
+            and int(estimated.stdout.strip()) > 1
+            and bounded_estimate.stdout == estimated.stdout,
+            "estimate-only did not return a stable token count independently of the limit",
+        )
+        require(
+            failed.returncode != 0
+            and f"Estimated input token count ({estimated.stdout.strip()}) exceeds token limit (1)"
+            in failed.stderr
+            and not mock.requests,
+            "token estimation or input-limit rejection unexpectedly called the API",
+        )
+        for result in (estimated, bounded_estimate, failed):
+            session_name = session_name_from_result(result, noninteractive=False)
+            session_dir = self.home / ".local/state/mince/state" / session_name
+            require(
+                session_dir.is_dir() and not any(session_dir.iterdir()),
+                "estimation or input-limit rejection created request-turn artifacts",
+            )
+        require(target.read_text(encoding="utf-8") == source, "token checks modified context")
+
+    def test_shell_rejects_invalid_command_manifests(self) -> None:
+        marker = self.work / "invalid-shell-executed.txt"
+        command = f"printf unexpected > {shlex.quote(str(marker))}"
+        step = {"command": command, "reason": "Record whether invalid commands ran"}
+        cases = [
+            ("empty-commands", {"commands": []}, "non-empty array"),
+            ("empty-command", {"commands": [{**step, "command": " "}]}, "non-empty command"),
+            ("missing-reason", {"commands": [{"command": command}]}, "non-empty reason"),
+            ("empty-lines", {"commands": [{**step, "lines": []}]}, "non-empty lines array"),
+            ("nonstring-lines", {"commands": [{**step, "lines": [1]}]}, "lines must be strings"),
+            ("unexpected-field", {"commands": [{**step, "extra": True}]}, "unexpected fields"),
+        ]
+        for name, manifest, diagnostic in cases:
+            with MockResponsesAPI([{"output": manifest}]) as mock:
+                failed = self.run(
+                    "--task", "Reject the invalid offline shell manifest.", "--shell",
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log",
+                    input_text="y\n", check=False,
+                )
+            require(
+                failed.returncode != 0
+                and "Failed to parse shell command manifest" in failed.stderr
+                and diagnostic in failed.stderr,
+                f"{name} was accepted or its validation diagnostic was missing: {failed.stderr}",
+            )
+            require(
+                len(mock.requests) == 1 and not marker.exists(),
+                f"{name} executed commands or requested a shell follow-up",
+            )
+
+    def test_agent_hook_context_scripts(self) -> None:
+        counter = self.work / "agent-hook-executions.txt"
+        successful = self.work / "successful-agent-hook.sh"
+        unsuccessful = self.work / "unsuccessful-agent-hook.sh"
+        missing = self.work / "missing-agent-hook.sh"
+        successful.write_text(
+            "#!/bin/sh\n"
+            "cat\n"
+            "printf 'Accepted hook context\\n'\n"
+            f"printf 'executed\\n' >> {shlex.quote(str(counter))}\n",
+            encoding="utf-8",
+        )
+        unsuccessful.write_text(
+            "#!/bin/sh\n"
+            "printf 'Rejected hook context\\n'\n"
+            "printf 'Discarded hook stderr\\n' >&2\n"
+            "exit 7\n",
+            encoding="utf-8",
+        )
+        successful.chmod(0o700)
+        unsuccessful.chmod(0o700)
+        task = "Inspect offline agent hook context."
+        stdin_marker = "Hook input must not be consumed\n"
+        responses = [
+            MockResponsesAPI.tool_response(("agent", {
+                "task": task, "context": "", "reason": "Check hooks on the next turn",
+            })),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Offline hook session completed",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", task, "--agent", "--agent-auto",
+                "--agent-hook-context", successful, unsuccessful, missing,
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log", input_text=stdin_marker,
+            )
+        require(
+            len(mock.requests) == 2
+            and counter.read_text(encoding="utf-8") == "executed\nexecuted\n",
+            "successful hooks were not executed once before each controller turn",
+        )
+        for request in mock.requests:
+            prompt = str(request["input"])
+            require(
+                prompt.count("<additional_context>") == 1
+                and "<additional_context>\nAccepted hook context\n</additional_context>" in prompt
+                and "Rejected hook context" not in prompt
+                and "Discarded hook stderr" not in prompt
+                and stdin_marker not in prompt,
+                "hook context included failed output, stderr, or inherited standard input",
+            )
+        require(
+            "Discarded hook stderr" not in result.stderr,
+            "failed hook stderr was unexpectedly printed",
+        )
+
+    def test_agent_readfile_refresh_removes_stale_context(self) -> None:
+        target = self.work / "refreshed-agent-context.txt"
+        target.write_text("Original readfile context\n", encoding="utf-8")
+        responses = [
+            MockResponsesAPI.tool_response(("readfile", {"paths": [str(target)]})),
+            MockResponsesAPI.tool_response(("shell", {
+                "commands": [{
+                    "command": (
+                        f"printf 'Refreshed readfile context\\n' > {shlex.quote(str(target))}"
+                    ),
+                    "reason": "Update the temporary fixture before refreshing file context",
+                }],
+            })),
+            MockResponsesAPI.tool_response(("readfile", {"paths": [str(target)]})),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Readfile context refreshed",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Refresh the offline readfile fixture.",
+                "--agent", "--agent-auto",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 4, "unexpected readfile-refresh controller request count")
+        original_files = str(mock.requests[1]["input"]).split(
+            "<files ", 1,
+        )[1].split("\n</files>", 1)[0]
+        refreshed_files = str(mock.requests[3]["input"]).split(
+            "<files ", 1,
+        )[1].split("\n</files>", 1)[0]
+        require(
+            "1 Original readfile context" in original_files
+            and "1 Refreshed readfile context" in refreshed_files
+            and "1 Original readfile context" not in refreshed_files
+            and refreshed_files.count(f"path='{target}'") == 1
+            and "<file turn='3' " in refreshed_files,
+            "refreshing a readfile path retained stale or duplicate file context",
+        )
+        require(
+            target.read_text(encoding="utf-8") == "Refreshed readfile context\n",
+            "the readfile-refresh fixture was not updated by the accepted shell tool",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        original_state = self.state_artifacts(
+            session_name, "0", "response_agent_file_contexts",
+        )
+        refreshed_state = self.state_artifacts(
+            session_name, "2", "response_agent_file_contexts",
+        )
+        original_contexts = json.loads(original_state["response_agent_file_contexts"])
+        refreshed_contexts = json.loads(refreshed_state["response_agent_file_contexts"])
+        require(
+            len(original_contexts) == 1 and len(refreshed_contexts) == 1
+            and original_contexts[0]["path"] == refreshed_contexts[0]["path"] == str(target)
+            and "1 Original readfile context" in original_contexts[0]["section"]
+            and "1 Refreshed readfile context" not in original_contexts[0]["section"]
+            and "1 Refreshed readfile context" in refreshed_contexts[0]["section"],
+            "refreshing live context overwrote an earlier persisted readfile snapshot",
+        )
+
+    def test_tool_review_rejections(self) -> None:
+        target = self.work / "rejected-review.txt"
+        marker = self.work / "rejected-shell-executed.txt"
+        source = "review-original\n"
+        target.write_text(source, encoding="utf-8")
+        task = "Reject the offline tool proposal without executing it."
+        patch = self._patch_manifest(
+            target, patches=[self._replacement_patch(["not-approved"])],
+        )
+        shell = {
+            "commands": [{
+                "command": f"printf unexpected > {shlex.quote(str(marker))}",
+                "reason": "Record whether the rejected command executed",
+            }],
+        }
+        cases = [
+            ("patch", patch, ("--patch", "--patch-review", "--patch-save", "off")),
+            ("shell", shell, ("--shell",)),
+        ]
+        for name, proposal, options in cases:
+            with MockResponsesAPI([{"output": proposal}]) as mock:
+                result = self.run(
+                    "--task", task, "--files", target, *options,
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log", input_text="n\n",
+                )
+            require(
+                len(mock.requests) == 1
+                and target.read_text(encoding="utf-8") == source
+                and not target.with_name(target.name + ".mcepatched").exists()
+                and not marker.exists(),
+                f"rejected {name} review changed files or made a follow-up request",
+            )
+            session_name = session_name_from_result(result, noninteractive=False)
+            artifacts = self.state_artifacts(session_name, "0")
+            require(
+                artifacts["request_task"] == task
+                and json.loads(artifacts["response"]) == proposal
+                and "response_schema_patch_applied" not in artifacts
+                and "response_shell_output" not in artifacts,
+                f"rejected {name} proposal was not preserved as an unexecuted state turn",
+            )
+            if name == "patch":
+                require(
+                    json.loads(artifacts["response_schema_patch"]) == patch
+                    and "+not-approved" in artifacts["response_diff_patch"],
+                    "rejected patch review did not retain its validated manifest and diff",
+                )
+
+    def test_patch_reuse_skip_verify(self) -> None:
+        target = self.work / "skip-verify-patch.txt"
+        source = "original-source\n"
+        changed_source = "changed-source\n"
+        target.write_text(source, encoding="utf-8")
+        original_task = "Save the original offline patch."
+        revision_task = "Revise the saved patch against changed file content."
+        original = self._patch_manifest(
+            target, patches=[self._replacement_patch(["first-proposal"])],
+        )
+        revised = self._patch_manifest(
+            target, patches=[self._replacement_patch(["revised-proposal"])],
+        )
+        with MockResponsesAPI([{"output": original}, {"output": revised}]) as mock:
+            common = (
+                "--patch", "--noninteractive", "--model", "offline-test-model",
+                "--base-url", mock.url, "--no-api-log",
+            )
+            first = self.run(
+                "--task", original_task, "--files", target, *common,
+            )
+            session_name = session_name_from_result(first, noninteractive=True)
+            original_state = self.state_artifacts(session_name, "0")
+            target.write_text(changed_source, encoding="utf-8")
+            resumed = self.run(
+                "--task", revision_task, "--reuse-session", session_name, "0",
+                "--reuse-session-skip-verify", *common,
+            )
+        require(
+            session_name_from_result(resumed, noninteractive=True) == session_name
+            and len(mock.requests) == 2,
+            "checksum-skip patch reuse changed sessions or made unexpected requests",
+        )
+        revision_input = str(mock.requests[1]["input"])
+        previous_manifest = revision_input.split(
+            "<json_patch>\n", 1,
+        )[1].split("\n</json_patch>", 1)[0]
+        require(
+            f"<json_patch_task>\n{original_task}\n</json_patch_task>" in revision_input
+            and json.loads(previous_manifest) == original
+            and revision_task in revision_input
+            and "1 changed-source" in revision_input,
+            "patch reuse omitted the saved proposal, previous task, or current file context",
+        )
+        revised_state = self.state_artifacts(session_name, "1")
+        expected_checksum = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        require(
+            self.state_artifacts(session_name, "0") == original_state
+            and revised_state["request_files"] == f"{target.resolve()} {expected_checksum}"
+            and revised_state["request_task"] == revision_task
+            and json.loads(revised_state["response_schema_patch"]) == revised
+            and "+revised-proposal" in revised_state["response_diff_patch"],
+            "patch reuse overwrote prior artifacts or failed to append the revised proposal",
+        )
+        require(
+            target.read_text(encoding="utf-8") == changed_source
+            and not target.with_name(target.name + ".mcepatched").exists()
+            and "response_schema_patch_applied" not in original_state
+            and "response_schema_patch_applied" not in revised_state,
+            "noninteractive checksum-skip patch reuse unexpectedly applied a proposal",
+        )
+
+    def test_agent_patch_explicit_suffix(self) -> None:
+        target = self.work / "suffixed-agent-patch.txt"
+        output = target.with_name(target.name + ".agent")
+        source = "agent-original\n"
+        target.write_text(source, encoding="utf-8")
+        manifest = self._patch_manifest(
+            target, patches=[self._replacement_patch(["agent-suffixed"])],
+        )
+        responses = [
+            MockResponsesAPI.tool_response(("patch", manifest)),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Suffixed agent patch completed",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Apply an agent patch using the explicit suffix.",
+                "--agent", "--agent-auto", "--patch-suffix", ".agent",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(
+            len(mock.requests) == 2
+            and target.read_text(encoding="utf-8") == source
+            and output.is_file()
+            and output.read_text(encoding="utf-8") == "agent-suffixed\n"
+            and not target.with_name(target.name + ".mcepatched").exists(),
+            "automatic agent patch ignored its explicit suffix or modified the source",
+        )
+        require(
+            f"<written_paths>\n{output}\n</written_paths>" in mock.requests[1]["input"],
+            "suffixed agent patch did not report its actual output path to the controller",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        artifacts = self.state_artifacts(
+            session_name, "0", "response_schema_patch", "response_schema_patch_applied",
+        )
+        require(
+            json.loads(artifacts["response_schema_patch"]) == manifest
+            and artifacts["response_schema_patch_applied"] == str(output),
+            "suffixed agent patch did not preserve its manifest and actual applied path",
+        )
+
+    def test_agent_task_list_capacity_and_removals(self) -> None:
+        tasks = [
+            {"task": f"Removal task {number}", "status": "todo"}
+            for number in range(1, 26)
+        ]
+        replacements = [
+            {"task": "First replacement task", "status": "todo"},
+            {"task": "Second replacement task", "status": "skip"},
+        ]
+        responses = [
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "add", "tasks": tasks},
+            ]})),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "add", "tasks": [replacements[0]]},
+            ]})),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "remove", "numbers": [1, 26]},
+            ]})),
+            MockResponsesAPI.tool_response(("meta_task_list", {"operations": [
+                {"action": "remove", "numbers": [1, 3, 3]},
+                {"action": "change", "tasks": [{"number": 2, "status": "done"}]},
+                {"action": "add", "tasks": replacements},
+            ]})),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Task-list capacity and removals checked",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Check task-list rejection and removal numbering.",
+                "--agent", "--agent-auto",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 5, "unexpected task-list capacity request count")
+        original_lines = [
+            f"{number}. [{task['status']}] {task['task']}"
+            for number, task in enumerate(tasks, start=1)
+        ]
+        for request_index, diagnostic in (
+            (2, "supports at most 25 tasks"),
+            (3, "task does not exist: 26"),
+        ):
+            prompt = str(mock.requests[request_index]["input"])
+            task_block = prompt.split(
+                "<meta_task_list>\n", 1,
+            )[1].split("\n</meta_task_list>", 1)[0]
+            require(
+                task_block.splitlines() == original_lines and diagnostic in prompt,
+                "rejected overflow or removal partially changed the task list or omitted its error",
+            )
+        expected_tasks = [
+            task.copy() for number, task in enumerate(tasks, start=1)
+            if number not in (1, 3)
+        ]
+        expected_tasks[1]["status"] = "done"
+        expected_tasks.extend(replacements)
+        final_block = str(mock.requests[4]["input"]).split(
+            "<meta_task_list>\n", 1,
+        )[1].split("\n</meta_task_list>", 1)[0]
+        require(
+            final_block.splitlines() == [
+                f"{number}. [{task['status']}] {task['task']}"
+                for number, task in enumerate(expected_tasks, start=1)
+            ],
+            "task removals did not deduplicate numbers and renumber subsequent batch operations",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        artifacts = self.state_artifacts(session_name, "meta_task_list")
+        require(
+            json.loads(artifacts["meta_task_list"]) == expected_tasks,
+            "task-list removal snapshot differs from the final controller context",
+        )
+
     def close(self) -> None:
         self._temporary_directory.cleanup()
 
@@ -1920,10 +3389,8 @@ def session_name_from_result(
     noninteractive: bool,
  ) -> str:
     if noninteractive:
-        session_name = re_search(
-            r"(?m)^([^=\s]+)$",
-            result.stdout,
-        )
+        lines = result.stdout.rstrip().splitlines()
+        session_name = re_search(r"^([^=\s]+)$", lines[-1]) if lines else None
     else:
         session_name = re_search(
             r"(?m)^session_name=(\S+)$",
@@ -1972,6 +3439,32 @@ def main() -> int:
         ("reuses completed shell sessions without an extra request", "test_successful_shell_session_reuse"),
         ("writes and commits patch changes on a git branch", "test_patch_branch_writes_and_commits"),
         ("merges and removes patch branches", "test_patch_branch_merge_and_remove"),
+        ("rejects invalid patch ranges, content, endings, and duplicate paths", "test_patch_rejects_invalid_inputs"),
+        ("applies a saved session patch only once", "test_saved_patch_session_apply_once"),
+        ("repairs JSON and controls explicit prompt caching", "test_json_repair_and_explicit_prompt_cache"),
+        ("retries transient but not permanent API failures", "test_api_retry_classification"),
+        ("disables conflicting task modes for ask requests", "test_ask_disables_task_modes"),
+        ("revises the last shell command turn after session completion", "test_shell_session_revision"),
+        ("restricts shell network address families unless enabled", "test_shell_network_address_families"),
+        ("applies native agent patches and refreshes companion file context", "test_agent_patch_readfile_companion"),
+        ("updates persistent agent tasks atomically at capacity", "test_agent_task_list_atomic_capacity"),
+        ("retries invalid agent responses and rejects invalid call batches", "test_agent_controller_retries"),
+        ("manages agent profiles and delegates schema-constrained worker requests", "test_agent_profile_worker"),
+        ("reviews plans and preserves accepted, rejected, and saved state", "test_plan_review_and_saved_state"),
+        ("navigates patch revisions and applies the selected state turn", "test_patch_revision_navigation"),
+        ("reuses saved shell output without executing commands again", "test_shell_reuse_keeps_existing_output"),
+        ("pins agent file context and extends unpinned context expiry", "test_agent_context_control_and_expiry"),
+        ("restores selected agent history, tasks, and persisted file context", "test_agent_reuse_restores_selected_history"),
+        ("redacts API keys in configuration output and session logs", "test_api_key_redaction"),
+        ("writes text and JSON output files without duplicating stdout", "test_text_and_json_output_files"),
+        ("estimates tokens and rejects oversized requests before API calls", "test_input_token_estimation_and_limit"),
+        ("rejects invalid shell manifests before executing commands", "test_shell_rejects_invalid_command_manifests"),
+        ("runs agent hooks per turn and omits failed output and stdin", "test_agent_hook_context_scripts"),
+        ("refreshes readfile context without retaining stale files or overwriting snapshots", "test_agent_readfile_refresh_removes_stale_context"),
+        ("preserves rejected tool proposals without applying patches or executing commands", "test_tool_review_rejections"),
+        ("revises saved patches with checksum verification explicitly skipped", "test_patch_reuse_skip_verify"),
+        ("honors explicit automatic-agent patch suffixes without modifying source files", "test_agent_patch_explicit_suffix"),
+        ("rejects task-list overflow atomically and renumbers removal batches", "test_agent_task_list_capacity_and_removals"),
     ]
     print("TAP version 13")
     print(f"1..{len(tests)}")
