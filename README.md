@@ -538,6 +538,73 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 | `make changelog` | Displays the changelog for the last two weeks or last 20 entries. |
 | `make help` | Prints this table and a short description of each target. |
 
+
+## Tests passed 🧪
+
+Last tested: `2026-10-06`
+
+```text
+
+TAP version 13
+1..55
+ok 1 - prints the built-in configuration offline
+ok 2 - supports inherited profile overrides
+ok 3 - filters tree inputs without an API
+ok 4 - processes tree files through a local API
+ok 5 - selects extension-specific tree prompts
+ok 6 - creates, assigns, and removes prompt-library entries
+ok 7 - expands prompt-library references
+ok 8 - loads prompt and context files
+ok 9 - lists state artifact types offline
+ok 10 - applies patches to multiple files and creates files
+ok 11 - inserts patches into empty files
+ok 12 - validates patches and preserves line endings
+ok 13 - reviews patches interactively without a suffix
+ok 14 - handles text and JSON responses from a local API
+ok 15 - handles streamed text responses
+ok 16 - streams text responses to an output file
+ok 17 - enables text streaming from configuration
+ok 18 - preserves prompt placement and line-number overrides
+ok 19 - handles custom JSON-schema responses
+ok 20 - validates and writes an API patch response
+ok 21 - records patch artifacts and reapplies saved JSON
+ok 22 - applies deletion and replacement patch ranges
+ok 23 - rejects reused sessions with changed files
+ok 24 - executes shell scripts and saves state offline
+ok 25 - handles shell follow-up commands and failures
+ok 26 - reports shell command timeouts
+ok 27 - reuses completed shell sessions without an extra request
+ok 28 - writes and commits patch changes on a git branch
+ok 29 - merges and removes patch branches
+ok 30 - rejects invalid patch ranges, content, endings, and duplicate paths
+ok 31 - applies a saved session patch only once
+ok 32 - repairs JSON and controls explicit prompt caching
+ok 33 - retries transient but not permanent API failures
+ok 34 - disables conflicting task modes for ask requests
+ok 35 - revises the last shell command turn after session completion
+ok 36 - restricts shell network address families unless enabled
+ok 37 - applies native agent patches and refreshes companion file context
+ok 38 - updates persistent agent tasks atomically at capacity
+ok 39 - retries invalid agent responses and rejects invalid call batches
+ok 40 - manages agent profiles and delegates schema-constrained worker requests
+ok 41 - reviews plans and preserves accepted, rejected, and saved state
+ok 42 - navigates patch revisions and applies the selected state turn
+ok 43 - reuses saved shell output without executing commands again
+ok 44 - pins agent file context and extends unpinned context expiry
+ok 45 - restores selected agent history, tasks, and persisted file context
+ok 46 - redacts API keys in configuration output and session logs
+ok 47 - writes text and JSON output files without duplicating stdout
+ok 48 - estimates tokens and rejects oversized requests before API calls
+ok 49 - rejects invalid shell manifests before executing commands
+ok 50 - runs agent hooks per turn and omits failed output and stdin
+ok 51 - refreshes readfile context without retaining stale files or overwriting snapshots
+ok 52 - preserves rejected tool proposals without applying patches or executing commands
+ok 53 - revises saved patches with checksum verification explicitly skipped
+ok 54 - honors explicit automatic-agent patch suffixes without modifying source files
+ok 55 - rejects task-list overflow atomically and renumbers removal batches
+```
+
+
 ## Usage Notes 🪧
 
 **Prevent incorrect cost calculation when specifying --model**

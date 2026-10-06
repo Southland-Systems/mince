@@ -152,11 +152,11 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
 AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "Use the provided controller tools. Every controller response must call at "
     "least one tool and must not answer with plain text. Put the executable tool "
-    "call first. Additional calls may only use `meta_context_control`, and a "
-    "`session` call must be the only call in its response. The "
-    "`<agent_tool_json_schemas>` context contains the JSON schemas for the "
-    "available controller tool calls. Available tools are `patch`, `shell`, "
-    "`readfile`, `meta_task_list`, `agent`, `session`, and "
+    "call first. Additional calls may only use `meta_task_list` or "
+    "`meta_context_control`, and a `session` call must be the only call in "
+    "its response. The `<agent_tool_json_schemas>` context contains the JSON "
+    "schemas for the available controller tool calls. Available tools are "
+    "`patch`, `shell`, `readfile`, `meta_task_list`, `agent`, `session`, and "
     "`meta_context_control`. `patch` directly accepts the 'patch' JSON schema, "
     "applies its file modification manifest, and automatically appends a "
     "`readfile` companion call for every document in the manifest. Always use `patch` "
@@ -3107,6 +3107,7 @@ def execute_shell_commands(
     commands: list[ShellStep],
     timeout: int,
     shell_networking: bool = False,
+    print_exit_status: bool = False,
  ) -> str:
     output_blocks: list[str] = []
     command_timeout = max(1, int(timeout))
@@ -3155,6 +3156,9 @@ def execute_shell_commands(
             status = "error"
             stdout = ""
             stderr = f"{type(exc).__name__}: {exc}"
+
+        if VERBOSE and print_exit_status:
+            print(f"[{index}] exit_status={status}", file=sys.stderr)
 
         stdout = "\n" + stdout if stdout != "" else stdout
         stderr = "\n" + stderr if stderr != "" else stderr
@@ -5077,12 +5081,15 @@ def normalize_agent_controller_tool_calls(
             AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
         )
     if any(
-        tool_call.tool != AGENT_META_CONTEXT_CONTROL_TOOL
+        tool_call.tool not in (
+            AGENT_META_TASK_LIST_TOOL,
+            AGENT_META_CONTEXT_CONTROL_TOOL,
+        )
         for tool_call in tool_calls[1:]
     ):
         raise AgentControllerResponseError(
             "agent responses may include additional tool calls only for "
-            "meta_context_control"
+            "meta_task_list or meta_context_control"
         )
     if tool_calls[0].tool == AGENT_SESSION_TOOL and len(tool_calls) != 1:
         raise AgentControllerResponseError(
@@ -6242,6 +6249,7 @@ def load_reused_session_agent_history(
                     f"{turn_dir} ({exc})"
                 ) from exc
             continue
+        active_task = task
         for tool_call_index, (tool_call, tool_output) in enumerate(
             zip(tool_calls, tool_outputs)
         ):
@@ -6294,8 +6302,10 @@ def load_reused_session_agent_history(
                     raise ValueError(
                         f"invalid saved meta_task_list operations: {turn_dir}"
                     ) from exc
-            active_task = task
-            if tool_call.tool == AGENT_AGENT_TOOL:
+            if (
+                tool_call.tool == AGENT_AGENT_TOOL
+                and not tool_call.profile_name
+            ):
                 active_task = tool_call.task
                 active_context = tool_call.context
 
@@ -7068,6 +7078,7 @@ def run_agent_shell_tool(
         commands,
         settings.model_settings.llm_timeout,
         shell_networking=settings.shell_networking,
+        print_exit_status=True,
     )
     try:
         write_state_artifact(turn_dir, "response_shell_output", shell_output)
@@ -8503,17 +8514,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agent",
         action="store_true",
-        help="Run a confirmed multi-turn AI agent tool-call session",
+        help=(
+            "Run a multi-turn AI agent tool-call session, automatically "
+            "confirming and outputting each call before execution; patches "
+            "overwrite source files unless --patch-suffix is specified. Conflicting "
+            "standalone patch and shell options are ignored"
+        ),
     )
 
-    parser.add_argument(
+    agent_confirmation_group = parser.add_mutually_exclusive_group()
+    agent_confirmation_group.add_argument(
+        "--agent-review",
+        action="store_true",
+        help="Review agent tool calls and changes before execution (requires --agent)",
+    )
+
+    agent_confirmation_group.add_argument(
         "--agent-auto",
         action="store_true",
-        help=(
-            "Automatically confirm agent tool calls and output each before "
-            "execution; agent patches overwrite source files unless "
-            "--patch-suffix is specified"
-        ),
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -8668,7 +8687,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--noninteractive",
         action="store_true",
-        help="Disables review and saves the response or patches and exits",
+        help=(
+            "Disable interactive review, save responses or patches, and exit "
+            "(--agent still executes tools unless --agent-review is specified)"
+        ),
     )
 
     parser.add_argument(
@@ -9428,31 +9450,50 @@ def parse_args() -> argparse.Namespace:
         help="Remove session data older than KEEP_DAYS (default: 60)",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.agent_review and not args.agent:
+        parser.error("--agent-review requires --agent")
+    if args.agent_auto and not args.agent:
+        parser.error("--agent-auto requires --agent")
+    if args.agent_auto:
+        print(
+            "WARNING: --agent-auto is deprecated; use --agent instead.",
+            file=sys.stderr,
+        )
+    return args
+
+
+def disable_patch_shell_conflicting_options(args: argparse.Namespace) -> None:
+    disabled_options: dict[str, Any] = {
+        "patch": False,
+        "shell": False,
+        "patch_branch": False,
+        "patch_branch_remove": None,
+        "patch_merge": None,
+        "patch_save": False,
+        "patch_file_apply": None,
+        "patch_file_print": None,
+    }
+    for option_name, value in disabled_options.items():
+        setattr(args, option_name, value)
 
 
 def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
+    disable_patch_shell_conflicting_options(args)
     disabled_options: dict[str, Any] = {
         "files": None,
         "files_list": None,
         "plan": False,
         "plan_system_prompt": None,
         "agent": False,
+        "agent_review": False,
         "agent_auto": False,
         "agent_context_expires": None,
         "agent_hook_context": None,
         "agent_profiles": None,
-        "patch": False,
-        "shell": False,
         "shell_networking": False,
         "patch_review": False,
-        "patch_branch": False,
-        "patch_branch_remove": None,
-        "patch_merge": None,
         "patch_suffix": None,
-        "patch_save": False,
-        "patch_file_apply": None,
-        "patch_file_print": None,
         "patch_system_prompt": None,
         "shell_system_prompt": None,
         "agent_system_prompt": None,
@@ -9524,6 +9565,8 @@ def main() -> int:
     ask_mode = args.ask is not None or args.ask_file is not None
     if ask_mode:
         disable_ask_conflicting_options(args)
+    elif args.agent:
+        disable_patch_shell_conflicting_options(args)
 
     patch_file_turn: int | None = None
     patch_file_print_turn: int | None = None
@@ -9582,6 +9625,7 @@ def main() -> int:
             ("--patch", args.patch is not None),
             ("--plan", args.plan is not None),
             ("--agent", args.agent),
+            ("--agent-review", args.agent_review),
             ("--agent-auto", args.agent_auto),
             (
                 "--agent-context-expires",
@@ -10158,7 +10202,7 @@ def main() -> int:
         'shell_networking',
     )
     agent_mode = args.agent
-    agent_auto = args.agent_auto
+    agent_auto = agent_mode and not args.agent_review
     if args.agent_context_expires is not None and not agent_mode:
         print("ERROR: --agent-context-expires requires --agent", file=sys.stderr)
         return 1
@@ -10284,12 +10328,6 @@ def main() -> int:
         return 1
     if shell_networking and not (shell_mode or agent_mode):
         print("ERROR: --shell-networking requires --shell or --agent", file=sys.stderr)
-        return 1
-    if agent_auto and not agent_mode:
-        print("ERROR: --agent-auto requires --agent", file=sys.stderr)
-        return 1
-    if agent_mode and (patch_mode or shell_mode):
-        print("ERROR: --agent cannot be combined with --patch or --shell", file=sys.stderr)
         return 1
     if args.agent_hook_context is not None and not agent_mode:
         print("ERROR: --agent-hook-context requires --agent", file=sys.stderr)
