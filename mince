@@ -23,7 +23,7 @@ import subprocess
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import fnmatch
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -75,6 +75,49 @@ def write_output_file(text: str, append: bool = False) -> None:
         OUTPUT_FILE.write("\n\n")
     OUTPUT_FILE.write(text)
     OUTPUT_FILE.flush()
+
+
+def format_response_output(
+    response_text: str,
+    reasoning: str,
+    print_reasoning: bool,
+) -> str:
+    if print_reasoning:
+        return f"<think>\n{reasoning}\n</think>\n\n{response_text}"
+    return response_text
+
+
+def emit_response_output(
+    output_text: str,
+    *,
+    suppress_response_output: bool = False,
+    append_output: bool = False,
+    stream_output_emitted: bool = False,
+    output_file_path: Path | None = None,
+) -> int:
+    if OUTPUT_FILE is not None:
+        if not stream_output_emitted:
+            try:
+                write_output_file(output_text, append=append_output)
+            except Exception as exc:
+                output_target = (
+                    f" {output_file_path}"
+                    if output_file_path is not None
+                    else ""
+                )
+                print(
+                    f"ERROR: Failed to write output to file{output_target}: {exc}",
+                    file=sys.stderr,
+                )
+                if not suppress_response_output:
+                    print(output_text)
+                return 1
+    elif stream_output_emitted:
+        if not output_text or not output_text.endswith("\n"):
+            print()
+    elif not suppress_response_output:
+        print(output_text)
+    return 0
 
 
 def page_or_print(text: str) -> None:
@@ -172,7 +215,7 @@ DEFAULT_PROMPT_LIBRARY_REFERENCES: dict[str, str] = {
 DEFAULT_AGENT_CONTEXT_EXPIRES = (12, 6, 24)
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.6-luna",
+    "model": "gpt-6-luna",
     "api_key": "",
     "base_url": "https://api.openai.com/v1",
     "proxy_server": "",
@@ -207,7 +250,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "print_reasoning": "off",
     "token_limit": 65534,
     "max_output_tokens": 65534,
-    "token_cost": "1.00:6.00",
+    "token_cost": "0.10:0.50",
     "max_file_size_kb": 512,
     "files": "",
     "response_format": "text",
@@ -573,16 +616,11 @@ def save_config(config: dict[str, Any]) -> None:
             migrated_config, parent_name
         )
     else:
-        if INHERIT_PROFILE_CONFIG_KEY in raw_document:
-            migrated_config[INHERIT_PROFILE_CONFIG_KEY] = raw_document[
-                INHERIT_PROFILE_CONFIG_KEY
-            ]
-        else:
-            migrated_config.pop(INHERIT_PROFILE_CONFIG_KEY, None)
+        migrated_config.pop(INHERIT_PROFILE_CONFIG_KEY, None)
         output_config = DEFAULT_CONFIG.copy()
         output_config.update(migrated_config)
 
-    write_config_document(CONFIG_FILE, output_config)
+    write_json_document(CONFIG_FILE, output_config)
 
 PROMPT_TYPE_ALIASES: dict[str, str] = {
     "system": "system_prompt",
@@ -608,13 +646,11 @@ def prompt_type_key(value: str) -> str:
 
 
 def validate_prompt_name(name: str) -> str:
-    name = name.strip()
-    if (
-        not name
-        or name in (".", "..")
-        or any(character in name for character in ("/", "\\", "|"))
-        or any(ord(character) < 32 for character in name)
-    ):
+    try:
+        name = validate_session_name(name)
+    except ValueError as exc:
+        raise ValueError("invalid prompt name") from exc
+    if "|" in name:
         raise ValueError("invalid prompt name")
     return name
 
@@ -630,6 +666,18 @@ def validate_session_name(name: str) -> str:
         raise ValueError("invalid session name")
     return name
 
+
+def parse_session_turn(value: str, option_name: str) -> int:
+    try:
+        turn = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{option_name} TURN must be an integer"
+        ) from exc
+    if turn < 0:
+        raise ValueError(f"{option_name} TURN must be non-negative")
+    return turn
+
 def state_turn_directories(state_session_dir: Path) -> list[tuple[int, Path]]:
     if not state_session_dir.is_dir():
         return []
@@ -644,6 +692,21 @@ def state_turn_directories(state_session_dir: Path) -> list[tuple[int, Path]]:
         if turn >= 0:
             turn_dirs.append((turn, entry))
     return turn_dirs
+
+
+def completed_state_turn_directories(
+    state_session_dir: Path,
+    maximum_turn: int,
+) -> list[tuple[int, Path]]:
+    return sorted(
+        (turn, entry)
+        for turn, entry in state_turn_directories(state_session_dir)
+        if (
+            turn <= maximum_turn
+            and (entry / "response").is_file()
+            and not (entry / "response").is_symlink()
+        )
+    )
 
 
 def next_state_turn_index(state_session_dir: Path) -> int:
@@ -736,6 +799,14 @@ def read_state_artifact(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except Exception as exc:
         raise ValueError(f"cannot read state artifact {path} ({exc})") from exc
+
+
+def read_optional_state_artifact(path: Path) -> str | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    return read_state_artifact(path)
+
+
 def state_turn_directory(
     state_session_dir: Path,
     turn: int | None,
@@ -833,18 +904,11 @@ def handle_shell_session_print_json(
                 '--shell-session-print-json requires SESSION and optional TURN'
             )
         session_name = validate_session_name(values[0])
-        requested_turn: int | None = None
-        if len(values) == 2:
-            try:
-                requested_turn = int(values[1])
-            except ValueError as exc:
-                raise ValueError(
-                    '--shell-session-print-json TURN must be an integer'
-                ) from exc
-            if requested_turn < 0:
-                raise ValueError(
-                    '--shell-session-print-json TURN must be non-negative'
-                )
+        requested_turn = (
+            parse_session_turn(values[1], '--shell-session-print-json')
+            if len(values) == 2
+            else None
+        )
         state_session_dir = STATE_DIR / session_name
         if not state_session_dir.is_dir() or state_session_dir.is_symlink():
             raise ValueError(
@@ -948,6 +1012,30 @@ def load_reused_session_task(
             f"cannot read reused session task from {turn_dir} ({exc})"
         ) from exc
 
+
+def _load_reused_session_turn_artifacts(
+    state_session_dir: Path,
+    turn: int | None,
+    artifact_names: tuple[str, ...],
+    missing_message: str,
+) -> tuple[Path, dict[str, str]]:
+    turn_dir = last_completed_state_turn(state_session_dir, turn)
+    artifact_paths = {
+        artifact_name: turn_dir / artifact_name
+        for artifact_name in artifact_names
+    }
+    if any(
+        path.is_symlink() or not path.is_file()
+        for path in artifact_paths.values()
+    ):
+        raise ValueError(f"{missing_message}: {turn_dir}")
+    artifacts = {
+        artifact_name: read_state_artifact(path)
+        for artifact_name, path in artifact_paths.items()
+    }
+    return turn_dir, artifacts
+
+
 @dataclass(frozen=True)
 class ReusedPatchTurn:
     turn_dir: Path
@@ -959,40 +1047,18 @@ def load_reused_session_patch_turn(
     state_session_dir: Path,
     turn: int | None = None,
 ) -> ReusedPatchTurn:
-    turn_dir = last_completed_state_turn(state_session_dir, turn)
-    request_task_path = turn_dir / "request_task"
-    response_path = turn_dir / "response"
-    required_paths = (request_task_path, response_path)
-    if any(path.is_symlink() or not path.is_file() for path in required_paths):
-        raise ValueError(
-            "completed patch turn has no request_task or response: "
-            f"{turn_dir}"
-        )
-    return ReusedPatchTurn(
-        turn_dir=turn_dir,
-        task=read_state_artifact(request_task_path),
-        response=read_state_artifact(response_path),
-    )
-
-
-def load_reused_session_patch_history(
-    state_session_dir: Path,
-    turn: int | None = None,
-) -> str:
-    patch_turn = load_reused_session_patch_turn(
+    turn_dir, artifacts = _load_reused_session_turn_artifacts(
         state_session_dir,
         turn,
+        ("request_task", "response"),
+        "completed patch turn has no request_task or response",
     )
-    return (
-        "<previous_turn>\n"
-        "<request_task>\n"
-        f"{patch_turn.task}\n"
-        "</request_task>\n"
-        "<response>\n"
-        f"{patch_turn.response}\n"
-        "</response>\n"
-        "</previous_turn>"
+    return ReusedPatchTurn(
+        turn_dir=turn_dir,
+        task=artifacts["request_task"],
+        response=artifacts["response"],
     )
+
 
 @dataclass(frozen=True)
 class ReusedShellTurn:
@@ -1008,40 +1074,24 @@ def load_reused_session_shell_turn(
     state_session_dir: Path,
     turn: int | None = None,
 ) -> ReusedShellTurn:
-    turn_dir = last_completed_state_turn(state_session_dir, turn)
-    system_prompt_path = turn_dir / "request_system_prompt"
-    request_task_path = turn_dir / "request_task"
-    response_path = turn_dir / "response"
-    required_paths = (
-        system_prompt_path,
-        request_task_path,
-        response_path,
-    )
-    if any(path.is_symlink() or not path.is_file() for path in required_paths):
-        raise ValueError(
-            "completed shell turn has no request_system_prompt, "
-            f"request_task, or response: {turn_dir}"
-        )
-
-    reasoning_path = turn_dir / "response_reasoning"
-    shell_output_path = turn_dir / "response_shell_output"
-    reasoning = (
-        read_state_artifact(reasoning_path)
-        if reasoning_path.exists() or reasoning_path.is_symlink()
-        else ""
-    )
-    shell_output = (
-        read_state_artifact(shell_output_path)
-        if shell_output_path.exists() or shell_output_path.is_symlink()
-        else None
+    turn_dir, artifacts = _load_reused_session_turn_artifacts(
+        state_session_dir,
+        turn,
+        ("request_system_prompt", "request_task", "response"),
+        "completed shell turn has no request_system_prompt, "
+        "request_task, or response",
     )
     return ReusedShellTurn(
         turn_dir=turn_dir,
-        system_prompt=read_state_artifact(system_prompt_path),
-        task=read_state_artifact(request_task_path),
-        response=read_state_artifact(response_path),
-        reasoning=reasoning,
-        shell_output=shell_output,
+        system_prompt=artifacts["request_system_prompt"],
+        task=artifacts["request_task"],
+        response=artifacts["response"],
+        reasoning=read_optional_state_artifact(
+            turn_dir / "response_reasoning"
+        ) or "",
+        shell_output=read_optional_state_artifact(
+            turn_dir / "response_shell_output"
+        ),
     )
 
 
@@ -1054,18 +1104,12 @@ def load_reused_session_shell_command_turn(
         state_session_dir,
         turn,
     )
-    selected_turn = int(selected_turn_dir.name)
-    candidate_turns = [
-        candidate_turn
-        for candidate_turn, entry in state_turn_directories(state_session_dir)
-        if (
-            candidate_turn <= selected_turn
-            and (entry / "response").is_file()
-            and not (entry / "response").is_symlink()
-        )
-    ]
+    candidate_turns = completed_state_turn_directories(
+        state_session_dir,
+        int(selected_turn_dir.name),
+    )
 
-    for candidate_turn in sorted(candidate_turns, reverse=True):
+    for candidate_turn, _ in reversed(candidate_turns):
         try:
             shell_turn = load_reused_session_shell_turn(
                 state_session_dir,
@@ -1099,7 +1143,7 @@ def start_state_turn(
         ("request_task", task),
     )
     for filename, content in state_files:
-        (turn_dir / filename).write_text(content, encoding="utf-8")
+        write_state_artifact(turn_dir, filename, content)
     request_files_path = state_session_dir / "request_files"
     if not request_files_path.exists():
         request_file_lines: list[str] = []
@@ -1117,64 +1161,33 @@ def start_state_turn(
             pass
     return turn_dir
 
+def write_state_artifact(
+    state_directory: Path,
+    artifact_name: str,
+    content: str,
+) -> None:
+    (state_directory / artifact_name).write_text(content, encoding="utf-8")
+
+
 def complete_state_turn(
     turn_dir: Path,
     reasoning: str,
     response: str,
  ) -> None:
-    (turn_dir / "response_reasoning").write_text(
-        reasoning,
-        encoding="utf-8",
-    )
-    (turn_dir / "response").write_text(
-        response,
-        encoding="utf-8",
-    )
+    write_state_artifact(turn_dir, "response_reasoning", reasoning)
+    write_state_artifact(turn_dir, "response", response)
 
-def write_state_schema_patch(
-    turn_dir: Path,
-    response: str,
- ) -> None:
-    (turn_dir / "response_schema_patch").write_text(
-        response,
-        encoding="utf-8",
-    )
 
-def write_state_diff_patch(
+def write_state_patch_artifacts(
     turn_dir: Path,
+    manifest_text: str,
     diff_text: str,
- ) -> None:
-    (turn_dir / "response_diff_patch").write_text(
-        diff_text,
-        encoding="utf-8",
-    )
-
-def write_state_schema_patch_applied(
-    turn_dir: Path,
-    paths: list[str],
- ) -> None:
-    (turn_dir / "response_schema_patch_applied").write_text(
-        "\n".join(paths),
-        encoding="utf-8",
-    )
-
-def write_state_shell_output(
-    turn_dir: Path,
-    output: str,
- ) -> None:
-    (turn_dir / "response_shell_output").write_text(
-        output,
-        encoding="utf-8",
-    )
-
-def write_state_agent_tool_output(
-    turn_dir: Path,
-    output: str,
- ) -> None:
-    (turn_dir / "response_agent_tool_output").write_text(
-        output,
-        encoding="utf-8",
-    )
+) -> None:
+    for artifact_name, content in (
+        ("response_schema_patch", manifest_text),
+        ("response_diff_patch", diff_text),
+    ):
+        write_state_artifact(turn_dir, artifact_name, content)
 
 
 def write_state_agent_file_contexts(
@@ -1185,18 +1198,20 @@ def write_state_agent_file_contexts(
         {"path": path, "section": section}
         for path, section in contexts
     ]
-    (turn_dir / "response_agent_file_contexts").write_text(
+    write_state_artifact(
+        turn_dir,
+        "response_agent_file_contexts",
         json.dumps(context_entries, ensure_ascii=False),
-        encoding="utf-8",
     )
 
 def write_state_meta_task_list(
     state_session_dir: Path,
     task_list: list[dict[str, Any]],
 ) -> None:
-    (state_session_dir / STATE_META_TASK_LIST_ARTIFACT).write_text(
+    write_state_artifact(
+        state_session_dir,
+        STATE_META_TASK_LIST_ARTIFACT,
         json.dumps(task_list, indent=2, ensure_ascii=False),
-        encoding="utf-8",
     )
 
 def prompt_file_path(name: str) -> Path:
@@ -1223,24 +1238,28 @@ def validate_prompt_profile_name(name: str) -> str:
     return name
 
 
+def read_json_document(path: Path, label: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot read {label} {path} ({exc})") from exc
+
+
 def read_config_document(path: Path, missing_ok: bool = False) -> dict[str, Any]:
     if not path.exists():
         if missing_ok:
             return {}
         raise ValueError(f"configuration file does not exist: {path}")
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"cannot read configuration file {path} ({exc})") from exc
+    raw = read_json_document(path, "configuration file")
     if not isinstance(raw, dict):
         raise ValueError(f"configuration file {path} must contain a JSON object")
     return raw
 
 
-def write_config_document(path: Path, config: dict[str, Any]) -> None:
+def write_json_document(path: Path, document: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False),
+        json.dumps(document, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -1471,7 +1490,7 @@ def handle_prompt_assign(
                 config[config_key] = "|".join(references)
                 if prompt_text:
                     config[config_key] += f" {prompt_text}"
-        write_config_document(profile_path, config)
+        write_json_document(profile_path, config)
     except Exception as exc:
         print(f"ERROR: Failed to assign prompt: {exc}", file=sys.stderr)
         return 1
@@ -1502,7 +1521,7 @@ def handle_prompt_unassign(
         )
         changed = unassign_prompt_from_config(config, prompt_path, keys)
         if changed:
-            write_config_document(profile_path, config)
+            write_json_document(profile_path, config)
     except Exception as exc:
         print(f"ERROR: Failed to unassign prompt: {exc}", file=sys.stderr)
         return 1
@@ -1532,7 +1551,7 @@ def handle_prompt_remove(name: str) -> int:
                 if unassign_prompt_from_config(
                     config, prompt_path, PROMPT_CONFIG_KEYS
                 ):
-                    write_config_document(config_path, config)
+                    write_json_document(config_path, config)
 
             if prompt_path.exists():
                 prompt_path.unlink()
@@ -1721,12 +1740,7 @@ def read_agent_profile_with_document(
     path = agent_profile_path(valid_name)
     if not path.is_file():
         raise ValueError(f"agent profile does not exist: {path}")
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(
-            f"cannot read agent profile {path} ({exc})"
-        ) from exc
+    document = read_json_document(path, "agent profile")
     if not isinstance(document, dict):
         raise ValueError(f"agent profile must contain a JSON object: {path}")
     allowed_fields = {"type", "content", "description"}
@@ -1779,18 +1793,13 @@ def write_agent_profile(
     if not isinstance(description, str):
         raise ValueError("agent profile description must be a string")
     path = agent_profile_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "type": profile_type,
-                "content": content,
-                "description": description,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    write_json_document(
+        path,
+        {
+            "type": profile_type,
+            "content": content,
+            "description": description,
+        },
     )
     return path
 
@@ -1937,54 +1946,44 @@ def load_or_create_agent_profile(name: str) -> AgentProfile:
     return AgentProfile(name=name, profile_type="custom", content="")
 
 
-def handle_agent_profile_edit(values: list[str]) -> int:
+def handle_agent_profile_edit(
+    values: list[str],
+    edit_description: bool = False,
+) -> int:
     try:
         profile = load_or_create_agent_profile(values[0])
         if len(values) > 1:
-            content = " ".join(values[1:]).strip()
+            edited_text = " ".join(values[1:]).strip()
         else:
-            suffix = ".json" 
-            content = edit_text(profile.content, suffix=suffix)
+            edited_text = edit_text(
+                profile.description if edit_description else profile.content,
+                suffix=".txt" if edit_description else ".json",
+            )
         write_agent_profile(
             profile.name,
             profile.profile_type,
-            content,
-            profile.description,
+            profile.content if edit_description else edited_text,
+            edited_text if edit_description else profile.description,
         )
     except Exception as exc:
-        print(f"ERROR: Failed to edit agent profile: {exc}", file=sys.stderr)
+        action = (
+            "set agent profile description"
+            if edit_description
+            else "edit agent profile"
+        )
+        print(f"ERROR: Failed to {action}: {exc}", file=sys.stderr)
         return 1
-    if not profile.description.strip():
-        print(
-            f"WARNING: Agent profile '{profile.name}' has no description; use ",
-            "--agent-profile-description to set one.",
-            file=sys.stderr,
-        )
-    print(f"agent_profile={profile.name} type={profile.profile_type}")
-    return 0
-
-
-def handle_agent_profile_description(values: list[str]) -> int:
-    try:
-        profile = load_or_create_agent_profile(values[0])
-        if len(values) > 1:
-            description = " ".join(values[1:]).strip()
-        else:
-            description = edit_text(profile.description, suffix=".txt")
-        write_agent_profile(
-            profile.name,
-            profile.profile_type,
-            profile.content,
-            description,
-        )
-    except Exception as exc:
-        print(
-            f"ERROR: Failed to set agent profile description: {exc}",
-            file=sys.stderr,
-        )
-        return 1
-    description_set = "yes" if description.strip() else "no"
-    print(f"agent_profile={profile.name} description_set={description_set}")
+    if edit_description:
+        description_set = "yes" if edited_text.strip() else "no"
+        print(f"agent_profile={profile.name} description_set={description_set}")
+    else:
+        if not profile.description.strip():
+            print(
+                f"WARNING: Agent profile '{profile.name}' has no description; use ",
+                "--agent-profile-description to set one.",
+                file=sys.stderr,
+            )
+        print(f"agent_profile={profile.name} type={profile.profile_type}")
     return 0
 
 
@@ -2011,7 +2010,11 @@ def handle_agent_profile_type(values: list[str]) -> int:
     return 0
 
 
-def handle_agent_profile_copy(values: list[str]) -> int:
+def handle_agent_profile_transfer(
+    values: list[str],
+    rename: bool = False,
+) -> int:
+    action = "rename" if rename else "copy"
     try:
         source_name, destination_name = (
             validate_agent_profile_name(value) for value in values
@@ -2024,42 +2027,21 @@ def handle_agent_profile_copy(values: list[str]) -> int:
             raise ValueError(
                 f"destination agent profile already exists: {destination_path}"
             )
-        write_agent_profile(
-            destination_name,
-            profile.profile_type,
-            profile.content,
-            profile.description,
-        )
-    except Exception as exc:
-        print(f"ERROR: Failed to copy agent profile: {exc}", file=sys.stderr)
-        return 1
-    print(
-        f"agent_profile_copied={source_name} "
-        f"new_name={destination_name}"
-    )
-    return 0
-
-
-def handle_agent_profile_rename(values: list[str]) -> int:
-    try:
-        source_name, destination_name = (
-            validate_agent_profile_name(value) for value in values
-        )
-        if source_name == destination_name:
-            raise ValueError("source and destination agent profiles must differ")
-        source_profile = read_agent_profile(source_name)
-        source_path = agent_profile_path(source_profile.name)
-        destination_path = agent_profile_path(destination_name)
-        if destination_path.exists():
-            raise ValueError(
-                f"destination agent profile already exists: {destination_path}"
+        if rename:
+            agent_profile_path(profile.name).rename(destination_path)
+        else:
+            write_agent_profile(
+                destination_name,
+                profile.profile_type,
+                profile.content,
+                profile.description,
             )
-        source_path.rename(destination_path)
     except Exception as exc:
-        print(f"ERROR: Failed to rename agent profile: {exc}", file=sys.stderr)
+        print(f"ERROR: Failed to {action} agent profile: {exc}", file=sys.stderr)
         return 1
+    status = "renamed" if rename else "copied"
     print(
-        f"agent_profile_renamed={source_name} "
+        f"agent_profile_{status}={source_name} "
         f"new_name={destination_name}"
     )
     return 0
@@ -2117,13 +2099,11 @@ def parse_patch_branch_value(value: Any) -> bool | str:
         return value
     if isinstance(value, str):
         raw_value = value.strip()
-        normalized = raw_value.lower()
-        if normalized in ("true", "yes", "on", "1"):
-            return True
-        if normalized in ("false", "no", "off", "0"):
-            return False
         if raw_value:
-            return raw_value
+            try:
+                return parse_bool(raw_value)
+            except argparse.ArgumentTypeError:
+                return raw_value
     raise ValueError('patch_branch must be a boolean or branch name')
 
 
@@ -2181,12 +2161,10 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
         except ValueError as exc:
             raise ValueError(f"{name} must be a number") from exc
     if isinstance(expected, bool):
-        normalized = raw_value.lower()
-        if normalized in ("true", "yes", "on", "1"):
-            return name, True
-        if normalized in ("false", "no", "off", "0"):
-            return name, False
-        raise ValueError(f"{name} must be a boolean")
+        try:
+            return name, parse_bool(raw_value)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(f"{name} must be a boolean") from exc
     return name, raw_value
 
 
@@ -2289,7 +2267,7 @@ def init_config_interactive() -> None:
     config = load_config()
     config_document = read_config_document(CONFIG_FILE)
     if migrate_deprecated_config(config_document):
-        write_config_document(CONFIG_FILE, config_document)
+        write_json_document(CONFIG_FILE, config_document)
         config = load_config()
 
     print(
@@ -2379,7 +2357,7 @@ def handle_inherit_profile(current_name: str, new_name: str) -> int:
 
         # Validate the source profile and its inheritance chain.
         merged_config(source_path)
-        write_config_document(
+        write_json_document(
             destination_path,
             {INHERIT_PROFILE_CONFIG_KEY: current_name},
         )
@@ -2999,40 +2977,51 @@ def format_shell_command_archive(
         )
     return "\n".join(turn_blocks)
 
-def shell_review_usage() -> str:
-    return "Usage: [y]es, [n]o, [p]ager, [h]elp, [e]dit, E <prompt>"
-
-def process_shell_review_input(
-    shell_input: str,
-    command_text: str,
+def process_tool_review_input(
+    tool_input: str,
+    tool_text: str,
+    usage: str = "Usage: [y]es, [n]o, [p]ager, [h]elp, [e]dit, E <prompt>",
  ) -> str | None:
-    choice = shell_input.strip()
+    choice = tool_input.strip()
     normalized_choice = choice.lower()
     if not choice or normalized_choice == "h":
-        print(shell_review_usage())
+        print(usage)
         return None
     if normalized_choice == "p":
-        page_or_print(command_text)
+        page_or_print(tool_text)
         return None
     return choice
 
-def review_shell_commands(
-    commands: list[ShellStep],
+
+def review_tool_text(
+    tool_text: str,
+    prompt: str,
+    accept_automatically: bool = False,
     accept_noninteractive: bool = False,
+    input_processor: Callable[[str], str | None] | None = None,
+    invalid_choice_message: str = (
+        'Please answer y, n, p, h, e, or E followed by a prompt.'
+    ),
+    allow_revision: bool = True,
+    additional_actions: tuple[str, ...] = (),
+    display_text: bool = True,
 ) -> tuple[str, str | None]:
-    command_text = format_shell_commands(commands)
-    if not NONINTERACTIVE:
-        print()
-        print(command_text)
+    if accept_automatically:
+        return 'accept', None
     if NONINTERACTIVE:
         return (
             'accept' if accept_noninteractive else 'save',
             None,
         )
+    if display_text:
+        print()
+        print(tool_text)
     while True:
-        choice = process_shell_review_input(
-            input('Run these shell commands? [y/n/p/h/e/E <prompt>]: '),
-            command_text,
+        review_input = input(prompt)
+        choice = (
+            process_tool_review_input(review_input, tool_text)
+            if input_processor is None
+            else input_processor(review_input)
         )
         if choice is None:
             continue
@@ -3041,10 +3030,13 @@ def review_shell_commands(
             return 'accept', None
         if normalized_choice in ('n', 'no'):
             return 'reject', None
-        if normalized_choice == 'e':
+        if choice in additional_actions:
+            return choice, None
+        if allow_revision and normalized_choice == 'e':
             return 'edit', None
         if (
-            choice.startswith('E')
+            allow_revision
+            and choice.startswith('E')
             and len(choice) > 1
             and choice[1].isspace()
         ):
@@ -3053,7 +3045,20 @@ def review_shell_commands(
                 print('Revision task cannot be empty.')
                 continue
             return 'edit', revision_task
-        print('Please answer y, n, p, h, e, or E followed by a prompt.')
+        print(invalid_choice_message)
+
+
+def review_shell_commands(
+    commands: list[ShellStep],
+    accept_noninteractive: bool = False,
+    accept_automatically: bool = False,
+) -> tuple[str, str | None]:
+    return review_tool_text(
+        format_shell_commands(commands),
+        'Run these shell commands? [y/n/p/h/e/E <prompt>]: ',
+        accept_automatically=accept_automatically,
+        accept_noninteractive=accept_noninteractive,
+    )
 
 def _shell_text(value: Any) -> str:
     if isinstance(value, bytes):
@@ -3170,13 +3175,11 @@ def build_shell_followup_prompt(
     shell_command_archive: list[ShellTurn] | None = None,
     include_task: bool = True,
  ) -> str:
-    schema_block = ""
-    if json_schema is not None:
-        schema_block = (
-            "\n<json_schema instructions='Return JSON that matches this schema exactly'>\n"
-            f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
-            "</json_schema>"
-        )
+    schema_block = (
+        "\n" + format_json_schema_context(json_schema)
+        if json_schema is not None
+        else ""
+    )
     output_values = (
         [shell_output] if isinstance(shell_output, str) else shell_output
     )
@@ -3219,38 +3222,6 @@ PATCH_REVISION_HEADING = (
 )
 
 
-def patch_review_usage(allow_navigation: bool = False) -> str:
-    options = (
-        "[y]es, [n]o, [p]ager, [h]elp, "
-        "[S] toggle patch suffix"
-    )
-    if allow_navigation:
-        options += ", [<]prevturn, [>]nextturn, [e]dit, E <prompt>"
-    return f"Usage: {options}"
-
-
-def process_patch_review_input(
-    patch_input: str,
-    diff_text: str,
-    suffix_provided: bool,
-    allow_navigation: bool = False,
- ) -> tuple[str | None, bool]:
-    choice = patch_input.strip()
-    normalized_choice = choice.lower()
-    if not choice or normalized_choice == "h":
-        print(patch_review_usage(allow_navigation))
-        return None, suffix_provided
-    if normalized_choice == "p":
-        page_or_print(diff_text)
-        return None, suffix_provided
-    if normalized_choice == "s":
-        suffix_provided = not suffix_provided
-        state = "enabled" if suffix_provided else "disabled"
-        print(f"Patch suffix {state}.")
-        return None, suffix_provided
-    return choice, suffix_provided
-
-
 def build_patch_revision_editor_text(
     diff_text: str,
     previous_task: str = "",
@@ -3267,14 +3238,16 @@ def build_patch_revision_editor_text(
 def extract_patch_revision_task(edited_text: str) -> str:
     task_text, separator, _ = edited_text.partition(PATCH_REVISION_HEADING)
     return (task_text if separator else edited_text).strip()
-def build_shell_revision_editor_text(
-    commands: list[ShellStep],
-    previous_task: str = '',
+
+
+def edit_tool_revision_task(
+    tool_text: str,
+    previous_task: str = "",
  ) -> str:
-    return build_patch_revision_editor_text(
-        format_shell_commands(commands, include_reasons=False),
-        previous_task,
+    edited_text = edit_text(
+        build_patch_revision_editor_text(tool_text, previous_task),
     )
+    return extract_patch_revision_task(edited_text)
 
 
 @dataclass(frozen=True)
@@ -3480,10 +3453,7 @@ def build_patch_changes(
 def load_patch_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"patch JSON file does not exist: {path}")
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"cannot read patch JSON file {path} ({exc})") from exc
+    raw = read_json_document(path, "patch JSON file")
     if not isinstance(raw, dict):
         raise ValueError("patch manifest must contain a JSON object")
     files = raw.get("files")
@@ -3634,10 +3604,10 @@ def handle_patch_file_apply(
         print(f"ERROR: Failed to load patch file: {exc}", file=sys.stderr)
         return 1
 
-    patch_review = not NONINTERACTIVE and (
-        patch_review_argument
-        if patch_review_argument is not None
-        else coerce_bool(config.get("patch_review", "off"))
+    patch_review = not NONINTERACTIVE and resolve_bool_option(
+        patch_review_argument,
+        config,
+        "patch_review",
     )
     patch_suffix, suffix_provided = resolve_patch_suffix(
         config, patch_suffix_argument
@@ -3645,9 +3615,10 @@ def handle_patch_file_apply(
 
     try:
         patch_branch_setting = resolve_patch_branch_setting(
-            patch_branch_argument
-            if patch_branch_argument is not None
-            else config.get("patch_branch", DEFAULT_CONFIG["patch_branch"])
+            resolve_config_option(
+                patch_branch_argument, config, "patch_branch",
+                DEFAULT_CONFIG["patch_branch"],
+            )
         )
     except ValueError as exc:
         print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
@@ -3676,23 +3647,17 @@ def handle_patch_file_apply(
         print(diff_text)
 
     if patch_review:
-        while True:
-            patch_input = input("Apply these changes? [y/n/p/h/S]: ")
-            patch_input, suffix_provided = process_patch_review_input(
-                patch_input,
-                diff_text,
-                suffix_provided,
-            )
-            if patch_input is None:
-                continue
-            patch_choice = patch_input.lower()
-            if patch_choice in ("y", "yes"):
-                break
-            if patch_choice in ("n", "no"):
-                if VERBOSE:
-                    print("Aborted.", file=sys.stderr)
-                return 0
-            print("Please answer y, n, or p.")
+        review_action, _, suffix_provided = review_patch_changes(
+            diff_text,
+            suffix_provided,
+            prompt="Apply these changes? [y/n/p/h/S]: ",
+            allow_revision=False,
+            display_text=False,
+        )
+        if review_action != "accept":
+            if VERBOSE:
+                print("Aborted.", file=sys.stderr)
+            return 0
 
     try:
         written_patch_paths = write_patch_changes(
@@ -3705,9 +3670,10 @@ def handle_patch_file_apply(
             patch_commit_message=patch_commit_message,
         )
         if patch_path.name == "response_schema_patch":
-            write_state_schema_patch_applied(
+            write_state_artifact(
                 patch_path.parent,
-                written_patch_paths,
+                "response_schema_patch_applied",
+                "\n".join(written_patch_paths),
             )
     except Exception as exc:
         action = (
@@ -3838,6 +3804,19 @@ def parse_token_cost(value: Any) -> tuple[float, float] | None:
         raise ValueError("token costs must be finite non-negative floats")
     return input_cost, output_cost
 
+
+def request_cost_estimate_log(
+    token_cost: tuple[float, float] | None,
+    request_tokens: int,
+) -> str:
+    if token_cost is None:
+        return ""
+    return (
+        " request_cost_estimate="
+        f"{request_tokens * token_cost[0] / 1_000_000:.4f}"
+    )
+
+
 def response_cost_amounts(
     token_cost: tuple[float, float] | None,
     usage: dict[str, Any] | None,
@@ -3903,12 +3882,22 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ("on", "true", "yes", "1"):
-            return True
-        if normalized in ("off", "false", "no", "0"):
-            return False
+        try:
+            return parse_bool(value)
+        except argparse.ArgumentTypeError:
+            pass
     return default
+
+def resolve_config_option(
+    override: Any,
+    config: dict[str, Any],
+    key: str,
+    default: Any = None,
+ ) -> Any:
+    if override is not None:
+        return override
+    return config.get(key, default)
+
 
 def resolve_bool_option(
     override: bool | None,
@@ -3916,9 +3905,10 @@ def resolve_bool_option(
     key: str,
     default: bool = False,
  ) -> bool:
-    if override is not None:
-        return override
-    return coerce_bool(config.get(key, default), default)
+    return coerce_bool(
+        resolve_config_option(override, config, key, default),
+        default,
+    )
 
 def parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
@@ -3927,6 +3917,13 @@ def parse_bool(value: str) -> bool:
     if normalized in ("off", "false", "no", "0"):
         return False
     raise argparse.ArgumentTypeError("expected a boolean value (true/false)")
+
+
+def parse_optional_float(value: Any) -> float | None:
+    if isinstance(value, str):
+        return None if value.lower() == "off" else float(value)
+    return value
+
 
 def coerce_int(value: Any, default: int) -> int:
     try:
@@ -4261,7 +4258,7 @@ def build_context(
 
 def load_json_schema(path: Path) -> dict[str, Any]:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = read_json_document(path, "schema file")
         if not isinstance(raw, dict):
             raise ValueError("Schema file must contain a JSON object")
         return raw
@@ -4332,6 +4329,15 @@ def append_task_to_system_prompt(
         return system_prompt
     return f"{task}\n{system_prompt}" if system_prompt else task
 
+
+def format_json_schema_context(json_schema: dict[str, Any]) -> str:
+    return (
+        "<json_schema instructions='Return JSON that matches this schema exactly'>\n"
+        f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
+        "</json_schema>"
+    )
+
+
 def build_user_prompt(
     task: str,
     context: str,
@@ -4339,10 +4345,8 @@ def build_user_prompt(
     json_schema: dict[str, Any] | None = None,
     json_patch_responses: list[str] | None = None,
     json_patch_task: str | None = None,
-    json_patch_block = "",
     include_task: bool = True,
     additional_prompt: str = "",
-    schema_block = "",
     current_unix_time: int | None = None,
 ) -> str:
     additional_prompt_block = (
@@ -4351,12 +4355,12 @@ def build_user_prompt(
         else ''
     )
 
-    if response_format == "schema" and json_schema is not None:
-        schema_block = (
-            "<json_schema instructions='Return JSON that matches this schema exactly'>\n"
-            f"{json.dumps(json_schema, indent=2, ensure_ascii=False)}\n"
-            "</json_schema>\n"
-        )
+    schema_block = (
+        format_json_schema_context(json_schema) + "\n"
+        if response_format == "schema" and json_schema is not None
+        else ""
+    )
+    json_patch_block = ""
     if json_patch_responses:
         last_response = json_patch_responses[-1]
         task_block = (
@@ -4384,15 +4388,6 @@ def build_user_prompt(
 {schema_block}{json_patch_block}{additional_prompt_block}
 """.strip()
 
-AGENT_TOOL_NAMES = (
-    "patch",
-    "shell",
-    "readfile",
-    "meta_task_list",
-    "agent",
-    "session",
-    "meta_context_control",
-)
 AGENT_EXPIRES_IN_TURNS_DEFAULT = DEFAULT_AGENT_CONTEXT_EXPIRES[0]
 
 
@@ -4516,13 +4511,8 @@ AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     }
     for tool, argument_schema in AGENT_TOOL_ARGUMENT_SCHEMAS.items()
 ]
- 
-AGENT_TOOL_ARGUMENT_FIELDS: dict[str, frozenset[str]] = {
-    tool: frozenset(argument_schema["properties"])
-    for tool, argument_schema in AGENT_TOOL_ARGUMENT_SCHEMAS.items()
-}
- 
- 
+
+
 @dataclass(frozen=True)
 class AgentToolCall:
     tool: str
@@ -4576,7 +4566,7 @@ class AgentToolExecution:
  
  
 @dataclass(frozen=True)
-class AgentModelSettings:
+class ModelSettings:
     model: str
     api_key: str
     openai_base_url: str
@@ -4601,7 +4591,7 @@ class AgentModelSettings:
  
 @dataclass
 class AgentRunSettings:
-    model_settings: AgentModelSettings
+    model_settings: ModelSettings
     token_limit: int
     token_cost: tuple[float, float] | None
     state_session_dir: Path
@@ -4886,7 +4876,7 @@ def _parse_agent_tool_arguments_value(
         return parse_agent_profile_tool_call(
             profile_name, value, expires_schema
         )
-    if tool not in AGENT_TOOL_NAMES:
+    if not isinstance(tool, str) or tool not in AGENT_TOOL_ARGUMENT_SCHEMAS:
         raise ValueError(f"unknown agent tool: {tool}")
     if not isinstance(value, dict):
         raise ValueError(f"agent {tool} arguments must be a JSON object")
@@ -4969,7 +4959,7 @@ def _parse_agent_tool_arguments_value(
             arguments={"paths": normalized_paths},
         )
  
-    expected_fields = set(AGENT_TOOL_ARGUMENT_FIELDS[tool])
+    expected_fields = set(AGENT_TOOL_ARGUMENT_SCHEMAS[tool]["properties"])
     actual_fields = set(value)
     if actual_fields != expected_fields:
         missing_fields = sorted(expected_fields - actual_fields)
@@ -5146,14 +5136,6 @@ def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
             for field in ("block_id", "summary_message"):
                 if not isinstance(patch[field], str) or not patch[field].strip():
                     raise ValueError(f"{label} requires a non-empty {field}")
-#            content_lines = patch["content_line_array"]
-#            if not isinstance(content_lines, list) or any(
-#                not isinstance(line, str) or "\r" in line or "\n" in line
-#                for line in content_lines
-#            ):
-#                raise ValueError(
-#                    f"{label} content_line_array must contain strings without line endings"
-#                )
         total_lines = max(
             (
                 patch["end_line"]
@@ -5207,7 +5189,7 @@ def is_agent_patch_readfile_companion(
     except ValueError:
         return False
 
-def agent_response_output_text(response_obj: Any) -> str:
+def response_output_text(response_obj: Any) -> str:
     output_text_value = (
         response_obj.get("output_text", "")
         if isinstance(response_obj, dict)
@@ -5279,7 +5261,7 @@ def response_agent_tool_calls(
     error_logger: Any = None,
     response_json_repair: bool = False,
 ) -> list[AgentToolCall]:
-    output_text = agent_response_output_text(response_obj)
+    output_text = response_output_text(response_obj)
     if output_text.strip():
         raise AgentControllerResponseError(
             AGENT_CONTROLLER_NO_EXECUTABLE_TOOL_CALL_ERROR
@@ -5418,14 +5400,6 @@ def format_agent_meta_task_operations(
     return "\n\n".join(blocks)
 
 
-def indent_agent_patch_text(
-    text: str,
-    empty_text: str = "",
-) -> str:
-    lines = text.splitlines() or [empty_text]
-    return "\n".join(f"    {line}" for line in lines)
-
-
 def format_agent_patch_manifest(manifest: dict[str, Any]) -> str:
     file_blocks: list[str] = []
     for file_index, file_entry in enumerate(manifest["files"], start=1):
@@ -5518,25 +5492,18 @@ def format_agent_tool_call_report(
     meta_task_list: list[dict[str, Any]] | None = None,
 ) -> str:
     normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
-    if current_turn is not None:
-        if len(normalized_tool_calls) == 1:
-            return (
-                f"-- [{current_turn}] {'-' * 72}\n"
-                f"{format_agent_tool_call_for_output(normalized_tool_calls[0], meta_task_list)}"
-            )
-        tool_text = "\n\n".join(
-            f"[{index}] {format_agent_tool_call_for_output(tool_call, meta_task_list)}"
-            for index, tool_call in enumerate(
-                normalized_tool_calls,
-                start=1,
-            )
+    if current_turn is not None and len(normalized_tool_calls) == 1:
+        return (
+            f"-- [{current_turn}] {'-' * 72}\n"
+            f"{format_agent_tool_call_for_output(normalized_tool_calls[0], meta_task_list)}"
         )
-        return f"-- [{current_turn}] {'-' * 72}\n{tool_text}"
-    blocks = [
+    tool_text = "\n\n".join(
         f"[{index}] {format_agent_tool_call_for_output(tool_call, meta_task_list)}"
         for index, tool_call in enumerate(normalized_tool_calls, start=1)
-    ]
-    return "Agent tool calls:\n" + "\n\n".join(blocks)
+    )
+    if current_turn is not None:
+        return f"-- [{current_turn}] {'-' * 72}\n{tool_text}"
+    return "Agent tool calls:\n" + tool_text
 
 
 def format_agent_tool_calls(tool_calls: list[AgentToolCall]) -> str:
@@ -5570,7 +5537,7 @@ def format_agent_tool_outputs(
     )
 
 
-def append_agent_tool_history(
+def record_agent_tool_history(
     turns: list[AgentTurn],
     task: str,
     context: str,
@@ -5578,7 +5545,28 @@ def append_agent_tool_history(
     output: str,
     turn_unix_time: int | None = None,
     readfile_contexts: tuple[tuple[str, str], ...] | None = None,
+    *,
+    preceding_patch_tool_call: AgentToolCall | None = None,
  ) -> None:
+    if readfile_contexts is not None:
+        remove_duplicate_agent_history_context_files(
+            turns,
+            readfile_contexts,
+        )
+    if preceding_patch_tool_call is not None:
+        if readfile_contexts is not None:
+            if (
+                not turns
+                or turns[-1].tool_call != preceding_patch_tool_call
+            ):
+                raise ValueError(
+                    "agent patch readfile call has no preceding patch turn"
+                )
+            turns[-1] = replace(
+                turns[-1],
+                readfile_contexts=readfile_contexts,
+            )
+        return
     turns.append(
         AgentTurn(
             task=task,
@@ -5693,22 +5681,6 @@ def remove_duplicate_agent_history_context_files(
         )
 
 
-def attach_agent_patch_readfile_contexts(
-    turns: list[AgentTurn],
-    patch_tool_call: AgentToolCall,
-    readfile_contexts: tuple[tuple[str, str], ...],
-) -> None:
-    if (
-        not turns
-        or turns[-1].tool_call != patch_tool_call
-    ):
-        raise ValueError(
-            "agent patch readfile call has no preceding patch turn"
-        )
-    turns[-1] = replace(
-        turns[-1],
-        readfile_contexts=readfile_contexts,
-    )
 AGENT_HISTORY_PURGE_IN_TURNS = 1
 AGENT_HISTORY_EXPIRATION_REMOVAL_REASON = (
     "This agent turn was removed from the controller context because its "
@@ -5765,7 +5737,6 @@ def advance_agent_history_purges(
 def agent_history_turn_numbers(
     turns: list[AgentTurn],
     turn_numbers: list[int] | None = None,
-    pinned_turn_numbers: set[int] | None = None,
  ) -> list[int]:
     if turn_numbers is None:
         turn_numbers = list(range(1, len(turns) + 1))
@@ -5796,7 +5767,6 @@ def format_agent_history(
             agent_history_turn_numbers(
                 turns,
                 turn_numbers,
-                pinned_turn_numbers,
             )
         )
     blocks: list[str] = []
@@ -5919,23 +5889,34 @@ def resolve_agent_context_pin(
     )
 
 
-def set_agent_context_expires_in_turns(
-    target_type: str,
-    target: str | int,
+def apply_agent_context_control(
+    tool_call: AgentToolCall,
+    file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
     file_expires_in_turns: dict[str, int],
-    expires_in_turns: int,
+    pinned_paths: set[str],
+    pinned_turn_numbers: set[int],
 ) -> None:
-    if target_type == "file":
-        file_expires_in_turns[str(target)] = expires_in_turns
-        return
-    if target_type != "turn":
-        raise ValueError(f"unknown agent context target type: {target_type}")
-    turn_number = int(target)
-    turns[turn_number - 1] = replace(
-        turns[turn_number - 1],
-        expires_in_turns=expires_in_turns,
+    target_type, target = resolve_agent_context_pin(
+        tool_call.context_id,
+        file_contexts,
+        turns,
+        set(agent_history_turn_numbers(turns)),
     )
+    if tool_call.action == "pin":
+        if target_type == "file":
+            pinned_paths.add(str(target))
+        else:
+            pinned_turn_numbers.add(int(target))
+    elif tool_call.action == "set_expires_in_turns":
+        if target_type == "file":
+            file_expires_in_turns[str(target)] = tool_call.expires_in_turns
+        else:
+            turn_index = int(target) - 1
+            turns[turn_index] = replace(
+                turns[turn_index],
+                expires_in_turns=tool_call.expires_in_turns,
+            )
 
 
 @dataclass(frozen=True)
@@ -6066,10 +6047,11 @@ def load_state_agent_file_contexts(
     turn_dir: Path,
  ) -> tuple[tuple[str, str], ...] | None:
     artifact_path = turn_dir / "response_agent_file_contexts"
-    if not artifact_path.exists() and not artifact_path.is_symlink():
+    artifact_text = read_optional_state_artifact(artifact_path)
+    if artifact_text is None:
         return None
     try:
-        entries = json.loads(read_state_artifact(artifact_path))
+        entries = json.loads(artifact_text)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"agent file contexts must contain JSON: {artifact_path}"
@@ -6176,15 +6158,6 @@ def parse_reused_agent_tool_calls(
     )
 
 
-def parse_reused_agent_tool_call(response: str) -> AgentToolCall:
-    tool_calls = parse_reused_agent_tool_calls(response)
-    if len(tool_calls) != 1:
-        raise ValueError(
-            "reused agent response must contain exactly one tool call"
-        )
-    return tool_calls[0]
-
-
 def parse_reused_agent_tool_outputs(
     output: str,
     tool_call_count: int,
@@ -6227,21 +6200,16 @@ def load_reused_session_agent_history(
         state_session_dir, turn
     )
     selected_turn = int(selected_turn_dir.name)
-    turn_directories = [
-        (turn_number, entry)
-        for turn_number, entry in state_turn_directories(state_session_dir)
-        if (
-            turn_number <= selected_turn
-            and (entry / "response").is_file()
-            and not (entry / "response").is_symlink()
-        )
-    ]
+    turn_directories = completed_state_turn_directories(
+        state_session_dir,
+        selected_turn,
+    )
     turns: list[AgentTurn] = []
     active_task = ""
     active_context = ""
     task_list: list[dict[str, Any]] = []
 
-    for turn_number, turn_dir in sorted(turn_directories):
+    for turn_number, turn_dir in turn_directories:
         response_path = turn_dir / "response"
         response = read_state_artifact(response_path)
         turn_unix_time = state_artifact_last_modified_time(response_path)
@@ -6259,12 +6227,9 @@ def load_reused_session_agent_history(
                 ) from exc
             continue
         task = read_state_artifact(turn_dir / "request_task")
-        output_path = turn_dir / "response_agent_tool_output"
-        output = (
-            read_state_artifact(output_path)
-            if output_path.exists() or output_path.is_symlink()
-            else ""
-        )
+        output = read_optional_state_artifact(
+            turn_dir / "response_agent_tool_output"
+        ) or ""
         try:
             tool_outputs = parse_reused_agent_tool_outputs(
                 output,
@@ -6298,30 +6263,22 @@ def load_reused_session_agent_history(
                 if tool_call.tool == AGENT_READFILE_TOOL
                 else None
             )
-            if readfile_contexts is not None:
-                remove_duplicate_agent_history_context_files(
-                    turns,
-                    readfile_contexts,
-                )
-            if patch_readfile_companion:
-                if readfile_contexts is not None:
-                    attach_agent_patch_readfile_contexts(
-                        turns,
-                        tool_calls[tool_call_index - 1],
-                        readfile_contexts,
-                    )
-                continue
-            turns.append(
-                AgentTurn(
-                    task=task,
-                    context=tool_context,
-                    tool_call=tool_call,
-                    output=tool_output,
-                    turn_unix_time=turn_unix_time,
-                    expires_in_turns=tool_call.expires_in_turns,
-                    readfile_contexts=readfile_contexts,
-                )
+            record_agent_tool_history(
+                turns,
+                task,
+                tool_context,
+                tool_call,
+                tool_output,
+                turn_unix_time=turn_unix_time,
+                readfile_contexts=readfile_contexts,
+                preceding_patch_tool_call=(
+                    tool_calls[tool_call_index - 1]
+                    if patch_readfile_companion
+                    else None
+                ),
             )
+            if patch_readfile_companion:
+                continue
             if (
                 tool_call.tool == AGENT_META_TASK_LIST_TOOL
                 and tool_output
@@ -6367,7 +6324,7 @@ def reused_agent_context_pins(
     pinned_paths = set(initial_pinned_paths or ())
     pinned_turn_numbers: set[int] = set()
     replayed_turns: list[AgentTurn] = []
-    for turn_number, turn in enumerate(turns, start=1):
+    for turn in turns:
         advance_agent_history_purges(
             replayed_turns,
             pinned_turn_numbers,
@@ -6382,35 +6339,17 @@ def reused_agent_context_pins(
             and turn.output
             and not turn.output.startswith("ERROR:")
         ):
-            available_turn_numbers = set(
-                agent_history_turn_numbers(
-                    replayed_turns,
-                    pinned_turn_numbers=pinned_turn_numbers,
-                )
-            )
             try:
-                target_type, target = resolve_agent_context_pin(
-                    turn.tool_call.context_id,
+                apply_agent_context_control(
+                    turn.tool_call,
                     file_contexts,
                     replayed_turns,
-                    available_turn_numbers,
+                    file_expires_in_turns,
+                    pinned_paths,
+                    pinned_turn_numbers,
                 )
             except ValueError:
                 pass
-            else:
-                if turn.tool_call.action == "pin":
-                    if target_type == "file":
-                        pinned_paths.add(str(target))
-                    else:
-                        pinned_turn_numbers.add(int(target))
-                elif turn.tool_call.action == "set_expires_in_turns":
-                    set_agent_context_expires_in_turns(
-                        target_type,
-                        target,
-                        replayed_turns,
-                        file_expires_in_turns,
-                        turn.tool_call.expires_in_turns,
-                    )
         replayed_turns.append(turn)
     turns[:] = replayed_turns
     return pinned_paths, pinned_turn_numbers
@@ -6471,10 +6410,7 @@ def build_agent_context_window_prompt(
         pinned_paths,
     )
     visible_turn_numbers = set(
-        agent_history_turn_numbers(
-            turns,
-            pinned_turn_numbers=pinned_turn_numbers,
-        )
+        agent_history_turn_numbers(turns)
     )
     turn_numbers = list(range(1, len(turns) + 1))
     visible_file_indexes = set(range(len(file_contexts)))
@@ -6702,41 +6638,14 @@ def review_agent_tool_calls(
     accept_automatically: bool,
     task_list: list[dict[str, Any]] | None = None,
  ) -> tuple[str, str | None]:
-    tool_text = format_agent_tool_call_report(
-        tool_calls,
-        meta_task_list=task_list,
+    return review_tool_text(
+        format_agent_tool_call_report(
+            tool_calls,
+            meta_task_list=task_list,
+        ),
+        "Run these agent tool calls? [y/n/p/h/e/E <prompt>]: ",
+        accept_automatically=accept_automatically,
     )
-    if accept_automatically:
-        return "accept", None
-    if NONINTERACTIVE:
-        return "save", None
-    print()
-    print(tool_text)
-    while True:
-        choice = process_shell_review_input(
-            input("Run these agent tool calls? [y/n/p/h/e/E <prompt>]: "),
-            tool_text,
-        )
-        if choice is None:
-            continue
-        normalized_choice = choice.lower()
-        if normalized_choice in ("y", "yes"):
-            return "accept", None
-        if normalized_choice in ("n", "no"):
-            return "reject", None
-        if normalized_choice == "e":
-            return "edit", None
-        if (
-            choice.startswith("E")
-            and len(choice) > 1
-            and choice[1].isspace()
-        ):
-            revision_task = choice[1:].strip()
-            if revision_task:
-                return "edit", revision_task
-            print("Revision task cannot be empty.")
-            continue
-        print("Please answer y, n, p, h, e, or E followed by a prompt.")
 
 
 
@@ -6756,53 +6665,61 @@ def emit_agent_auto_tool_call(
     elif not settings.suppress_response_output:
         print(output_text)
 
-def review_agent_patch_changes(
+def review_patch_changes(
     diff_text: str,
     suffix_provided: bool,
-    accept_automatically: bool,
+    accept_automatically: bool = False,
+    *,
+    prompt: str = "Apply these changes? [y/n/p/h/S/e/E <prompt>]: ",
+    allow_revision: bool = True,
+    allow_navigation: bool = False,
+    display_text: bool = True,
  ) -> tuple[str, str | None, bool]:
-    if accept_automatically:
-        return "accept", None, suffix_provided
-    if NONINTERACTIVE:
-        return "save", None, suffix_provided
-    print()
-    print(diff_text)
-    while True:
-        patch_input = input(
-            "Apply this agent patch? [y/n/p/h/S/e/E <prompt>]: "
-        )
-        patch_input, suffix_provided = process_patch_review_input(
+    options = (
+        "[y]es, [n]o, [p]ager, [h]elp, "
+        "[S] toggle patch suffix"
+    )
+    if allow_navigation:
+        options += ", [<]prevturn, [>]nextturn"
+    if allow_revision:
+        options += ", [e]dit, E <prompt>"
+    usage = f"Usage: {options}"
+
+    def process_input(patch_input: str) -> str | None:
+        nonlocal suffix_provided
+        choice = process_tool_review_input(
             patch_input,
             diff_text,
-            suffix_provided,
-            allow_navigation=True,
+            usage,
         )
-        if patch_input is None:
-            continue
-        patch_choice = patch_input.lower()
-        if patch_choice in ("y", "yes"):
-            return "accept", None, suffix_provided
-        if patch_choice in ("n", "no"):
-            return "reject", None, suffix_provided
-        if patch_choice == "e":
-            return "edit", None, suffix_provided
-        if (
-            patch_input.startswith("E")
-            and len(patch_input) > 1
-            and patch_input[1].isspace()
-        ):
-            revision_task = patch_input[1:].strip()
-            if revision_task:
-                return "edit", revision_task, suffix_provided
-            print("Revision task cannot be empty.")
-            continue
-        print("Please answer y, n, p, h, S, e, or E followed by a prompt.")
+        if choice is not None and choice.lower() == "s":
+            suffix_provided = not suffix_provided
+            state = "enabled" if suffix_provided else "disabled"
+            print(f"Patch suffix {state}.")
+            return None
+        return choice
+
+    review_action, revision_task = review_tool_text(
+        diff_text,
+        prompt,
+        accept_automatically=accept_automatically,
+        input_processor=process_input,
+        invalid_choice_message=usage,
+        allow_revision=allow_revision,
+        additional_actions=("<", ">") if allow_navigation else (),
+        display_text=display_text,
+    )
+    return review_action, revision_task, suffix_provided
 
 
-def append_agent_log(settings: AgentRunSettings, text: str) -> None:
-    if not settings.log_enabled or settings.log_path is None:
+def append_session_log(
+    log_path: Path | None,
+    text: str,
+    enabled: bool = True,
+) -> None:
+    if not enabled or log_path is None:
         return
-    with settings.log_path.open("a", encoding="utf-8") as log_file:
+    with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(text)
 
 
@@ -6815,6 +6732,11 @@ def request_agent_model(
     tools: list[dict[str, Any]] | None = None,
     record_state: bool = True,
 ) -> AgentModelResult:
+    def append_log(text: str) -> None:
+        append_session_log(
+            settings.log_path, text, settings.log_enabled
+        )
+
     request_tokens = estimate_request_tokens(
         model=settings.model_settings.model,
         system_prompt=system_prompt,
@@ -6832,11 +6754,8 @@ def request_agent_model(
         else ""
     )
     request_characters = len(system_prompt + user_prompt + tool_schema_text)
-    request_cost_log = (
-        f" request_cost_estimate="
-        f"{request_tokens * settings.token_cost[0] / 1_000_000:.4f}"
-        if settings.token_cost is not None
-        else ""
+    request_cost_log = request_cost_estimate_log(
+        settings.token_cost, request_tokens
     )
     turn_dir: Path | None = None
     if record_state:
@@ -6848,8 +6767,7 @@ def request_agent_model(
             settings.file_paths,
         )
         settings.state_turn += 1
-    append_agent_log(
-        settings,
+    append_log(
         "<agent_request>\n"
         f"<request_stats>\nrequest_characters={request_characters} "
         f"request_tokens_estimate={request_tokens}{request_cost_log}"
@@ -6870,35 +6788,16 @@ def request_agent_model(
     model_settings = settings.model_settings
     parsed_tool_calls: tuple[AgentToolCall, ...] = ()
     response_failures = 0
-    error_logger = lambda event: append_agent_log(settings, event)
     try:
         while True:
             try:
-                response_obj, usage = call_openai(
-                    api_key=model_settings.api_key,
-                    openai_base_url=model_settings.openai_base_url,
-                    openai_proxy=model_settings.openai_proxy,
-                    openai_organization=model_settings.openai_organization,
-                    openai_project=model_settings.openai_project,
-                    model=model_settings.model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
+                response_obj, usage = call_model(
+                    model_settings,
+                    system_prompt,
+                    user_prompt,
                     response_format=("schema" if json_schema is not None else "text"),
                     json_schema=json_schema,
-                    response_verbosity=model_settings.response_verbosity,
-                    temperature=model_settings.temperature,
-                    top_p=model_settings.top_p,
-                    max_output_tokens=model_settings.max_output_tokens,
-                    openai_service_tier=model_settings.openai_service_tier,
-                    openai_reasoning=model_settings.openai_reasoning,
-                    reasoning_mode=model_settings.reasoning_mode,
-                    explicit_prompt_cache=model_settings.explicit_prompt_cache,
-                    extra_body=model_settings.extra_body,
-                    llm_timeout=model_settings.llm_timeout,
-                    retry=model_settings.retry,
-                    safety_identifier=model_settings.safety_identifier,
-                    store=model_settings.api_log,
-                    error_logger=error_logger,
+                    error_logger=append_log,
                     tools=tools,
                     tool_choice="required" if tools else None,
                     parallel_tool_calls=True if tools else None,
@@ -6911,7 +6810,7 @@ def request_agent_model(
                             agent_expires_in_turns_schema(
                                 settings.agent_context_expires
                             ),
-                            error_logger=error_logger,
+                            error_logger=append_log,
                             response_json_repair=model_settings.response_json_repair,
                         )
                     )
@@ -6923,7 +6822,7 @@ def request_agent_model(
                         ) from exc
                     parse_agent_response_json(response, "agent tool calls")
                 else:
-                    response = agent_response_output_text(response_obj)
+                    response = response_output_text(response_obj)
                     if json_schema is not None:
                         response = normalize_agent_json_response(
                             response,
@@ -6938,7 +6837,7 @@ def request_agent_model(
                     f"(attempt {response_failures}/{model_settings.retry + 1}): {exc}"
                 )
                 print(failure_message, file=sys.stderr)
-                _log_api_request_event(error_logger, failure_message)
+                _log_api_request_event(append_log, failure_message)
                 if response_failures > model_settings.retry:
                     raise
                 continue
@@ -6963,8 +6862,7 @@ def request_agent_model(
         usage=usage,
         response_cost=response_cost_line(settings.token_cost, usage),
     )
-    append_agent_log(
-        settings,
+    append_log(
         f"<agent_response_reasoning>\n{reasoning}\n</agent_response_reasoning>\n"
         f"<agent_response>\n{response}\n</agent_response>\n"
         f"<agent_response_stats>\n{statsline}\n</agent_response_stats>\n",
@@ -7135,20 +7033,17 @@ def run_agent_shell_tool(
     turn_dir: Path,
     previous_task: str,
 ) -> AgentToolExecution:
-    if settings.agent_auto:
-        review_action, revision_task = "accept", None
-    else:
-        review_action, revision_task = review_shell_commands(commands)
+    review_action, revision_task = review_shell_commands(
+        commands,
+        accept_automatically=settings.agent_auto,
+    )
     if review_action == "edit":
         if revision_task is None:
             try:
-                edited_text = edit_text(
-                    build_shell_revision_editor_text(
-                        commands,
-                        previous_task,
-                    ),
+                revision_task = edit_tool_revision_task(
+                    format_shell_commands(commands, include_reasons=False),
+                    previous_task,
                 )
-                revision_task = extract_patch_revision_task(edited_text)
             except Exception as exc:
                 return AgentToolExecution(
                     f"ERROR: Failed to edit shell tool task: {exc}"
@@ -7175,7 +7070,7 @@ def run_agent_shell_tool(
         shell_networking=settings.shell_networking,
     )
     try:
-        write_state_shell_output(turn_dir, shell_output)
+        write_state_artifact(turn_dir, "response_shell_output", shell_output)
     except Exception as exc:
         return AgentToolExecution(
             f"ERROR: Failed to save shell tool output: {exc}"
@@ -7201,29 +7096,26 @@ def run_agent_patch_tool(
             original_texts,
             manifest,
         )
-        write_state_schema_patch(turn_dir, manifest_text)
-        write_state_diff_patch(turn_dir, diff_text)
+        write_state_patch_artifacts(turn_dir, manifest_text, diff_text)
     except Exception as exc:
         return AgentToolExecution(f"ERROR: Patch tool failed: {exc}")
  
     if not changed_items:
         return AgentToolExecution("Patch tool completed without changes.")
  
-    review_action, revision_task, suffix_provided = review_agent_patch_changes(
+    review_action, revision_task, suffix_provided = review_patch_changes(
         diff_text,
         suffix_provided,
         settings.agent_auto,
+        prompt="Apply this agent patch? [y/n/p/h/S/e/E <prompt>]: ",
     )
     if review_action == "edit":
         if revision_task is None:
             try:
-                edited_text = edit_text(
-                    build_patch_revision_editor_text(
-                        diff_text,
-                        previous_task,
-                    ),
+                revision_task = edit_tool_revision_task(
+                    diff_text,
+                    previous_task,
                 )
-                revision_task = extract_patch_revision_task(edited_text)
             except Exception as exc:
                 return AgentToolExecution(
                     f"ERROR: Failed to edit patch tool task: {exc}"
@@ -7254,9 +7146,10 @@ def run_agent_patch_tool(
                 manifest.get("commit_message", "Agent patch")
             ).strip() or "Agent patch",
         )
-        write_state_schema_patch_applied(
+        write_state_artifact(
             turn_dir,
-            written_paths,
+            "response_schema_patch_applied",
+            "\n".join(written_paths),
         )
     except Exception as exc:
         return AgentToolExecution(
@@ -7275,25 +7168,18 @@ def finish_agent_response(
     reasoning: str,
     append_output: bool = False,
  ) -> int:
-    output_text = response_text
-    if settings.print_reasoning:
-        output_text = f"<think>\n{reasoning}\n</think>\n\n{output_text}"
+    output_text = format_response_output(
+        response_text,
+        reasoning,
+        settings.print_reasoning,
+    )
     if not output_text:
         return 0
-    if OUTPUT_FILE is not None:
-        try:
-            write_output_file(output_text, append=append_output)
-        except Exception as exc:
-            print(
-                f"ERROR: Failed to write output to file: {exc}",
-                file=sys.stderr,
-            )
-            if not settings.suppress_response_output:
-                print(output_text)
-            return 1
-    elif not settings.suppress_response_output:
-        print(output_text)
-    return 0
+    return emit_response_output(
+        output_text,
+        suppress_response_output=settings.suppress_response_output,
+        append_output=append_output,
+    )
 
 
 def run_agent_mode(settings: AgentRunSettings) -> int:
@@ -7397,16 +7283,13 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         if review_action == "edit":
             if revision_task is None:
                 try:
-                    edited_text = edit_text(
-                        build_patch_revision_editor_text(
-                            format_agent_tool_call_report(
-                                tool_calls,
-                                meta_task_list=meta_task_list,
-                            ),
-                            active_task,
+                    revision_task = edit_tool_revision_task(
+                        format_agent_tool_call_report(
+                            tool_calls,
+                            meta_task_list=meta_task_list,
                         ),
+                        active_task,
                     )
-                    revision_task = extract_patch_revision_task(edited_text)
                 except Exception as exc:
                     print(
                         f"ERROR: Failed to edit agent revision: {exc}",
@@ -7444,8 +7327,9 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             if not executed_tool_calls:
                 return True
             try:
-                write_state_agent_tool_output(
+                write_state_artifact(
                     model_result.turn_dir,
+                    "response_agent_tool_output",
                     format_agent_tool_outputs(
                         executed_tool_calls,
                         tool_outputs,
@@ -7489,40 +7373,19 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             readfile_contexts: tuple[tuple[str, str], ...] | None = None
 
             if tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL:
-                available_turn_numbers = set(
-                    agent_history_turn_numbers(
-                        turns,
-                        pinned_turn_numbers=pinned_turn_numbers,
-                    )
-                )
                 try:
-                    target_type, target = resolve_agent_context_pin(
-                        tool_call.context_id,
+                    apply_agent_context_control(
+                        tool_call,
                         file_contexts,
                         turns,
-                        available_turn_numbers,
+                        file_expires_in_turns,
+                        pinned_paths,
+                        pinned_turn_numbers,
                     )
                 except ValueError as exc:
                     tool_output = f"ERROR: Failed to pin context: {exc}"
                 else:
                     tool_output = ""
-                    if tool_call.action == "pin":
-                        if target_type == "file":
-                            path = str(target)
-                            already_pinned = path in pinned_paths
-                            pinned_paths.add(path)
-                        else:
-                            turn_number = int(target)
-                            already_pinned = turn_number in pinned_turn_numbers
-                            pinned_turn_numbers.add(turn_number)
-                    else:
-                        set_agent_context_expires_in_turns(
-                            target_type,
-                            target,
-                            turns,
-                            file_expires_in_turns,
-                            tool_call.expires_in_turns,
-                        )
             elif tool_call.tool == AGENT_READFILE_TOOL:
                 execution = run_agent_readfile_tool_call(
                     settings,
@@ -7603,27 +7466,20 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 return 1
             if readfile_contexts is not None:
                 readfile_contexts_for_turn = readfile_contexts
-                remove_duplicate_agent_history_context_files(
-                    turns,
-                    readfile_contexts,
-                )
-            if patch_readfile_companion:
-                if readfile_contexts is not None:
-                    attach_agent_patch_readfile_contexts(
-                        turns,
-                        tool_calls[tool_call_index - 1],
-                        readfile_contexts,
-                    )
-            else:
-                append_agent_tool_history(
-                    turns,
-                    turn_task,
-                    tool_context,
-                    tool_call,
-                    tool_output,
-                    turn_unix_time=model_result.turn_unix_time,
-                    readfile_contexts=readfile_contexts,
-                )
+            record_agent_tool_history(
+                turns,
+                turn_task,
+                tool_context,
+                tool_call,
+                tool_output,
+                turn_unix_time=model_result.turn_unix_time,
+                readfile_contexts=readfile_contexts,
+                preceding_patch_tool_call=(
+                    tool_calls[tool_call_index - 1]
+                    if patch_readfile_companion
+                    else None
+                ),
+            )
             executed_tool_calls.append(tool_call)
             tool_outputs.append(tool_output)
         if not save_tool_outputs():
@@ -7638,32 +7494,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
 # -------------------------------------------------------------------
 # OpenAI-compatible request
 # -------------------------------------------------------------------
-
-def _handle_openai_error(exc: Exception) -> None:
-    if isinstance(exc, AuthenticationError):
-        msg = "Authentication failed – check your API key."
-    elif isinstance(exc, RateLimitError):
-        msg = "Rate limit exceeded – try again later."
-    elif isinstance(exc, BadRequestError):
-        msg = f"Bad request: {exc}"
-    elif isinstance(exc, PermissionDeniedError):
-        msg = f"Permission denied: {exc}"
-    elif isinstance(exc, NotFoundError):
-        msg = f"Resource not found: {exc}"
-    elif isinstance(exc, APITimeoutError):
-        msg = f"Request timed out: {exc}"
-    elif isinstance(exc, APIConnectionError):
-        msg = f"Network error: {exc}"
-    elif isinstance(exc, UnprocessableEntityError):
-        msg = f"Cannot process request despite it being correct: {exc}"
-    elif isinstance(exc, InternalServerError):
-        msg = f"API internal server error: {exc}"
-    elif isinstance(exc, APIError):
-        msg = f"API error: {exc}"
-    else:
-        msg = f"Unexpected error: {exc}"
-    raise exc
-
 
 def _log_api_request_event(error_logger: Any, message: str) -> None:
     if error_logger is None:
@@ -7726,7 +7556,6 @@ def execute_openai_request(
                 )
                 print(success_message, file=sys.stderr)
                 _log_api_request_event(error_logger, success_message)
-            failed_retries = 0
             return response
 
 
@@ -7854,17 +7683,61 @@ def call_openai(
         print(json.dumps(kwargs, indent=2), file=sys.stderr)
         print("</debug_request>", file=sys.stderr)
 
-    try:
-        response = execute_openai_request(
-            lambda: client.responses.create(**kwargs),
-            retry=retry,
-            operation_name="API request",
-            error_logger=error_logger,
-        )
-    except Exception as exc:
-        _handle_openai_error(exc)
+    response = execute_openai_request(
+        lambda: client.responses.create(**kwargs),
+        retry=retry,
+        operation_name="API request",
+        error_logger=error_logger,
+    )
 
     return response, usage_to_dict(getattr(response, "usage", None))
+
+
+def call_model(
+    settings: ModelSettings,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    response_format: str = "text",
+    json_schema: dict[str, Any] | None = None,
+    stream: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    parallel_tool_calls: bool | None = None,
+    retry: int | None = None,
+    error_logger: Any = None,
+) -> tuple[Any, dict[str, Any] | None]:
+    return call_openai(
+        api_key=settings.api_key,
+        openai_base_url=settings.openai_base_url,
+        openai_proxy=settings.openai_proxy,
+        openai_organization=settings.openai_organization,
+        openai_project=settings.openai_project,
+        model=settings.model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        response_format=response_format,
+        json_schema=json_schema,
+        response_verbosity=settings.response_verbosity,
+        temperature=settings.temperature,
+        top_p=settings.top_p,
+        max_output_tokens=settings.max_output_tokens,
+        openai_service_tier=settings.openai_service_tier,
+        openai_reasoning=settings.openai_reasoning,
+        reasoning_mode=settings.reasoning_mode,
+        explicit_prompt_cache=settings.explicit_prompt_cache,
+        extra_body=settings.extra_body,
+        llm_timeout=settings.llm_timeout,
+        retry=settings.retry if retry is None else retry,
+        safety_identifier=settings.safety_identifier,
+        store=settings.api_log,
+        stream=stream,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+        error_logger=error_logger,
+    )
+
 
 def consume_response_stream(
     stream: Any,
@@ -8081,6 +7954,25 @@ def expand_tree_file_paths(
     return sorted(unique_candidates, key=lambda path: path.as_posix()), roots
 
 
+def resolve_tree_file_paths(
+    args: argparse.Namespace,
+    exclude_git: bool,
+ ) -> tuple[list[Path], list[Path]]:
+    input_names = (
+        read_files_list(args.tree_files_list)
+        if args.tree_files_list
+        else list(args.tree_files or [])
+    )
+    file_paths, roots = expand_tree_file_paths(
+        input_names,
+        include_patterns=args.tree_include or [],
+        exclude_patterns=args.tree_exclude or [],
+        exclude_git=exclude_git,
+    )
+    if not file_paths:
+        raise ValueError("No files matched the tree inputs and filters.")
+    return file_paths, roots
+
 
 def tree_result_relative_path(path: Path, roots: list[Path]) -> Path:
     cwd = Path.cwd().resolve()
@@ -8164,25 +8056,9 @@ def run_tree_mode(
     max_file_size_kb: int,
     tree_parallel: int,
     token_limit: int,
-    model: str,
-    api_key: str,
-    openai_base_url: str,
-    openai_proxy: str,
-    openai_organization: str,
-    openai_project: str,
+    model_settings: ModelSettings,
     response_format: str,
     json_schema: dict[str, Any] | None,
-    response_verbosity: str,
-    temperature: float | None,
-    top_p: float | None,
-    max_output_tokens: int,
-    openai_service_tier: str,
-    openai_reasoning: str | None,
-    reasoning_mode: str,
-    extra_body: dict[str, Any],
-    llm_timeout: int,
-    safety_identifier: Any,
-    api_log: bool,
     token_cost: tuple[float, float] | None,
     print_reasoning: bool,
     tree_session_dir: Path,
@@ -8192,22 +8068,17 @@ def run_tree_mode(
     log_path: Path | None,
     system_prompt_with_task: bool = False,
     tree_session_stem: str = "",
-    retry: int = 2,
-    explicit_prompt_cache: bool = False,
-    response_json_repair: bool = False,
 ) -> int:
-    retry = parse_retry_count(retry)
+    retry = parse_retry_count(model_settings.retry)
+    model = model_settings.model
     log_lock = threading.Lock()
     db_lock = threading.Lock()
     state_turn_lock = threading.Lock()
     next_state_turn = next_state_turn_index(state_session_dir)
 
     def append_tree_log(text: str) -> None:
-        if not log_enabled or log_path is None:
-            return
         with log_lock:
-            with log_path.open("a", encoding="utf-8") as log_file:
-                log_file.write(text)
+            append_session_log(log_path, text, log_enabled)
     def start_tree_state_turn(
         system_prompt: str,
         task: str,
@@ -8349,8 +8220,9 @@ def run_tree_mode(
                 user_prompt=user_prompt,
             )
             request_characters = len(full_system_prompt + user_prompt)
-            if token_cost is not None:
-                request_cost_log = f" request_cost_estimate={request_tokens * token_cost[0] / 1_000_000:.4f}"
+            request_cost_log = request_cost_estimate_log(
+                token_cost, request_tokens
+            )
             state_turn_path = start_tree_state_turn(
                 system_prompt=full_system_prompt,
                 task=selected_task,
@@ -8359,41 +8231,23 @@ def run_tree_mode(
                 raise ValueError(
                     f"Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})"
                 )
-            response_obj, usage = call_openai(
-                api_key=api_key,
-                openai_base_url=openai_base_url,
-                openai_proxy=openai_proxy,
-                openai_organization=openai_organization,
-                openai_project=openai_project,
-                model=model,
-                system_prompt=full_system_prompt,
-                user_prompt=user_prompt,
+            response_obj, usage = call_model(
+                model_settings,
+                full_system_prompt,
+                user_prompt,
                 response_format=response_format,
                 json_schema=json_schema,
-                response_verbosity=response_verbosity,
-                temperature=temperature,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-                openai_service_tier=openai_service_tier,
-                openai_reasoning=openai_reasoning,
-                reasoning_mode=reasoning_mode,
-                extra_body=extra_body,
-                explicit_prompt_cache=explicit_prompt_cache,
-                llm_timeout=llm_timeout,
                 retry=0,
-                safety_identifier=safety_identifier,
-                store=api_log,
-                stream=False,
                 error_logger=append_tree_log,
             )
-            result = str(getattr(response_obj, "output_text", "") or "")
+            result = response_output_text(response_obj)
             if not result.strip():
                 error_text = "LLM returned an empty response"
                 error_type = "temp"
             if response_format in ("json", "schema") and result.strip():
                 try:
                     result = json.dumps(
-                        parse_json_response(result, response_json_repair),
+                        parse_json_response(result, model_settings.response_json_repair),
                         indent=2,
                         ensure_ascii=False,
                     )
@@ -8414,10 +8268,8 @@ def run_tree_mode(
         if not stored_result:
             stored_result = f"ERROR: {error_text}" if error_text else ""
         if state_turn_path is not None:
-            state_response = result if result else (f"ERROR: {error_text}" if error_text else "")
-            complete_state_turn(state_turn_path, reasoning, state_response)
-        if print_reasoning:
-            stored_result = f"<think>\n{reasoning}\n</think>\n\n{stored_result}"
+            complete_state_turn(state_turn_path, reasoning, stored_result)
+        stored_result = format_response_output(stored_result, reasoning, print_reasoning)
         output_error: str | None = None
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8438,26 +8290,22 @@ def run_tree_mode(
             response_cost=response_cost,
         )
         if log_enabled:
-            with log_lock:
-                with open(log_path, "a", encoding="utf-8") as log_file:
-                    log_file.write(f"<tree_file path='{file_path}'>\n")
-                    log_file.write("<tree_request_stats>\n")
-                    log_file.write(
-                        f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
-                        f"reasoning={openai_reasoning} reasoning_mode={reasoning_mode} "
-                        f"max_output_tokens={max_output_tokens} api_log={api_log} timeout={llm_timeout}\n"
-                    )
-                    log_file.write(f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n")
-                    log_file.write(f"<user_prompt>\n{user_prompt}\n</user_prompt>\n")
-                    if reasoning:
-                        log_file.write(f"<reasoning>\n{reasoning}\n</reasoning>\n")
-                    if error_text:
-                        log_file.write(f"<error>{error_text}</error>\n")
-                    log_file.write(f"<response>\n{stored_result}\n</response>\n")
-                    log_file.write(f"<response_stats>\n{statsline}\n</response_stats>\n")
-                    log_file.write(f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n")
-                    log_file.write("</tree_file>\n")
-                    log_file.flush()
+            append_tree_log(
+                f"<tree_file path='{file_path}'>\n"
+                "<tree_request_stats>\n"
+                f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+                f"reasoning={model_settings.openai_reasoning} reasoning_mode={model_settings.reasoning_mode} "
+                f"max_output_tokens={model_settings.max_output_tokens} api_log={model_settings.api_log} timeout={model_settings.llm_timeout}\n"
+                "</tree_request_stats>\n"
+                f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n"
+                f"<user_prompt>\n{user_prompt}\n</user_prompt>\n"
+                + (f"<reasoning>\n{reasoning}\n</reasoning>\n" if reasoning else "")
+                + (f"<error>{error_text}</error>\n" if error_text else "")
+                + f"<response>\n{stored_result}\n</response>\n"
+                f"<response_stats>\n{statsline}\n</response_stats>\n"
+                f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n"
+                "</tree_file>\n"
+            )
         if error_text is None and output_error is None:
             set_status(rel_str, "complete")
             success = True
@@ -9632,11 +9480,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
 # -------------------------------------------------------------------
 
 def main() -> int:
-    tokenizer_padding = 0
-
     json_schema = None
-    json_patch_responses: list[str] = []
-    json_patch_task: str | None = None
 
     global CONFIG_FILE
     global VERBOSE
@@ -9697,18 +9541,9 @@ def main() -> int:
         parsed_turn: int | None = None
         if len(option_values) == 2:
             try:
-                parsed_turn = int(option_values[1])
-            except ValueError:
-                print(
-                    f"ERROR: {option_flag} TURN must be an integer",
-                    file=sys.stderr,
-                )
-                return 1
-            if parsed_turn < 0:
-                print(
-                    f"ERROR: {option_flag} TURN must be non-negative",
-                    file=sys.stderr,
-                )
+                parsed_turn = parse_session_turn(option_values[1], option_flag)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
         setattr(args, option_name, option_values[0])
         if option_name == "patch_file_apply":
@@ -9896,21 +9731,13 @@ def main() -> int:
             return 1
         if len(args.reuse_session) == 2:
             try:
-                reuse_session_turn = int(args.reuse_session[1])
-            except ValueError:
-                print(
-                    "ERROR: --reuse-session TURN must be an integer",
-                    file=sys.stderr,
+                reuse_session_turn = parse_session_turn(
+                    args.reuse_session[1], "--reuse-session"
                 )
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
         args.reuse_session = args.reuse_session[0]
-
-    if reuse_session_turn is not None and reuse_session_turn < 0:
-        print(
-            "ERROR: --reuse-session TURN must be non-negative",
-            file=sys.stderr,
-        )
-        return 1
 
     if args.remove_expired_data is not None:
         return handle_remove_expired_data(args.remove_expired_data)
@@ -9941,15 +9768,19 @@ def main() -> int:
     if args.agent_profile_edit is not None:
         return handle_agent_profile_edit(args.agent_profile_edit)
     if args.agent_profile_description is not None:
-        return handle_agent_profile_description(
-            args.agent_profile_description
+        return handle_agent_profile_edit(
+            args.agent_profile_description,
+            edit_description=True,
         )
     if args.agent_profile_type is not None:
         return handle_agent_profile_type(args.agent_profile_type)
     if args.agent_profile_copy is not None:
-        return handle_agent_profile_copy(args.agent_profile_copy)
+        return handle_agent_profile_transfer(args.agent_profile_copy)
     if args.agent_profile_rename is not None:
-        return handle_agent_profile_rename(args.agent_profile_rename)
+        return handle_agent_profile_transfer(
+            args.agent_profile_rename,
+            rename=True,
+        )
     if args.agent_profile_remove is not None:
         return handle_agent_profile_remove(args.agent_profile_remove)
 
@@ -10161,7 +9992,7 @@ def main() -> int:
             raw_config = _prune_inherited_config(
                 raw_config, inherited_parent
             )
-            write_config_document(CONFIG_FILE, raw_config)
+            write_json_document(CONFIG_FILE, raw_config)
         else:
             for name, value, _ in updates:
                 config[name] = value
@@ -10226,9 +10057,7 @@ def main() -> int:
     if args.print_current_config:
         ensure_config_exists()
         try:
-            current_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            if not isinstance(current_config, dict):
-                raise ValueError("configuration must be a JSON object")
+            current_config = read_config_document(CONFIG_FILE)
             current_config["api_key"] = mask_api_key(current_config.get("api_key", ""))
             print(json.dumps(current_config, indent=2, ensure_ascii=False))
         except Exception as exc:
@@ -10285,7 +10114,7 @@ def main() -> int:
         if args.task:
             task = read_prompt_argument(args.task)
         elif args.task_file:
-            task = read_prompt_files(args.task_file).strip()
+            task = read_prompt_files(args.task_file)
         elif args.reuse_session is not None:
             task = ""
         else:
@@ -10306,22 +10135,11 @@ def main() -> int:
 
     if tree_mode and args.tree_show_only:
         try:
-            if args.tree_files_list:
-                tree_input_names = read_files_list(args.tree_files_list)
-            else:
-                tree_input_names = list(args.tree_files or [])
-            tree_file_paths, _ = expand_tree_file_paths(
-                tree_input_names,
-                include_patterns=args.tree_include or [],
-                exclude_patterns=args.tree_exclude or [],
-                exclude_git=tree_exclude_git,
+            tree_file_paths, _ = resolve_tree_file_paths(
+                args, tree_exclude_git
             )
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-
-        if not tree_file_paths:
-            print("ERROR: No files matched the tree inputs and filters.", file=sys.stderr)
             return 1
 
         for tree_file_path in tree_file_paths:
@@ -10348,9 +10166,9 @@ def main() -> int:
     if agent_mode:
         try:
             agent_context_expires = parse_agent_context_expires(
-                args.agent_context_expires
-                if args.agent_context_expires is not None
-                else config.get(
+                resolve_config_option(
+                    args.agent_context_expires,
+                    config,
                     "agent_context_expires",
                     DEFAULT_CONFIG["agent_context_expires"],
                 )
@@ -10410,9 +10228,10 @@ def main() -> int:
 
     try:
         patch_branch_setting = resolve_patch_branch_setting(
-            args.patch_branch
-            if args.patch_branch is not None
-            else config.get('patch_branch', DEFAULT_CONFIG['patch_branch'])
+            resolve_config_option(
+                args.patch_branch, config, 'patch_branch',
+                DEFAULT_CONFIG['patch_branch'],
+            )
         )
     except ValueError as exc:
         print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
@@ -10540,16 +10359,14 @@ def main() -> int:
         except (OSError, ValueError) as exc:
             print(f'ERROR: {exc}', file=sys.stderr)
             return 1
-    llm_timeout = (
-        args.llm_timeout
-        if args.llm_timeout is not None
-        else config.get("llm_timeout", 300)
+    llm_timeout = resolve_config_option(
+        args.llm_timeout, config, "llm_timeout", 300
     )
     try:
         retry = parse_retry_count(
-            args.retry
-            if args.retry is not None
-            else config.get("retry", DEFAULT_CONFIG["retry"])
+            resolve_config_option(
+                args.retry, config, "retry", DEFAULT_CONFIG["retry"]
+            )
         )
     except ValueError as exc:
         print(f"ERROR: Invalid retry value: {exc}", file=sys.stderr)
@@ -10576,137 +10393,88 @@ def main() -> int:
             timeout=llm_timeout,
             max_retries=0,
         )
-        try:
-            models = execute_openai_request(
-                client.models.list,
-                retry=retry,
-                operation_name="Model listing request",
-            )
-            modelnames = []
-            for m in models:
-                modelnames.append(m.id)
-            modelnames.sort()
-            for m in modelnames:
-                print(m)
-        except Exception as exc:
-            _handle_openai_error(exc)
+        models = execute_openai_request(
+            client.models.list,
+            retry=retry,
+            operation_name="Model listing request",
+        )
+        for model_name in sorted(model.id for model in models):
+            print(model_name)
         return 0
 
-    system_prompt = resolve_prompt_setting(
-        explicit_value=args.system_prompt,
-        prompt_file=args.system_prompt_file,
-        config=config,
-        config_key='system_prompt',
-        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['system_prompt'],
-        prompt_expansion_enabled=prompt_expansion_enabled,
+    def resolve_prompt_option(
+        config_key: str,
+        strip_configured_result: bool = False,
+    ) -> str:
+        return resolve_prompt_setting(
+            explicit_value=getattr(args, config_key),
+            prompt_file=(
+                args.system_prompt_file
+                if config_key == 'system_prompt'
+                else None
+            ),
+            config=config,
+            config_key=config_key,
+            default=DEFAULT_PROMPT_LIBRARY_REFERENCES[config_key],
+            prompt_expansion_enabled=prompt_expansion_enabled,
+            strip_configured_result=strip_configured_result,
+        )
+
+    system_prompt = resolve_prompt_option('system_prompt')
+    linenum_system_prompt = resolve_prompt_option(
+        'linenum_system_prompt', strip_configured_result=True
     )
-    linenum_system_prompt = resolve_prompt_setting(
-        explicit_value=args.linenum_system_prompt,
-        prompt_file=None,
-        config=config,
-        config_key='linenum_system_prompt',
-        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['linenum_system_prompt'],
-        prompt_expansion_enabled=prompt_expansion_enabled,
-        strip_configured_result=True,
+    patch_system_prompt = resolve_prompt_option(
+        'patch_system_prompt', strip_configured_result=True
     )
-    patch_system_prompt = resolve_prompt_setting(
-        explicit_value=args.patch_system_prompt,
-        prompt_file=None,
-        config=config,
-        config_key='patch_system_prompt',
-        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['patch_system_prompt'],
-        prompt_expansion_enabled=prompt_expansion_enabled,
-        strip_configured_result=True,
+    shell_system_prompt = resolve_prompt_option(
+        'shell_system_prompt', strip_configured_result=True
     )
-    shell_system_prompt = resolve_prompt_setting(
-        explicit_value=args.shell_system_prompt,
-        prompt_file=None,
-        config=config,
-        config_key='shell_system_prompt',
-        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['shell_system_prompt'],
-        prompt_expansion_enabled=prompt_expansion_enabled,
-        strip_configured_result=True,
+    agent_system_prompt = resolve_prompt_option(
+        'agent_system_prompt', strip_configured_result=True
     )
-    agent_system_prompt = resolve_prompt_setting(
-        explicit_value=args.agent_system_prompt,
-        prompt_file=None,
-        config=config,
-        config_key='agent_system_prompt',
-        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['agent_system_prompt'],
-        prompt_expansion_enabled=prompt_expansion_enabled,
-        strip_configured_result=True,
-    )
-    plan_system_prompt = resolve_prompt_setting(
-        explicit_value=args.plan_system_prompt,
-        prompt_file=None,
-        config=config,
-        config_key='plan_system_prompt',
-        default=DEFAULT_PROMPT_LIBRARY_REFERENCES['plan_system_prompt'],
-        prompt_expansion_enabled=prompt_expansion_enabled,
+    plan_system_prompt = resolve_prompt_option('plan_system_prompt')
+
+    try:
+        temperature = parse_optional_float(
+            resolve_config_option(args.temperature, config, "temperature", "off")
+        )
+    except ValueError:
+        print("ERROR: Invalid temperature value.", file=sys.stderr)
+        return 1
+
+    try:
+        top_p = parse_optional_float(
+            resolve_config_option(args.top_p, config, "top_p", "off")
+        )
+    except ValueError:
+        print("ERROR: Invalid top-p value.", file=sys.stderr)
+        return 1
+
+    token_limit = resolve_config_option(
+        args.token_limit, config, "token_limit", 65534
     )
 
-    temperature = (
-        args.temperature
-        if args.temperature is not None
-        else config.get("temperature", "off")
-    )
-    if isinstance(temperature, str):
-        if temperature.lower() == "off":
-            temperature = None
-        else:
-            try:
-                temperature = float(temperature)
-            except ValueError:
-                print("ERROR: Invalid temperature value.", file=sys.stderr)
-                return 1
-
-    top_p_raw = args.top_p if args.top_p is not None else config.get("top_p", "off")
-    if isinstance(top_p_raw, str):
-        if top_p_raw.lower() == "off":
-            top_p = None
-        else:
-            try:
-                top_p = float(top_p_raw)
-            except ValueError:
-                print("ERROR: Invalid top-p value.", file=sys.stderr)
-                return 1
-    else:
-        top_p = top_p_raw
-
-    token_limit = (
-        args.token_limit
-        if args.token_limit is not None
-        else config.get("token_limit", 65534)
+    max_output_tokens = resolve_config_option(
+        args.max_output_tokens, config, "max_output_tokens", 65534
     )
 
-    max_output_tokens = (
-        args.max_output_tokens
-        if args.max_output_tokens is not None
-        else config.get("max_output_tokens", 65534)
-    )
-
-    openai_reasoning = (
-        args.reasoning
-        if args.reasoning is not None
-        else config.get("reasoning", "medium")
+    openai_reasoning = resolve_config_option(
+        args.reasoning, config, "reasoning", "medium"
     )
     if str(openai_reasoning).strip().lower() == "off":
         print_reasoning = False
 
-    reasoning_mode = (
-        args.reasoning_mode
-        if args.reasoning_mode is not None
-        else config.get("reasoning_mode", "standard")
+    reasoning_mode = resolve_config_option(
+        args.reasoning_mode, config, "reasoning_mode", "standard"
     )
     reasoning_mode = str(reasoning_mode).strip().lower()
     if reasoning_mode not in ("standard", "pro"):
         print("ERROR: Invalid reasoning mode; choose 'standard' or 'pro'.", file=sys.stderr)
         return 1
 
-    extra_body_raw = (
-        args.extra_body
-        if args.extra_body is not None
-        else config.get("extra_body")
+    extra_body_raw = resolve_config_option(
+        args.extra_body, config, "extra_body"
     )
     if isinstance(extra_body_raw, dict):
         extra_body = extra_body_raw
@@ -10723,10 +10491,8 @@ def main() -> int:
     if args.model is not None and args.token_cost is None:
         token_cost_raw = "off"
     else:
-        token_cost_raw = (
-            args.token_cost
-            if args.token_cost is not None
-            else config.get("token_cost", "off")
+        token_cost_raw = resolve_config_option(
+            args.token_cost, config, "token_cost", "off"
         )
     try:
         token_cost = parse_token_cost(token_cost_raw)
@@ -10734,10 +10500,8 @@ def main() -> int:
         print(f"ERROR: Invalid token cost: {exc}", file=sys.stderr)
         return 1
 
-    response_verbosity: str = (
-        args.response_verbosity
-        if args.response_verbosity is not None
-        else config.get("response_verbosity", "off")
+    response_verbosity: str = resolve_config_option(
+        args.response_verbosity, config, "response_verbosity", "off"
     ).lower()
 
     agent_worker_system_prompt = system_prompt
@@ -10799,61 +10563,36 @@ def main() -> int:
         )
         return 1
 
-    def call_model(
-        request_system_prompt: str,
-        request_user_prompt: str,
-        *,
-        response_format_override: str | None = None,
-        json_schema_override: dict[str, Any] | None = None,
-        stream: bool = False,
-    ) -> tuple[Any, dict[str, Any] | None]:
-        request_response_format = (
-            response_format
-            if response_format_override is None
-            else response_format_override
-        )
-        request_schema = (
-            json_schema
-            if response_format_override is None
-            else json_schema_override
-        )
-        return call_openai(
-            api_key=api_key,
-            openai_base_url=openai_base_url,
-            openai_proxy=openai_proxy,
-            openai_organization=openai_organization,
-            openai_project=openai_project,
-            model=model,
-            system_prompt=request_system_prompt,
-            user_prompt=request_user_prompt,
-            response_format=request_response_format,
-            json_schema=request_schema,
-            response_verbosity=response_verbosity,
-            temperature=temperature,
-            top_p=top_p,
-            max_output_tokens=max_output_tokens,
-            openai_service_tier=openai_service_tier,
-            openai_reasoning=openai_reasoning,
-            reasoning_mode=reasoning_mode,
-            explicit_prompt_cache=explicit_prompt_cache,
-            extra_body=extra_body,
-            llm_timeout=llm_timeout,
-            retry=retry,
-            safety_identifier=safety_identifier,
-            store=api_log,
-            stream=stream,
-            error_logger=append_log,
-        )
-
     if args.estimate_only and not tree_mode:
         api_key = ""
     else:
         api_key = resolve_api_key(config)
 
-    log_enabled = tree_mode or (
-        args.log
-        if args.log is not None
-        else coerce_bool(config.get("log", "on"), True)
+    model_settings = ModelSettings(
+        model=model,
+        api_key=api_key,
+        openai_base_url=openai_base_url,
+        openai_proxy=openai_proxy,
+        openai_organization=openai_organization,
+        openai_project=openai_project,
+        response_verbosity=response_verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=max_output_tokens,
+        openai_service_tier=openai_service_tier,
+        openai_reasoning=openai_reasoning,
+        reasoning_mode=reasoning_mode,
+        explicit_prompt_cache=explicit_prompt_cache,
+        extra_body=extra_body,
+        llm_timeout=llm_timeout,
+        retry=retry,
+        safety_identifier=safety_identifier,
+        api_log=api_log,
+        response_json_repair=response_json_repair,
+    )
+
+    log_enabled = tree_mode or resolve_bool_option(
+        args.log, config, "log", True
     )
     log_path = None
     session_timestamp = int(time.time())
@@ -11015,10 +10754,7 @@ def main() -> int:
             f.write(format_log_settings(config, args))
 
     def append_log(text: str) -> None:
-        if not log_enabled or log_path is None:
-            return
-        with log_path.open("a", encoding="utf-8") as log_file:
-            log_file.write(text)
+        append_session_log(log_path, text, log_enabled)
 
     def log_model_request(
         request_characters: int,
@@ -11026,11 +10762,19 @@ def main() -> int:
         request_cost_log: str,
         request_system_prompt: str,
         request_user_prompt: str,
+        include_model_settings: bool = False,
     ) -> None:
         request_stats = (
             f"request_characters={request_characters} "
             f"request_tokens_estimate={request_tokens}{request_cost_log}"
         )
+        if include_model_settings:
+            request_stats += (
+                f" model={model} reasoning={openai_reasoning} "
+                f"reasoning_mode={reasoning_mode} "
+                f"max_output_tokens={max_output_tokens} api_log={api_log} "
+                f"timeout={llm_timeout}"
+            )
         append_log(
             f"<request_stats>\n{request_stats}\n</request_stats>\n"
             f"<request>\n"
@@ -11112,22 +10856,11 @@ def main() -> int:
 
     if tree_mode:
         try:
-            if args.tree_files_list:
-                tree_input_names = read_files_list(args.tree_files_list)
-            else:
-                tree_input_names = list(args.tree_files or [])
-            tree_file_paths, tree_roots = expand_tree_file_paths(
-                tree_input_names,
-                include_patterns=args.tree_include or [],
-                exclude_patterns=args.tree_exclude or [],
-                exclude_git=tree_exclude_git,
+            tree_file_paths, tree_roots = resolve_tree_file_paths(
+                args, tree_exclude_git
             )
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-
-        if not tree_file_paths:
-            print("ERROR: No files matched the tree inputs and filters.", file=sys.stderr)
             return 1
 
         tree_parallel = args.tree_parallel if args.tree_parallel is not None else 16
@@ -11181,28 +10914,9 @@ def main() -> int:
             max_file_size_kb=max_file_size_kb,
             tree_parallel=tree_parallel,
             token_limit=token_limit,
-            model=model,
-            api_key=api_key,
-            openai_base_url=openai_base_url,
-            openai_proxy=openai_proxy,
-            openai_organization=openai_organization,
-            openai_project=openai_project,
+            model_settings=model_settings,
             response_format=response_format,
-            response_json_repair=response_json_repair,
             json_schema=json_schema,
-            response_verbosity=response_verbosity,
-            temperature=temperature,
-            top_p=top_p,
-            max_output_tokens=max_output_tokens,
-            openai_service_tier=openai_service_tier,
-            openai_reasoning=openai_reasoning,
-            reasoning_mode=reasoning_mode,
-            explicit_prompt_cache=explicit_prompt_cache,
-            extra_body=extra_body,
-            llm_timeout=llm_timeout,
-            retry=retry,
-            safety_identifier=safety_identifier,
-            api_log=api_log,
             token_cost=token_cost,
             print_reasoning=print_reasoning,
             tree_session_dir=tree_session_dir,
@@ -11223,7 +10937,7 @@ def main() -> int:
             )
         else:
             ask_prompt = expand_prompt_names(
-                read_prompt_files(args.ask_file).strip(),
+                read_prompt_files(args.ask_file),
                 prompt_expansion_enabled,
             )
         full_system_prompt = append_task_to_system_prompt(
@@ -11364,18 +11078,13 @@ def main() -> int:
             model=model,
             system_prompt=plan_full_system_prompt,
             user_prompt=plan_user_prompt,
-        ) + tokenizer_padding
+        )
         if args.estimate_only:
             print(plan_request_tokens)
             return 0
         plan_request_characters = len(plan_full_system_prompt + plan_user_prompt)
-        plan_request_cost_estimate: str | None = None
-        if token_cost is not None:
-            plan_request_cost_estimate = plan_request_tokens * token_cost[0] / 1_000_000
-        plan_request_cost_log = (
-            f" request_cost_estimate={plan_request_cost_estimate:.4f}"
-            if plan_request_cost_estimate is not None
-            else ""
+        plan_request_cost_log = request_cost_estimate_log(
+            token_cost, plan_request_tokens
         )
         if plan_request_tokens > token_limit:
             print(f"ERROR: Estimated plan input token count ({plan_request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
@@ -11388,24 +11097,26 @@ def main() -> int:
             file_paths=file_paths,
         )
         state_turn += 1
-        if log_enabled:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"<plan_request>\n")
-                f.write(f"<plan_request_stats>\nrequest_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n")
-                f.write(f"<system_prompt>\n{plan_full_system_prompt}\n</system_prompt>\n")
-                f.write(f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n")
-                f.write("</plan_request>\n")
+        append_log(
+            "<plan_request>\n"
+            f"<plan_request_stats>\nrequest_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n"
+            f"<system_prompt>\n{plan_full_system_prompt}\n</system_prompt>\n"
+            f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n"
+            "</plan_request>\n"
+        )
         if VERBOSE:
             print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} session_name={session_stem}", file=sys.stderr)
         plan_start_time = time.perf_counter()
         plan_response_obj: Any = None
         try:
             plan_response_obj, plan_usage = call_model(
+                model_settings,
                 plan_full_system_prompt,
                 plan_user_prompt,
-                response_format_override='text',
+                response_format="text",
+                error_logger=append_log,
             )
-            plan_result = str(getattr(plan_response_obj, "output_text", "") or "").strip()
+            plan_result = response_output_text(plan_response_obj).strip()
         except Exception as exc:
             complete_state_turn(plan_state_turn_path, "", f"ERROR: {exc}")
             print(f"API error: {exc}", file=sys.stderr)
@@ -11425,10 +11136,10 @@ def main() -> int:
             usage=plan_usage,
             response_cost=plan_response_cost,
         )
-        if log_enabled:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"<plan_response>\n{plan_result}\n</plan_response>\n")
-                f.write(f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n")
+        append_log(
+            f"<plan_response>\n{plan_result}\n</plan_response>\n"
+            f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n"
+        )
         if args.noninteractive:
             if VERBOSE:
                 print(plan_statsline, file=sys.stderr)
@@ -11451,9 +11162,9 @@ def main() -> int:
                 accepted = plan_choice in ("y", "yes")
                 break
             print("Please answer y, n, p, or e.")
-        if log_enabled:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"<plan_review>{'accepted' if accepted else 'rejected'}</plan_review>\n")
+        append_log(
+            f"<plan_review>{'accepted' if accepted else 'rejected'}</plan_review>\n"
+        )
         if not accepted:
             if VERBOSE:
                 print("Aborted.", file=sys.stderr)
@@ -11477,28 +11188,7 @@ def main() -> int:
         )
     if agent_mode:
         agent_settings = AgentRunSettings(
-            model_settings=AgentModelSettings(
-                model=model,
-                api_key=api_key,
-                openai_base_url=openai_base_url,
-                openai_proxy=openai_proxy,
-                openai_organization=openai_organization,
-                openai_project=openai_project,
-                response_verbosity=response_verbosity,
-                temperature=temperature,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-                openai_service_tier=openai_service_tier,
-                openai_reasoning=openai_reasoning,
-                reasoning_mode=reasoning_mode,
-                explicit_prompt_cache=explicit_prompt_cache,
-                extra_body=extra_body,
-                llm_timeout=llm_timeout,
-                retry=retry,
-                safety_identifier=safety_identifier,
-                api_log=api_log,
-                response_json_repair=response_json_repair,
-            ),
+            model_settings=model_settings,
             token_limit=token_limit,
             token_cost=token_cost,
             state_session_dir=state_session_dir,
@@ -11569,17 +11259,6 @@ def main() -> int:
         system_prompt=full_system_prompt,
         user_prompt=user_prompt,
     )
-
-    request_tokens += tokenizer_padding
-
-    request_cost_estimate: str | None = None
-    if token_cost is not None:
-        request_cost_estimate = request_tokens * token_cost[0] / 1_000_000
-    request_cost_log = (
-        f" request_cost_estimate={request_cost_estimate:.4f}"
-        if request_cost_estimate is not None
-        else ""
-    )
     if args.estimate_only:
         print(request_tokens)
         return 0
@@ -11588,45 +11267,75 @@ def main() -> int:
         print(f"ERROR: Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
         return 1
 
-    request_characters = len(full_system_prompt + user_prompt)
+    state_turn_path: Path | None = None
+    stream_output_emitted = False
+    response_obj: Any = None
 
-    if not resume_reused_shell_turn:
+    def request_model_turn(
+        request_system_prompt: str,
+        request_user_prompt: str,
+        *,
+        response_format_override: str | None = None,
+        json_schema_override: dict[str, Any] | None = None,
+        request_tokens: int | None = None,
+        print_request_stats: bool = False,
+        include_model_settings: bool = True,
+        request_session_name: str | None = None,
+        stream: bool = False,
+    ) -> tuple[str, str, str]:
+        nonlocal state_turn, state_turn_path, response_obj, stream_output_emitted
+        if request_tokens is None:
+            request_tokens = estimate_request_tokens(
+                model=model,
+                system_prompt=request_system_prompt,
+                user_prompt=request_user_prompt,
+            )
+        request_characters = len(
+            request_system_prompt + request_user_prompt
+        )
+        request_cost_log = request_cost_estimate_log(
+            token_cost, request_tokens
+        )
+        if request_tokens > token_limit:
+            raise ValueError(
+                f"Estimated input token count ({request_tokens}) exceeds "
+                f"token limit ({token_limit})"
+            )
         log_model_request(
             request_characters=request_characters,
             request_tokens=request_tokens,
             request_cost_log=request_cost_log,
-            request_system_prompt=full_system_prompt,
-            request_user_prompt=user_prompt,
+            request_system_prompt=request_system_prompt,
+            request_user_prompt=request_user_prompt,
+            include_model_settings=include_model_settings,
         )
-
-        if VERBOSE:
-            print(f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} reasoning={openai_reasoning} session_name={session_stem}", file=sys.stderr)
-
-    start_time = time.perf_counter()
-    state_turn_path: Path | None = None
-    stream_output_emitted = False
-    if resume_reused_shell_turn:
-        result = reused_shell_turn.response
-        reasoning = reused_shell_turn.reasoning
-        response_obj = None
-        usage = None
-        elapsed = 0.0
-        state_turn_path = reused_shell_turn.turn_dir
-    else:
+        if VERBOSE and print_request_stats:
+            session_context = (
+                f" session_name={request_session_name}"
+                if request_session_name is not None
+                else ""
+            )
+            print(
+                f"request_characters={request_characters} "
+                f"request_tokens_estimate={request_tokens}"
+                f"{request_cost_log} model={model} "
+                f"reasoning={openai_reasoning}{session_context}",
+                file=sys.stderr,
+            )
+        request_start_time = time.perf_counter()
+        request_state_path: Path | None = None
         if state_enabled:
-            state_task = task
-            state_turn_path = start_state_turn(
+            request_state_path = start_state_turn(
                 state_session_dir,
                 state_turn,
-                full_system_prompt,
-                state_task,
+                request_system_prompt,
+                task,
                 file_paths=file_paths,
             )
             state_turn += 1
         stream_sink = None
-
         try:
-            if stream_enabled and not print_reasoning:
+            if stream and not print_reasoning:
                 def emit_stream_text(delta: str) -> None:
                     if OUTPUT_FILE is not None:
                         write_output_file(delta)
@@ -11637,49 +11346,80 @@ def main() -> int:
                 stream_sink = emit_stream_text
 
             response_obj, usage = call_model(
-                full_system_prompt,
-                user_prompt,
-                stream=stream_enabled,
+                model_settings,
+                request_system_prompt,
+                request_user_prompt,
+                response_format=(
+                    response_format
+                    if response_format_override is None
+                    else response_format_override
+                ),
+                json_schema=(
+                    json_schema
+                    if response_format_override is None
+                    else json_schema_override
+                ),
+                stream=stream,
+                error_logger=append_log,
             )
-            if stream_enabled:
-                result, usage, completed_response = consume_response_stream(
+            if stream:
+                response, usage, completed_response = consume_response_stream(
                     response_obj, stream_sink
                 )
                 if completed_response is not None:
                     response_obj = completed_response
                 stream_output_emitted = stream_sink is not None
             else:
-                result = getattr(response_obj, "output_text", "")
+                response = response_output_text(response_obj)
         except Exception as exc:
-            if state_turn_path is not None:
-                complete_state_turn(state_turn_path, "", f"ERROR: {exc}")
-            print(f"API error: {exc}", file=sys.stderr)
-            return 1
-
-        elapsed = time.perf_counter() - start_time
+            if request_state_path is not None:
+                complete_state_turn(request_state_path, "", f"ERROR: {exc}")
+            raise
+        elapsed = time.perf_counter() - request_start_time
         reasoning = response_reasoning_text(response_obj)
-        if state_turn_path is not None:
-            complete_state_turn(
-                state_turn_path,
-                reasoning,
-                str(result or ""),
-            )
-
-    statsline = print_stats(
-        request_characters=request_characters,
-        request_tokens=request_tokens,
-        processing_time=elapsed,
-        response_text=result,
-        usage=usage,
-        response_cost=response_cost_line(token_cost, usage),
-    )
-
-    if not resume_reused_shell_turn:
+        if request_state_path is not None:
+            complete_state_turn(request_state_path, reasoning, response)
+        state_turn_path = request_state_path
+        statsline = print_stats(
+            request_characters=request_characters,
+            request_tokens=request_tokens,
+            processing_time=elapsed,
+            response_text=response,
+            usage=usage,
+            response_cost=response_cost_line(token_cost, usage),
+        )
         log_model_response(
-            response_text=str(result or ""),
+            response_text=response,
             reasoning=reasoning,
             statsline=statsline,
         )
+        return response, reasoning, statsline
+
+    if resume_reused_shell_turn:
+        result = reused_shell_turn.response
+        reasoning = reused_shell_turn.reasoning
+        state_turn_path = reused_shell_turn.turn_dir
+        statsline = print_stats(
+            request_characters=len(full_system_prompt + user_prompt),
+            request_tokens=request_tokens,
+            processing_time=0.0,
+            response_text=result,
+        )
+    else:
+        try:
+            result, reasoning, statsline = request_model_turn(
+                full_system_prompt,
+                user_prompt,
+                request_tokens=request_tokens,
+                print_request_stats=True,
+                include_model_settings=False,
+                request_session_name=session_stem,
+                stream=stream_enabled,
+            )
+        except Exception as exc:
+            print(f"API error: {exc}", file=sys.stderr)
+            return 1
+
     if shell_mode and VERBOSE:
         print(statsline, file=sys.stderr)
 
@@ -11695,7 +11435,7 @@ def main() -> int:
         revision_task: str,
         shell_commands: list[ShellStep],
     ) -> tuple[str, str, str]:
-        nonlocal state_turn, state_turn_path, task, full_system_prompt
+        nonlocal task, full_system_prompt
         previous_task = task
         task = revision_task
         full_system_prompt = append_task_to_system_prompt(
@@ -11719,89 +11459,10 @@ def main() -> int:
                 '</shell_revision>'
             ),
         )
-        revision_request_tokens = (
-            estimate_request_tokens(
-                model=model,
-                system_prompt=full_system_prompt,
-                user_prompt=revision_user_prompt,
-            )
-            + tokenizer_padding
-        )
-        revision_request_characters = len(
-            full_system_prompt + revision_user_prompt
-        )
-        revision_request_cost_log = ''
-        if token_cost is not None:
-            revision_request_cost_log = (
-                f' request_cost_estimate='
-                f'{revision_request_tokens * token_cost[0] / 1_000_000:.4f}'
-            )
-        if revision_request_tokens > token_limit:
-            raise ValueError(
-                f'Estimated input token count ({revision_request_tokens}) exceeds '
-                f'token limit ({token_limit})'
-            )
-        revision_state_path = start_state_turn(
-            state_session_dir,
-            state_turn,
+        revision_result, revision_reasoning, revision_statsline = request_model_turn(
             full_system_prompt,
-            task,
-            file_paths=file_paths,
-        )
-        state_turn += 1
-        log_model_request(
-            request_characters=revision_request_characters,
-            request_tokens=revision_request_tokens,
-            request_cost_log=revision_request_cost_log,
-            request_system_prompt=full_system_prompt,
-            request_user_prompt=revision_user_prompt,
-        )
-        if VERBOSE:
-            print(
-                f'request_characters={revision_request_characters} '
-                f'request_tokens_estimate={revision_request_tokens}'
-                f'{revision_request_cost_log} model={model} '
-                f'reasoning={openai_reasoning}',
-                file=sys.stderr,
-            )
-        revision_start_time = time.perf_counter()
-        try:
-            revision_response_obj, revision_usage = call_model(
-                full_system_prompt,
-                revision_user_prompt,
-            )
-            revision_result = str(
-                getattr(revision_response_obj, 'output_text', '') or ''
-            )
-        except Exception as exc:
-            complete_state_turn(
-                revision_state_path,
-                '',
-                f'ERROR: {exc}',
-            )
-            raise
-        revision_elapsed = time.perf_counter() - revision_start_time
-        revision_reasoning = response_reasoning_text(revision_response_obj)
-        complete_state_turn(
-            revision_state_path,
-            revision_reasoning,
-            revision_result,
-        )
-        state_turn_path = revision_state_path
-        revision_statsline = print_stats(
-            request_characters=revision_request_characters,
-            request_tokens=revision_request_tokens,
-            processing_time=revision_elapsed,
-            response_text=revision_result,
-            usage=revision_usage,
-            response_cost=response_cost_line(
-                token_cost, revision_usage
-            ),
-        )
-        log_model_response(
-            response_text=revision_result,
-            reasoning=revision_reasoning,
-            statsline=revision_statsline,
+            revision_user_prompt,
+            print_request_stats=True,
         )
         if VERBOSE:
             print(revision_statsline, file=sys.stderr)
@@ -11811,7 +11472,6 @@ def main() -> int:
         shell_output: str,
         shell_commands: list[ShellStep],
     ) -> tuple[str, str]:
-        nonlocal state_turn, state_turn_path
         followup_schema = SHELL_FOLLOWUP_SCHEMA
         shell_turn_history.append(
             ShellTurn(
@@ -11823,33 +11483,38 @@ def main() -> int:
                 ),
             )
         )
-        while True:
+        followup_system_prompt = (
+            append_task_to_system_prompt(
+                base_full_system_prompt,
+                task,
+                system_prompt_with_task,
+            )
+            + "\nAfter shell output, choose whether to run more commands "
+            + "or use session_end with a reason that completes the session."
+        )
+
+        def build_followup_request(
+            history: list[ShellTurn],
+        ) -> tuple[str, int]:
             followup_user_prompt = build_shell_followup_prompt(
                 task,
-                shell_output=shell_turn_history,
+                shell_output=history,
                 json_schema=followup_schema,
                 shell_command_archive=archived_shell_turns,
                 include_task=not system_prompt_with_task,
             )
-            followup_system_prompt = (
-                append_task_to_system_prompt(
-                    base_full_system_prompt,
-                    task,
-                    system_prompt_with_task,
-                )
-                + "\nAfter shell output, choose whether to run more commands "
-                + "or use session_end with a reason that completes the session."
-            )
-            followup_request_tokens = (
+            return (
+                followup_user_prompt,
                 estimate_request_tokens(
                     model=model,
                     system_prompt=followup_system_prompt,
                     user_prompt=followup_user_prompt,
-                )
-                + tokenizer_padding
+                ),
             )
-            followup_request_characters = len(
-                followup_system_prompt + followup_user_prompt
+
+        while True:
+            followup_user_prompt, followup_request_tokens = build_followup_request(
+                shell_turn_history
             )
             if followup_request_tokens <= token_limit:
                 break
@@ -11882,28 +11547,12 @@ def main() -> int:
                     model,
                     midpoint,
                 )
-                candidate_turn = ShellTurn(
-                    commands=current_turn.commands,
-                    output=candidate_output,
-                )
                 candidate_history = [
                     *shell_turn_history[:-1],
-                    candidate_turn,
+                    replace(current_turn, output=candidate_output),
                 ]
-                candidate_user_prompt = build_shell_followup_prompt(
-                    task,
-                    shell_output=candidate_history,
-                    json_schema=followup_schema,
-                    shell_command_archive=archived_shell_turns,
-                    include_task=not system_prompt_with_task,
-                )
-                candidate_request_tokens = (
-                    estimate_request_tokens(
-                        model=model,
-                        system_prompt=followup_system_prompt,
-                        user_prompt=candidate_user_prompt,
-                    )
-                    + tokenizer_padding
+                _, candidate_request_tokens = build_followup_request(
+                    candidate_history
                 )
                 if candidate_request_tokens <= token_limit:
                     best_output = candidate_output
@@ -11912,29 +11561,11 @@ def main() -> int:
                     upper = midpoint - 1
 
             if best_output is None:
-                empty_turn = ShellTurn(
-                    commands=current_turn.commands,
-                    output="",
-                )
                 empty_history = [
                     *shell_turn_history[:-1],
-                    empty_turn,
+                    replace(current_turn, output=""),
                 ]
-                empty_user_prompt = build_shell_followup_prompt(
-                    task,
-                    shell_output=empty_history,
-                    json_schema=followup_schema,
-                    shell_command_archive=archived_shell_turns,
-                    include_task=not system_prompt_with_task,
-                )
-                empty_request_tokens = (
-                    estimate_request_tokens(
-                        model=model,
-                        system_prompt=followup_system_prompt,
-                        user_prompt=empty_user_prompt,
-                    )
-                    + tokenizer_padding
-                )
+                _, empty_request_tokens = build_followup_request(empty_history)
                 if empty_request_tokens > token_limit:
                     raise ValueError(
                         f'Estimated shell follow-up input token count '
@@ -11942,68 +11573,16 @@ def main() -> int:
                         f'({token_limit})'
                     )
                 best_output = ""
-            shell_turn_history[-1] = ShellTurn(
-                commands=current_turn.commands,
+            shell_turn_history[-1] = replace(
+                current_turn,
                 output=best_output,
             )
-            continue
-        followup_request_cost_log = (
-            f" request_cost_estimate="
-            f"{followup_request_tokens * token_cost[0] / 1_000_000:.4f}"
-            if token_cost is not None
-            else ""
-        )
-        followup_state_path = start_state_turn(
-            state_session_dir,
-            state_turn,
+        followup_result, followup_reasoning, followup_statsline = request_model_turn(
             followup_system_prompt,
-            task,
-            file_paths=file_paths,
-        )
-        state_turn += 1
-        log_model_request(
-            request_characters=followup_request_characters,
+            followup_user_prompt,
+            response_format_override="schema",
+            json_schema_override=followup_schema,
             request_tokens=followup_request_tokens,
-            request_cost_log=followup_request_cost_log,
-            request_system_prompt=followup_system_prompt,
-            request_user_prompt=followup_user_prompt,
-        )
-        followup_start_time = time.perf_counter()
-        try:
-            followup_response_obj, followup_usage = call_model(
-                followup_system_prompt,
-                followup_user_prompt,
-                response_format_override="schema",
-                json_schema_override=followup_schema,
-            )
-            followup_result = str(
-                getattr(followup_response_obj, "output_text", "") or ""
-            )
-        except Exception as exc:
-            complete_state_turn(followup_state_path, "", f"ERROR: {exc}")
-            raise
-        followup_elapsed = time.perf_counter() - followup_start_time
-        followup_reasoning = response_reasoning_text(followup_response_obj)
-        complete_state_turn(
-            followup_state_path,
-            followup_reasoning,
-            followup_result,
-        )
-        state_turn_path = followup_state_path
-        followup_statsline = print_stats(
-            request_characters=followup_request_characters,
-            request_tokens=followup_request_tokens,
-            processing_time=followup_elapsed,
-            response_text=followup_result,
-            usage=followup_usage,
-            response_cost=response_cost_line(
-                token_cost, followup_usage
-            ),
-        )
-        log_model_response(
-            response_text=followup_result,
-            reasoning=followup_reasoning,
-            statsline=followup_statsline,
         )
         if VERBOSE:
             print(followup_statsline, file=sys.stderr)
@@ -12013,26 +11592,15 @@ def main() -> int:
         response_text: str,
         response_reasoning: str,
     ) -> int:
-        output_str = response_text
-        if print_reasoning:
-            output_str = (
-                f"<think>\n{response_reasoning}\n</think>\n\n"
-                f"{output_str}"
-            )
-        if OUTPUT_FILE is not None:
-            try:
-                write_output_file(output_str)
-            except Exception as exc:
-                print(
-                    f"ERROR: Failed to write output to file {args.output_file}: {exc}",
-                    file=sys.stderr,
-                )
-                if not suppress_response_output:
-                    print(output_str)
-                return 1
-        elif not suppress_response_output:
-            print(output_str)
-        return 0
+        return emit_response_output(
+            format_response_output(
+                response_text,
+                response_reasoning,
+                print_reasoning,
+            ),
+            suppress_response_output=suppress_response_output,
+            output_file_path=args.output_file,
+        )
 
     if shell_mode:
         try:
@@ -12072,14 +11640,9 @@ def main() -> int:
                 pending_reused_shell_output = None
                 if revision_task is None:
                     try:
-                        edited_text = edit_text(
-                            build_shell_revision_editor_text(
-                                shell_steps,
-                                task,
-                            ),
-                        )
-                        revision_task = extract_patch_revision_task(
-                            edited_text
+                        revision_task = edit_tool_revision_task(
+                            format_shell_commands(shell_steps, include_reasons=False),
+                            task,
                         )
                     except Exception as exc:
                         print(
@@ -12133,7 +11696,7 @@ def main() -> int:
                 )
                 if state_turn_path is not None:
                     try:
-                        write_state_shell_output(state_turn_path, shell_output)
+                        write_state_artifact(state_turn_path, "response_shell_output", shell_output)
                     except Exception as exc:
                         print(f"ERROR: Failed to save shell output: {exc}", file=sys.stderr)
                         return 1
@@ -12195,136 +11758,6 @@ def main() -> int:
                 followup_reasoning,
             )
 
-    def call_patch_revision_request(
-        revision_user_prompt: str,
-    ) -> tuple[str, str, Any, dict[str, Any] | None]:
-        nonlocal state_turn, state_turn_path, full_system_prompt
-        full_system_prompt = append_task_to_system_prompt(
-            base_full_system_prompt,
-            task,
-            system_prompt_with_task,
-        )
-        revision_request_tokens = (
-            estimate_request_tokens(
-                model=model,
-                system_prompt=full_system_prompt,
-                user_prompt=revision_user_prompt,
-            )
-            + tokenizer_padding
-        )
-        revision_request_characters = len(
-            full_system_prompt + revision_user_prompt
-        )
-        revision_request_cost_log = ''
-        if token_cost is not None:
-            revision_request_cost_log = (
-                f' request_cost_estimate='
-                f'{revision_request_tokens * token_cost[0] / 1_000_000:.4f}'
-            )
-        if revision_request_tokens > token_limit:
-            raise ValueError(
-                f'Estimated input token count ({revision_request_tokens}) exceeds '
-                f'token limit ({token_limit})'
-            )
-        revision_state_context = context
-        if json_patch_responses:
-            revision_state_context += "\n"
-            if json_patch_task is not None:
-                revision_state_context += (
-                    f"<json_patch_task>\n{json_patch_task}\n"
-                    f"</json_patch_task>\n"
-                )
-            revision_state_context += (
-                f"<json_patch>\n{json_patch_responses[-1]}\n"
-                f"</json_patch>"
-            )
-        revision_state_turn_path = start_state_turn(
-            state_session_dir,
-            state_turn,
-            full_system_prompt,
-            task,
-            file_paths=file_paths,
-        )
-        state_turn += 1
-        if log_enabled:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(
-                    f'<request_stats>\n'
-                    f'request_characters={revision_request_characters} '
-                    f'request_tokens_estimate={revision_request_tokens}'
-                    f'{revision_request_cost_log} model={model} '
-                    f'reasoning={openai_reasoning} '
-                    f'reasoning_mode={reasoning_mode} '
-                    f'max_output_tokens={max_output_tokens} api_log={api_log} '
-                    f'timeout={llm_timeout}\n'
-                    f'</request_stats>\n'
-                )
-                f.write(f'<request>\n')
-                f.write(
-                    f'<system_prompt>\n{full_system_prompt}\n'
-                    f'</system_prompt>\n'
-                )
-                f.write(
-                    f'<user_prompt>\n{revision_user_prompt}\n'
-                    f'</user_prompt>\n'
-                )
-                f.write('</request>\n')
-        if VERBOSE:
-            print(
-                f'request_characters={revision_request_characters} '
-                f'request_tokens_estimate={revision_request_tokens}'
-                f'{revision_request_cost_log} model={model} '
-                f'reasoning={openai_reasoning}',
-                file=sys.stderr,
-            )
-
-        revision_start_time = time.perf_counter()
-        revision_response_obj, revision_usage = call_model(
-            full_system_prompt,
-            revision_user_prompt,
-        )
-        revision_result = str(
-            getattr(revision_response_obj, 'output_text', '') or ''
-        )
-        revision_elapsed = time.perf_counter() - revision_start_time
-        revision_reasoning = response_reasoning_text(revision_response_obj)
-        complete_state_turn(
-            revision_state_turn_path,
-            revision_reasoning,
-            revision_result,
-        )
-        state_turn_path = revision_state_turn_path
-        revision_statsline = print_stats(
-            request_characters=revision_request_characters,
-            request_tokens=revision_request_tokens,
-            processing_time=revision_elapsed,
-            response_text=revision_result,
-            usage=revision_usage,
-            response_cost=response_cost_line(
-                token_cost, revision_usage
-            ),
-        )
-        if log_enabled:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(
-                    f'<response>\n{revision_result}\n'
-                    f'</response>\n'
-                )
-                f.write(
-                    f'<response_stats>\n{revision_statsline}\n'
-                    f'</response_stats>\n'
-                )
-                f.write(
-                    f'<end_time>{time.ctime(int(time.time()))} '
-                    f'[{int(time.time())}]</end_time>\n'
-                )
-        return (
-            revision_result,
-            revision_statsline,
-            revision_response_obj,
-            revision_usage,
-        )
-
     if patch_mode:
         patch_turn_history: list[tuple[str, str, str]] = [
             (task, str(result or ""), statsline)
@@ -12333,30 +11766,36 @@ def main() -> int:
         patch_turn_index = 0
 
         def request_patch_revision(revision_task: str) -> None:
-            nonlocal task, result, statsline, response_obj, usage
-            nonlocal json_patch_task, json_patch_responses, patch_turn_index
+            nonlocal task, result, statsline, full_system_prompt
+            nonlocal patch_turn_index
 
             if VERBOSE:
                 print(statsline, file=sys.stderr)
-            json_patch_task = task
+            previous_task = task
             task = expand_prompt_names(
                 revision_task, prompt_expansion_enabled
             )
-            json_patch_responses = [result]
             revision_user_prompt = build_user_prompt(
                 task=task,
                 context=context,
                 response_format=response_format,
                 json_schema=json_schema,
-                json_patch_responses=json_patch_responses,
-                json_patch_task=json_patch_task,
+                json_patch_responses=[result],
+                json_patch_task=previous_task,
                 include_task=not system_prompt_with_task,
             )
             revision_user_prompt = (
                 revision_user_prompt + '\n' + patch_system_prompt
             )
-            result, statsline, response_obj, usage = (
-                call_patch_revision_request(revision_user_prompt)
+            full_system_prompt = append_task_to_system_prompt(
+                base_full_system_prompt,
+                task,
+                system_prompt_with_task,
+            )
+            result, _, statsline = request_model_turn(
+                full_system_prompt,
+                revision_user_prompt,
+                print_request_stats=True,
             )
             del patch_turn_history[patch_turn_index + 1:]
             del patch_state_turn_history[patch_turn_index + 1:]
@@ -12417,12 +11856,9 @@ def main() -> int:
 
             if state_turn_path is not None:
                 try:
-                    write_state_schema_patch(
+                    write_state_patch_artifacts(
                         state_turn_path,
                         result,
-                    )
-                    write_state_diff_patch(
-                        state_turn_path,
                         diff_text,
                     )
                 except Exception as exc:
@@ -12465,19 +11901,17 @@ def main() -> int:
             navigate_patch_turn = False
             if patch_review:
                 while True:
-                    patch_input = input(
-                        'Apply these changes? '
-                        '[y/n/p/h/S/</>/e/E <prompt>]: '
-                    )
-                    patch_input, suffix_provided = process_patch_review_input(
-                        patch_input,
+                    review_action, revision_task, suffix_provided = review_patch_changes(
                         diff_text,
                         suffix_provided,
+                        prompt=(
+                            'Apply these changes? '
+                            '[y/n/p/h/S/</>/e/E <prompt>]: '
+                        ),
                         allow_navigation=True,
+                        display_text=False,
                     )
-                    if patch_input is None:
-                        continue
-                    if patch_input == '<':
+                    if review_action == '<':
                         if patch_turn_index == 0:
                             print('Already at the first patch turn.')
                             continue
@@ -12486,7 +11920,7 @@ def main() -> int:
                         state_turn_path = patch_state_turn_history[patch_turn_index]
                         navigate_patch_turn = True
                         break
-                    if patch_input == '>':
+                    if review_action == '>':
                         if patch_turn_index + 1 >= len(patch_turn_history):
                             print('No later patch turn is available.')
                             continue
@@ -12495,51 +11929,30 @@ def main() -> int:
                         state_turn_path = patch_state_turn_history[patch_turn_index]
                         navigate_patch_turn = True
                         break
-                    patch_choice = patch_input.lower()
-                    if patch_choice in ('y', 'yes', 'n', 'no'):
-                        break
-                    if patch_choice == 'p':
-                        page_or_print(diff_text)
-                        continue
-                    if patch_choice == 'e':
-                        try:
-                            edited_text = edit_text(
-                                build_patch_revision_editor_text(
+                    if review_action == 'edit':
+                        if revision_task is None:
+                            try:
+                                revision_task = edit_tool_revision_task(
                                     diff_text,
                                     task,
-                                ),
-                            )
-                            revision_task = extract_patch_revision_task(
-                                edited_text
-                            )
-                        except Exception as exc:
-                            print(
-                                f'ERROR: Failed to edit patch revision: {exc}',
-                                file=sys.stderr,
-                            )
-                            continue
+                                )
+                            except Exception as exc:
+                                print(
+                                    f'ERROR: Failed to edit patch revision: {exc}',
+                                    file=sys.stderr,
+                                )
+                                continue
                         if not revision_task:
                             continue
-                        break
-                    if (
-                        patch_input.startswith('E')
-                        and len(patch_input) > 1
-                        and patch_input[1].isspace()
-                    ):
-                        revision_task = patch_input[1:].strip()
-                        if not revision_task:
-                            print('Revision task cannot be empty.')
-                            continue
-                        break
-                    print('Please answer y, n, p, <, >, e, E followed by a prompt')
+                    break
                 if navigate_patch_turn:
                     continue
-                if patch_choice in ('n', 'no'):
+                if review_action == 'reject':
                     if VERBOSE:
                         print('Aborted.', file=sys.stderr)
                         print(statsline, file=sys.stderr)
                     return 0
-                if revision_task is not None and patch_choice not in ('y', 'yes'):
+                if review_action == 'edit':
                     try:
                         request_patch_revision(revision_task)
                     except Exception as exc:
@@ -12558,9 +11971,10 @@ def main() -> int:
                     patch_commit_message=patch_commit_message,
                 )
                 if state_turn_path is not None:
-                    write_state_schema_patch_applied(
+                    write_state_artifact(
                         state_turn_path,
-                        written_patch_paths,
+                        "response_schema_patch_applied",
+                        "\n".join(written_patch_paths),
                     )
             except Exception as exc:
                 action = (
@@ -12592,33 +12006,22 @@ def main() -> int:
         finally:
             result = pretty_json(result)
 
-    if print_reasoning:
-        output_str = (
-            f"<think>\n{reasoning}\n</think>\n\n"
-            f"{result}"
-        )
-    else:
-        output_str = result
-
-    if OUTPUT_FILE is not None:
-        if not stream_output_emitted:
-            try:
-                write_output_file(output_str)
-            except Exception as exc:
-                print(f"ERROR: Failed to write output to file {args.output_file}: {exc}", file=sys.stderr)
-                if not suppress_response_output:
-                    print(output_str)
-                if VERBOSE:
-                    print(statsline, file=sys.stderr)
-                return 1
-    elif stream_output_emitted:
-        if not result or not result.endswith("\n"):
-            print()
-    elif not suppress_response_output:
-        print(output_str)
+    output_str = format_response_output(
+        result,
+        reasoning,
+        print_reasoning,
+    )
+    output_status = emit_response_output(
+        output_str,
+        suppress_response_output=suppress_response_output,
+        stream_output_emitted=stream_output_emitted,
+        output_file_path=args.output_file,
+    )
 
     if VERBOSE:
         print(statsline, file=sys.stderr)
+    if output_status:
+        return output_status
 
     if DEBUG:
         print("<debug_response>", file=sys.stderr)
@@ -12649,8 +12052,6 @@ except SystemExit as exc:
 except Exception as e:
     rv = 1
     err = e
-#    import traceback
-#    traceback.print_exc()
 finally:
     if OUTPUT_FILE is not None:
         try:

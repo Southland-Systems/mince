@@ -55,7 +55,7 @@ install-user:
 	if [ ! -x "$(USER_VENV)/bin/python" ]; then \
 		"$(PYTHON)" -m venv "$(USER_VENV)"; \
 	fi; \
-	"$(USER_VENV)/bin/python" -m pip install -r requirements.txt; \
+	"$(USER_VENV)/bin/python" -m pip install --disable-pip-version-check -r requirements.txt; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 	chmod 755 "$(USER_LAUNCH)"; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
@@ -85,7 +85,7 @@ update-user:
 		if [ ! -x "$(USER_VENV)/bin/python" ]; then \
 			"$(PYTHON)" -m venv "$(USER_VENV)"; \
 		fi; \
-		"$(USER_VENV)/bin/python" -m pip install --upgrade -q -r requirements.txt; \
+		"$(USER_VENV)/bin/python" -m pip install --disable-pip-version-check --upgrade -q -r requirements.txt; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 		chmod 755 "$(USER_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
@@ -108,7 +108,7 @@ install-global:
 	if [ ! -x "$(GLOBAL_VENV)/bin/python" ]; then \
 		$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 	fi; \
-	$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install -r requirements.txt; \
+	$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --disable-pip-version-check -r requirements.txt; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 	$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \
@@ -138,7 +138,7 @@ update-global:
 		if [ ! -x "$(GLOBAL_VENV)/bin/python" ]; then \
 			$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 		fi; \
-		$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --upgrade -q pip openai tiktoken; \
+		$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --disable-pip-version-check --upgrade -q -r requirements.txt; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 		$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \

@@ -13,7 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-WRITE_PATH_OPTION = "--contain-write-path"
+WRITE_PATH_OPTIONS = (
+    "--contain-write-path",
+    "-W",
+)
 READ_PATH_OPTIONS = (
     "--contain-read-path",
     "--contain-read-only-path",
@@ -78,6 +81,7 @@ def print_usage() -> None:
         "state directory plus explicitly granted paths remain writable.\n\n"
         "Containment options:\n"
         "  --contain-write-path PATH\n"
+        "  -W PATH\n"
         "      Allow writes to an existing file or directory. Repeat as "
         "needed; grant a parent directory when mce must create a file.\n"
         "  --contain-read-path PATH\n"
@@ -256,29 +260,22 @@ def parse_wrapper_arguments(
             index += 3
             continue
 
-        matched, value, next_index = _option_value(
-            argument, WRITE_PATH_OPTION, arguments, index
-        )
-        if matched:
-            options.write_paths.append(
-                _require_nonempty(WRITE_PATH_OPTION, value)
-            )
-            index = next_index
-            continue
-
-        read_option_matched = False
-        for read_option in READ_PATH_OPTIONS:
+        path_option_matched = False
+        for path_option in WRITE_PATH_OPTIONS + READ_PATH_OPTIONS:
             matched, value, next_index = _option_value(
-                argument, read_option, arguments, index
+                argument, path_option, arguments, index
             )
             if matched:
-                options.read_paths.append(
-                    _require_nonempty(read_option, value)
+                target = (
+                    options.write_paths
+                    if path_option in WRITE_PATH_OPTIONS
+                    else options.read_paths
                 )
+                target.append(_require_nonempty(path_option, value))
                 index = next_index
-                read_option_matched = True
+                path_option_matched = True
                 break
-        if read_option_matched:
+        if path_option_matched:
             continue
 
         matched, value, next_index = _option_value(
