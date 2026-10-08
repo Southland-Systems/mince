@@ -544,7 +544,6 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 Last tested: `2026-10-06`
 
 ```text
-
 TAP version 13
 1..55
 ok 1 - prints the built-in configuration offline
