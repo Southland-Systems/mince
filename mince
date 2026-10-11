@@ -244,7 +244,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shell": "off",
     "shell_networking": "off",
     "patch": "off",
-    "patch_save": "off",
     "patch_review": "off",
     "patch_branch": "off",
     "patch_suffix": ".mcepatched",
@@ -272,7 +271,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 INHERIT_PROFILE_CONFIG_KEY = "_inherit_profile"
 
-DEPRECATED_CONFIG_KEYS: dict[str, str] = {
+DEPRECATED_CONFIG_KEYS: dict[str, str | None] = {
     "openai_base_url": "base_url",
     "openai_proxy": "proxy_server",
     "openai_organization": "meta_organization",
@@ -280,6 +279,7 @@ DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "openai_service_tier": "service_tier",
     "openai_reasoning": "reasoning",
     "openai_extra_body": "extra_body",
+    "patch_save": None,
 }
 
 PATCH_MANIFEST_SCHEMA: dict[str, Any] = {
@@ -541,7 +541,9 @@ def _merged_config_from_path(
             config.update(_merged_config_from_path(parent_path, active_paths))
         config.update(raw)
         for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
-            if deprecated in raw and replacement not in raw:
+            if deprecated not in raw:
+                continue
+            elif replacement not in raw:
                 config[replacement] = raw[deprecated]
         return config
     finally:
@@ -565,7 +567,7 @@ def inherited_config_names(config_path: Path) -> set[str]:
 
     overridden_names = set(document)
     for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
-        if deprecated in document:
+        if deprecated in document and replacement is not None:
             overridden_names.add(replacement)
     parent_config = merged_config(get_profile_path(parent_name))
     return set(parent_config) - overridden_names
@@ -575,7 +577,7 @@ def migrate_deprecated_config(config: dict[str, Any]) -> bool:
     for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
         if deprecated not in config:
             continue
-        if replacement not in config:
+        if replacement is not None and replacement not in config:
             config[replacement] = config[deprecated]
         del config[deprecated]
         changed = True
@@ -2187,7 +2189,7 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
             f"{name} is deprecated and is not present in the config"
         )
 
-    canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+    canonical_name = DEPRECATED_CONFIG_KEYS.get(name) or name
     if canonical_name == INHERIT_PROFILE_CONFIG_KEY:
         raise ValueError(
             f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
@@ -2359,7 +2361,6 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
     prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)", parse_patch_branch_value)
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
-    prompt_config_value(config, "patch_save", "Save patch file to HOME/.local/state/mince/patches (off, on)")
     prompt_config_value(config, "prompt_expansion", "Expand ^^promptname^^ references found in prompts (off, on)")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0 or off)")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0 or off)")
@@ -2489,11 +2490,19 @@ def handle_session_view(view_type: str, session_name: str) -> int:
     try:
         session_name = validate_session_name(session_name)
         directory, suffix = view_specs[view_type]
-        path = (
-            APP_DIR / "trees" / session_name / f"{session_name}.md"
-            if view_type == "tree"
-            else APP_DIR / directory / f"{session_name}{suffix}"
-        )
+        state_session_dir = STATE_DIR / session_name
+        if view_type == "patch" and state_session_dir.is_dir():
+            turn_dir = last_completed_state_turn(
+                state_session_dir,
+                required_file="response_diff_patch",
+            )
+            path = turn_dir / "response_diff_patch"
+        else:
+            path = (
+                APP_DIR / "trees" / session_name / f"{session_name}.md"
+                if view_type == "tree"
+                else APP_DIR / directory / f"{session_name}{suffix}"
+            )
         if not path.is_file():
             raise ValueError(f"session file does not exist: {path}")
         page_or_print(path.read_text(encoding="utf-8"))
@@ -9836,7 +9845,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         type=parse_bool,
         metavar="BOOL",
-        help="Save patch file to HOME/.local/state/mince/patches (default: on)",
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -9863,7 +9872,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--reuse-session",
+        "--resume-session",
         nargs="+",
         metavar=("SESSION_NAME", "TURN"),
         help=(
@@ -9874,9 +9883,26 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--reuse-session-skip-verify",
+        "--reuse-session",
+        dest="resume_session",
+        nargs="+",
+        metavar=("SESSION_NAME", "TURN"),
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--resume-session-skip-verify",
         action="store_true",
-        help="Skip checksum verification when reusing a session",
+        help="Skip checksum verification when resuming a session",
+    )
+
+    parser.add_argument(
+        "--reuse-session-skip-verify",
+        dest="resume_session_skip_verify",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
     )
 
     tree_files_group = parser.add_mutually_exclusive_group()
@@ -9962,7 +9988,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--tree-reuse-session",
-        dest="reuse_session",
+        dest="resume_session",
         metavar="NAME",
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
@@ -10615,6 +10641,25 @@ def parse_args() -> argparse.Namespace:
             "WARNING: --agent-auto is deprecated; use --agent instead.",
             file=sys.stderr,
         )
+    if args.patch_save is not None:
+        print(
+            "WARNING: --patch-save is deprecated and has no effect; "
+            "patches are saved in session state.",
+            file=sys.stderr,
+        )
+    for deprecated, replacement in (
+        ("--reuse-session", "--resume-session"),
+        ("--reuse-session-skip-verify", "--resume-session-skip-verify"),
+        ("--tree-reuse-session", "--resume-session"),
+    ):
+        if any(
+            argument.split("=", 1)[0] == deprecated
+            for argument in sys.argv[1:]
+        ):
+            print(
+                f"WARNING: {deprecated} is deprecated; use {replacement} instead.",
+                file=sys.stderr,
+            )
     return args
 
 
@@ -10625,7 +10670,6 @@ def disable_patch_shell_conflicting_options(args: argparse.Namespace) -> None:
         "patch_branch": False,
         "patch_branch_remove": None,
         "patch_merge": None,
-        "patch_save": False,
         "patch_file_apply": None,
         "patch_file_print": None,
     }
@@ -10652,8 +10696,8 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "patch_system_prompt": None,
         "shell_system_prompt": None,
         "agent_system_prompt": None,
-        "reuse_session": None,
-        "reuse_session_skip_verify": False,
+        "resume_session": None,
+        "resume_session_skip_verify": False,
         "tree_files": None,
         "tree_files_list": None,
         "tree_task": None,
@@ -10792,10 +10836,9 @@ def main() -> int:
             ),
             ("--agent-profile", args.agent_profiles is not None),
             ("--output-file", args.output_file is not None),
-            ("--patch-save", args.patch_save is not None),
             ("--shell", args.shell is not None),
             ("--shell-networking", args.shell_networking is not None),
-            ("--reuse-session", args.reuse_session is not None),
+            ("--resume-session", args.resume_session is not None),
             ("--tree-files", args.tree_files is not None),
             ("--tree-files-list", args.tree_files_list is not None),
             ("--tree-task", args.tree_task is not None),
@@ -10920,23 +10963,23 @@ def main() -> int:
             return 1
         return handle_patch_merge(merge_branch_name, merge_commit_message)
 
-    reuse_session_turn: int | None = None
-    if isinstance(args.reuse_session, list):
-        if len(args.reuse_session) > 2:
+    resume_session_turn: int | None = None
+    if isinstance(args.resume_session, list):
+        if len(args.resume_session) > 2:
             print(
-                "ERROR: --reuse-session accepts SESSION_NAME and optional TURN",
+                "ERROR: --resume-session accepts SESSION_NAME and optional TURN",
                 file=sys.stderr,
             )
             return 1
-        if len(args.reuse_session) == 2:
+        if len(args.resume_session) == 2:
             try:
-                reuse_session_turn = parse_session_turn(
-                    args.reuse_session[1], "--reuse-session"
+                resume_session_turn = parse_session_turn(
+                    args.resume_session[1], "--resume-session"
                 )
             except ValueError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
-        args.reuse_session = args.reuse_session[0]
+        args.resume_session = args.resume_session[0]
 
     if args.remove_expired_data is not None:
         return handle_remove_expired_data(args.remove_expired_data)
@@ -11148,7 +11191,7 @@ def main() -> int:
                             raise ValueError(
                                 "configuration name cannot be empty"
                             )
-                        canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+                        canonical_name = DEPRECATED_CONFIG_KEYS.get(name) or name
                         if canonical_name == INHERIT_PROFILE_CONFIG_KEY:
                             raise ValueError(
                                 f"{INHERIT_PROFILE_CONFIG_KEY} is managed by "
@@ -11175,7 +11218,7 @@ def main() -> int:
 
         if inherited_parent is not None:
             for name, value, remove_from_child in updates:
-                canonical_name = DEPRECATED_CONFIG_KEYS.get(name, name)
+                canonical_name = DEPRECATED_CONFIG_KEYS.get(name) or name
                 if remove_from_child:
                     raw_config.pop(name, None)
                     raw_config.pop(canonical_name, None)
@@ -11314,7 +11357,7 @@ def main() -> int:
             task = read_prompt_argument(args.task)
         elif args.task_file:
             task = read_prompt_files(args.task_file)
-        elif args.reuse_session is not None:
+        elif args.resume_session is not None:
             task = ""
         else:
             print("ERROR: --ask or --task required (--help for help)", file=sys.stderr)
@@ -11385,7 +11428,7 @@ def main() -> int:
         and not ask_mode
         and not args.list_models
         and not file_names
-        and args.reuse_session is None
+        and args.resume_session is None
     ):
         if args.files is None and args.files_list is None:
             file_names = parse_config_files(
@@ -11436,12 +11479,6 @@ def main() -> int:
         return 1
 
     patch_branch_mode = patch_branch_setting is not None
-    patch_save_enabled = args.noninteractive or resolve_bool_option(
-        args.patch_save,
-        config,
-        'patch_save',
-        True,
-    )
     patch_review = (
         not args.noninteractive
         and resolve_bool_option(
@@ -11503,7 +11540,7 @@ def main() -> int:
         return 1
     if (
         shell_mode
-        and args.reuse_session is None
+        and args.resume_session is None
         and not (args.task or args.task_file)
     ):
         print("ERROR: --shell requires --task or --task-file", file=sys.stderr)
@@ -11513,7 +11550,7 @@ def main() -> int:
         return 1
     if (
         agent_mode
-        and args.reuse_session is None
+        and args.resume_session is None
         and not (args.task or args.task_file)
     ):
         print("ERROR: --agent requires --task or --task-file", file=sys.stderr)
@@ -11523,17 +11560,17 @@ def main() -> int:
         return 1
     if (
         patch_mode
-        and args.reuse_session is not None
+        and args.resume_session is not None
         and args.task is None
     ):
         print(
-            "ERROR: --patch with --reuse-session requires --task",
+            "ERROR: --patch with --resume-session requires --task",
             file=sys.stderr,
         )
         return 1
     if (
         patch_mode
-        and args.reuse_session is None
+        and args.resume_session is None
         and not (args.task or args.task_file)
     ):
         print("ERROR: --patch requires --task or --task-file", file=sys.stderr)
@@ -11793,7 +11830,7 @@ def main() -> int:
         f"{base_profile}-{session_timestamp}-{session_rand_part}"
     )
     state_enabled = not ask_mode
-    reuse_session_name: str | None = None
+    resume_session_name: str | None = None
     reused_patch_turn: ReusedPatchTurn | None = None
     reused_shell_turn: ReusedShellTurn | None = None
     reused_agent_history: ReusedAgentHistory | None = None
@@ -11801,22 +11838,19 @@ def main() -> int:
     reused_file_records: list[tuple[str, str]] = []
     reasoning_items: tuple[dict[str, Any], ...] = ()
     shell_revision_task: str | None = None
-    if args.reuse_session is not None:
+    if args.resume_session is not None:
         try:
-            reuse_session_name = validate_session_name(args.reuse_session)
+            resume_session_name = validate_session_name(args.resume_session)
         except ValueError as exc:
-            print(f"ERROR: Invalid reuse session name: {exc}", file=sys.stderr)
+            print(f"ERROR: Invalid resume session name: {exc}", file=sys.stderr)
             return 1
-    session_stem = reuse_session_name or generated_session_stem
+    session_stem = resume_session_name or generated_session_stem
     SESSION_NAME = session_stem
-    if reuse_session_name is not None:
-        state_session_dir = STATE_DIR / reuse_session_name
-    else:
-        state_session_dir = STATE_DIR / session_stem
+    state_session_dir = STATE_DIR / session_stem
     state_turn = 0
 
     if state_enabled:
-        if reuse_session_name is not None:
+        if resume_session_name is not None:
             try:
                 reused_file_records = load_reused_session_files(
                     state_session_dir
@@ -11828,13 +11862,13 @@ def main() -> int:
                     if shell_mode:
                         reused_shell_turn = load_reused_session_shell_turn(
                             state_session_dir,
-                            turn=reuse_session_turn,
+                            turn=resume_session_turn,
                         )
                         reused_task = reused_shell_turn.task
                         if task_supplied:
                             if not task:
                                 raise ValueError(
-                                    "reused session revision task cannot be empty"
+                                    "resumed session revision task cannot be empty"
                                 )
                             shell_revision_task = task
                         task = expand_prompt_names(
@@ -11845,7 +11879,7 @@ def main() -> int:
                             reused_shell_turn = (
                                 load_reused_session_shell_command_turn(
                                     state_session_dir,
-                                    turn=reuse_session_turn,
+                                    turn=resume_session_turn,
                                     response_json_repair=response_json_repair,
                                 )
                             )
@@ -11856,17 +11890,17 @@ def main() -> int:
                     elif patch_mode:
                         if not task:
                             raise ValueError(
-                                "reused session revision task cannot be empty"
+                                "resumed session revision task cannot be empty"
                             )
                         reused_patch_turn = load_reused_session_patch_turn(
                             state_session_dir,
-                            turn=reuse_session_turn,
+                            turn=resume_session_turn,
                         )
                     elif agent_mode:
                         reused_agent_history = (
                             load_reused_session_agent_history(
                                 state_session_dir,
-                                turn=reuse_session_turn,
+                                turn=resume_session_turn,
                                 expires_schema=agent_expires_in_turns_schema(
                                     agent_context_expires
                                 ),
@@ -11884,7 +11918,7 @@ def main() -> int:
                     else:
                         reused_task = load_reused_session_task(
                             state_session_dir,
-                            turn=reuse_session_turn,
+                            turn=resume_session_turn,
                         )
                         if not task_supplied:
                             task = expand_prompt_names(
@@ -11897,7 +11931,7 @@ def main() -> int:
                         reasoning_turn_dir = reused_patch_turn.turn_dir
                     else:
                         reasoning_turn_dir = last_completed_state_turn(
-                            state_session_dir, reuse_session_turn
+                            state_session_dir, resume_session_turn
                         )
                     reasoning_items = load_state_reasoning_items(
                         reasoning_turn_dir
@@ -11909,7 +11943,7 @@ def main() -> int:
                         file_names = reused_file_names
             except ValueError as exc:
                 print(
-                    f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
+                    f"ERROR: Failed to resume session '{resume_session_name}': {exc}",
                     file=sys.stderr,
                 )
                 return 1
@@ -11945,11 +11979,11 @@ def main() -> int:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = LOG_DIR / f"{session_stem}.txt"
         append_to_existing_log = (
-            reuse_session_name is not None and log_path.exists()
+            resume_session_name is not None and log_path.exists()
         )
         with open(
             log_path,
-            "a" if reuse_session_name is not None else "w",
+            "a" if resume_session_name is not None else "w",
             encoding="utf-8",
         ) as f:
             if append_to_existing_log:
@@ -12005,12 +12039,6 @@ def main() -> int:
             f"<end_time>{time.ctime(timestamp)} [{timestamp}]</end_time>\n"
         )
 
-    patch_save_path = None
-    patch_json_save_path = None
-    if patch_save_enabled and patch_mode:
-        patch_stem = log_path.stem if log_path is not None else session_stem
-        patch_save_path = APP_DIR / "patches" / f"{patch_stem}.patch"
-        patch_json_save_path = APP_DIR / "patches" / f"{patch_stem}.json"
     if patch_branch_mode:
         try:
             patch_branch_name = resolve_patch_branch_name(patch_branch_setting)
@@ -12041,8 +12069,8 @@ def main() -> int:
             return 1
 
     if (
-        reuse_session_name is not None
-        and not args.reuse_session_skip_verify
+        resume_session_name is not None
+        and not args.resume_session_skip_verify
     ):
         try:
             verify_reused_session_files(reused_file_records)
@@ -12052,7 +12080,7 @@ def main() -> int:
             except Exception:
                 pass
             print(
-                f"ERROR: Failed to reuse session '{reuse_session_name}': {exc}",
+                f"ERROR: Failed to resume session '{resume_session_name}': {exc}",
                 file=sys.stderr,
             )
             return 1
@@ -12091,9 +12119,7 @@ def main() -> int:
                 return 1
             used_relative_paths.add(relative_path)
             tree_relative_paths[tree_file_path] = relative_path
-        tree_session_stem = (
-            reuse_session_name if reuse_session_name is not None else session_stem
-        )
+        tree_session_stem = session_stem
         SESSION_NAME = tree_session_stem
         tree_session_dir = APP_DIR / "trees" / tree_session_stem
         tree_state_session_dir = STATE_DIR / tree_session_stem
@@ -12934,7 +12960,7 @@ def main() -> int:
                 print(shell_output, file=sys.stderr)
                 print("</shell_execution>", file=sys.stderr)
             if (
-                reuse_session_name is not None
+                resume_session_name is not None
                 and (
                     not resume_reused_shell_turn
                     or complete_reused_shell_turn_after_execution
@@ -13104,24 +13130,10 @@ def main() -> int:
                     print('No changes.', file=sys.stderr)
                     print(statsline, file=sys.stderr)
                 return 0
-            if patch_save_path is not None:
-                try:
-                    patch_save_path.parent.mkdir(parents=True, exist_ok=True)
-                    patch_save_path.write_text(diff_text, encoding='utf-8')
-                    patch_json_save_path.write_text(result, encoding='utf-8')
-                except Exception as exc:
-                    print(
-                        f'ERROR: Failed to save patch files to '
-                        f'{patch_save_path} and {patch_json_save_path}: {exc}',
-                        file=sys.stderr,
-                    )
-                    return 1
+            if args.noninteractive:
                 if VERBOSE:
-                    print(f'patch_file={patch_save_path} patch_json_file={patch_json_save_path}', file=sys.stderr)
-                if args.noninteractive:
-                    if VERBOSE:
-                        print(statsline, file=sys.stderr)
-                    return 0
+                    print(statsline, file=sys.stderr)
+                return 0
             if VERBOSE or patch_review:
                 print()
                 print(diff_text)
