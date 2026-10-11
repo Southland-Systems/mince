@@ -260,14 +260,14 @@ Copy a configuration option from another profile:
 mce --profile aws_grok --set-config-from base_url aws
 ```
 
-Use a `flex` service tier, omit explicit prompt caching, and allow three additional transient-failure retries:
+Use a `flex` service tier, add explicit prompt caching for maximum cost savings:
 
 ```bash
-mce --service-tier flex --explicit-prompt-cache off --retry 3 \
+mce --service-tier flex --explicit-prompt-cache on \
   --task "Identify one actionable reliability issue" --files src/main.py
 ```
 
-Service-tier and caching support depend on the endpoint. Explicit caching is already `off` by default.
+Service-tier and caching support depend on the endpoint. Explicit caching is `on` thus disabling cache on the API.
 
 Configure an API safety identifier in the selected configuration profile:
 
