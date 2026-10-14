@@ -7,9 +7,9 @@ An assistant for turning local files into useful answers.
 
 from __future__ import annotations
 
-import errno
 import os
 import signal
+import errno
 import socket
 import hashlib
 import argparse
@@ -53,7 +53,6 @@ from openai import (
     UnprocessableEntityError,
 )
 import httpx
-import pyseccomp as seccomp
 
 VERBOSE = 1
 DEBUG = 0
@@ -243,6 +242,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "plan": "off",
     "shell": "off",
     "shell_networking": "off",
+    "shell_timeout": 0,
     "patch": "off",
     "patch_review": "off",
     "patch_branch": "off",
@@ -279,6 +279,7 @@ DEPRECATED_CONFIG_KEYS: dict[str, str | None] = {
     "openai_service_tier": "service_tier",
     "openai_reasoning": "reasoning",
     "openai_extra_body": "extra_body",
+    "contain_networking": "shell_networking",
     "patch_save": None,
 }
 
@@ -2357,7 +2358,8 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "shell", "Shell mode (off, on)")
-    prompt_config_value(config, "shell_networking", "Allow networking for shell and agent shell tools (off, on)")
+    prompt_config_value(config, "shell_networking", "Allow networking for shell commands (off, on)")
+    prompt_config_value(config, "shell_timeout", "Shell command timeout in seconds (0 to disable)", int)
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
     prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)", parse_patch_branch_value)
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
@@ -3131,7 +3133,29 @@ def _shell_text(value: Any) -> str:
     return str(value or "")
 
 
-def _terminate_shell_process(process: Any) -> None:
+def _terminate_shell_process(
+    process: Any,
+    unit_name: str | None = None,
+) -> None:
+    if unit_name is not None:
+        try:
+            subprocess.run(
+                [
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "kill",
+                    "--signal=SIGKILL",
+                    "--kill-whom=all",
+                    unit_name,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -3144,7 +3168,62 @@ def _terminate_shell_process(process: Any) -> None:
         process.kill()
 
 
-def _restrict_shell_address_families() -> None:
+def _contained_shell_command(
+    command: str,
+    paths: tuple[Path, ...],
+    shell_networking: bool,
+    unit_name: str,
+    timeout: int | None = None,
+) -> list[str]:
+    if sys.platform != "linux":
+        raise OSError("shell containment requires Linux")
+    arguments = [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--quiet",
+        "--wait",
+        "--collect",
+        f"--unit={unit_name}",
+        "--pty",
+        f"--working-directory={Path.cwd()}",
+        "--property=Type=exec",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=read-only",
+        "--property=PrivateTmp=yes",
+        "--property=PrivateDevices=yes",
+        "--property=NoNewPrivileges=yes",
+        "--property=ProtectClock=yes",
+        "--property=ProtectControlGroups=yes",
+        "--property=ProtectHostname=yes",
+        "--property=ProtectKernelLogs=yes",
+        "--property=ProtectKernelModules=yes",
+        "--property=ProtectKernelTunables=yes",
+        "--property=LockPersonality=yes",
+        "--property=RestrictRealtime=yes",
+        "--property=RestrictSUIDSGID=yes",
+        "--property=RestrictNamespaces=yes",
+        f"--property=RuntimeMaxSec={timeout if timeout is not None else 'infinity'}",
+    ]
+    if paths:
+        read_write_paths = " ".join(
+            json.dumps(str(path), ensure_ascii=False) for path in paths
+        )
+        arguments.append(f"--property=ReadWritePaths={read_write_paths}")
+    if not shell_networking:
+        arguments.extend(
+            [
+                "--property=PrivateNetwork=yes",
+                "--property=RestrictAddressFamilies=AF_UNIX",
+            ]
+        )
+    return [*arguments, "--", "/bin/sh", "-c", command]
+
+
+def _shell_address_family_restriction() -> Callable[[], None]:
+    if sys.platform != "linux":
+        raise OSError("shell networking restrictions require Linux")
+    import pyseccomp as seccomp
+
     seccomp_filter = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
     denied_action = seccomp.ERRNO(errno.EAFNOSUPPORT)
     for syscall in ("socket", "socketpair"):
@@ -3153,43 +3232,46 @@ def _restrict_shell_address_families() -> None:
             syscall,
             seccomp.Arg(0, seccomp.NE, socket.AF_UNIX),
         )
-    seccomp_filter.load()
-
-
-def _shell_popen_kwargs(shell_networking: bool) -> dict[str, Any]:
-    popen_kwargs: dict[str, Any] = {}
-    if os.name == "posix":
-        popen_kwargs["start_new_session"] = True
-    if shell_networking:
-        return popen_kwargs
-    if sys.platform != "linux":
-        raise OSError("shell networking restrictions require Linux")
-    popen_kwargs["preexec_fn"] = _restrict_shell_address_families
-    return popen_kwargs
+    return seccomp_filter.load
 
 
 def execute_shell_commands(
     commands: list[ShellStep],
-    timeout: int,
+    timeout: int | None = None,
+    contain: tuple[Path, ...] | None = None,
     shell_networking: bool = False,
     print_exit_status: bool = False,
  ) -> str:
     output_blocks: list[str] = []
-    command_timeout = max(1, int(timeout))
+    command_timeout = int(timeout) if timeout else None
     for index, step in enumerate(commands, start=1):
         script_input = None
         if step.lines:
             script_input = "\n".join(step.lines) + "\n"
         try:
-            popen_kwargs = _shell_popen_kwargs(shell_networking)
+            command: str | list[str] = step.command
+            unit_name: str | None = None
+            preexec_fn: Callable[[], None] | None = None
+            if contain is not None:
+                unit_name = f"mince-shell-{os.getpid()}-{time.time_ns()}.service"
+                command = _contained_shell_command(
+                    step.command,
+                    contain,
+                    shell_networking,
+                    unit_name,
+                    command_timeout,
+                )
+            elif not shell_networking:
+                preexec_fn = _shell_address_family_restriction()
             process = subprocess.Popen(
-                step.command,
-                shell=True,
+                command,
+                shell=contain is None,
                 stdin=subprocess.PIPE if script_input is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                **popen_kwargs,
+                start_new_session=os.name == "posix",
+                preexec_fn=preexec_fn,
             )
             try:
                 stdout, stderr = process.communicate(
@@ -3198,7 +3280,7 @@ def execute_shell_commands(
                 )
                 status = str(process.returncode)
             except subprocess.TimeoutExpired:
-                _terminate_shell_process(process)
+                _terminate_shell_process(process, unit_name)
                 stdout, stderr = process.communicate()
                 status = "timeout"
                 stderr = (
@@ -3209,7 +3291,7 @@ def execute_shell_commands(
                     f"command exceeded timeout of {command_timeout} seconds"
                 )
             except BaseException:
-                _terminate_shell_process(process)
+                _terminate_shell_process(process, unit_name)
                 try:
                     process.communicate()
                 except Exception:
@@ -4762,6 +4844,7 @@ class AgentRunSettings:
     worker_system_prompt: str
     linenum_system_prompt: str
     shell_system_prompt: str
+    contain: tuple[Path, ...] | None
     shell_networking: bool
     patch_system_prompt: str
     system_prompt_with_task: bool
@@ -4773,6 +4856,7 @@ class AgentRunSettings:
     agent_auto: bool
     print_reasoning: bool
     suppress_response_output: bool
+    shell_timeout: int = 0
     agent_profiles: tuple[AgentProfile, ...] = ()
     agent_context_expires: tuple[int, int, int] = DEFAULT_AGENT_CONTEXT_EXPIRES
     patch_suffix_argument_provided: bool = False
@@ -7992,7 +8076,8 @@ def run_agent_shell_tool(
         )
     shell_output = execute_shell_commands(
         commands,
-        settings.model_settings.llm_timeout,
+        settings.shell_timeout,
+        contain=settings.contain,
         shell_networking=settings.shell_networking,
         print_exit_status=True,
     )
@@ -9178,13 +9263,13 @@ def response_reasoning_text(response_obj: Any) -> str:
     try:
         for item in getattr(response_obj, "output", []):
             if getattr(item, "type", None) == "reasoning":
-                for content in getattr(item, "content", []):
+                for content in (getattr(item, "content", []) or []):
                     if getattr(content, "type", None) == "reasoning_text":
                         reasoning = getattr(content, "text", "")
         if not reasoning:
             for item in getattr(response_obj, "output", []):
                 if getattr(item, "type", None) == "reasoning":
-                    for content in getattr(item, "summary", []):
+                    for content in (getattr(item, "summary", []) or []):
                         if getattr(content, "type", None) == "summary_text":
                             reasoning = getattr(content, "text", "")
     except Exception:
@@ -9772,13 +9857,40 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--shell-timeout",
+        metavar="SECONDS",
+        type=int,
+        help="Timeout for shell commands in seconds (0 to disable; default: disabled)",
+    )
+
+    parser.add_argument(
         "--shell-networking",
         nargs="?",
         const=True,
         default=None,
         type=parse_bool,
         metavar="BOOL",
-        help="Allow --shell or --agent shell commands to use network address families other than AF_UNIX",
+        help="Allow networking for shell commands (default: off)",
+    )
+
+    parser.add_argument(
+        "--contain",
+        nargs="*",
+        action="extend",
+        type=Path,
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--contain-networking",
+        dest="shell_networking",
+        nargs="?",
+        const=True,
+        default=argparse.SUPPRESS,
+        type=parse_bool,
+        metavar="BOOL",
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -10690,7 +10802,9 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
         "agent_context_expires": None,
         "agent_hook_context": None,
         "agent_profiles": None,
+        "contain": None,
         "shell_networking": False,
+        "shell_timeout": 0,
         "patch_review": False,
         "patch_suffix": None,
         "patch_system_prompt": None,
@@ -10837,7 +10951,9 @@ def main() -> int:
             ("--agent-profile", args.agent_profiles is not None),
             ("--output-file", args.output_file is not None),
             ("--shell", args.shell is not None),
+            ("--contain", args.contain is not None),
             ("--shell-networking", args.shell_networking is not None),
+            ("--shell-timeout", args.shell_timeout is not None),
             ("--resume-session", args.resume_session is not None),
             ("--tree-files", args.tree_files is not None),
             ("--tree-files-list", args.tree_files_list is not None),
@@ -11404,6 +11520,15 @@ def main() -> int:
         config,
         'shell_networking',
     )
+    try:
+        contain = (
+            tuple(path.expanduser().resolve() for path in args.contain)
+            if args.contain is not None
+            else None
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: Invalid containment path: {exc}", file=sys.stderr)
+        return 1
     agent_mode = args.agent
     agent_auto = agent_mode and not args.agent_review
     if args.agent_context_expires is not None and not agent_mode:
@@ -11506,19 +11631,30 @@ def main() -> int:
         suffix_provided = False
 
     if tree_mode and (
-        plan_mode or patch_mode or shell_mode or shell_networking or agent_mode
+        plan_mode
+        or patch_mode
+        or shell_mode
+        or contain is not None
+        or shell_networking
+        or agent_mode
     ):
         print(
             "ERROR: tree mode cannot be combined with --plan, --patch, --shell, "
-            "--shell-networking, or --agent",
+            "--contain, --shell-networking, or --agent",
             file=sys.stderr,
         )
         return 1
     if patch_mode and shell_mode:
         print("ERROR: --shell cannot be combined with --patch", file=sys.stderr)
         return 1
+    if contain is not None and not (shell_mode or agent_mode):
+        print("ERROR: --contain requires --shell or --agent", file=sys.stderr)
+        return 1
     if shell_networking and not (shell_mode or agent_mode):
-        print("ERROR: --shell-networking requires --shell or --agent", file=sys.stderr)
+        print(
+            "ERROR: --shell-networking requires --shell or --agent",
+            file=sys.stderr,
+        )
         return 1
     if args.agent_hook_context is not None and not agent_mode:
         print("ERROR: --agent-hook-context requires --agent", file=sys.stderr)
@@ -11591,6 +11727,18 @@ def main() -> int:
     llm_timeout = resolve_config_option(
         args.llm_timeout, config, "llm_timeout", 300
     )
+    try:
+        shell_timeout = int(
+            resolve_config_option(
+                args.shell_timeout, config, "shell_timeout",
+                DEFAULT_CONFIG["shell_timeout"],
+            )
+        )
+        if shell_timeout < 0:
+            raise ValueError("shell timeout must be non-negative")
+    except (TypeError, ValueError) as exc:
+        print(f"ERROR: Invalid shell timeout: {exc}", file=sys.stderr)
+        return 1
     try:
         retry = parse_retry_count(
             resolve_config_option(
@@ -12431,7 +12579,9 @@ def main() -> int:
             worker_system_prompt=agent_worker_system_prompt,
             linenum_system_prompt=linenum_system_prompt,
             shell_system_prompt=shell_system_prompt,
+            contain=contain,
             shell_networking=shell_networking,
+            shell_timeout=shell_timeout,
             patch_system_prompt=patch_system_prompt,
             system_prompt_with_task=system_prompt_with_task,
             add_line_numbers=add_line_numbers,
@@ -12942,7 +13092,8 @@ def main() -> int:
             if shell_output_is_new:
                 shell_output = execute_shell_commands(
                     shell_steps,
-                    llm_timeout,
+                    shell_timeout,
+                    contain=contain,
                     shell_networking=shell_networking,
                 )
                 if state_turn_path is not None:

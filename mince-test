@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run deterministic, offline integration tests for mince."""
+"""Run deterministic, offline integration tests for mince and mince-contain."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,8 +15,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-
-ROOT = Path(__file__).resolve().parent
 
 
 class TestFailure(Exception):
@@ -54,6 +53,17 @@ class MockResponsesAPI:
                 }
                 for index, (name, arguments) in enumerate(calls)
             ]
+        }
+
+    @staticmethod
+    def reasoning_item(name: str) -> dict[str, Any]:
+        return {
+            "id": f"rs_offline_{name}",
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "Offline reasoning summary"},
+            ],
+            "encrypted_content": f"offline-encrypted-{name}",
         }
 
     @staticmethod
@@ -100,6 +110,11 @@ class MockResponsesAPI:
                     ],
                 }
             ]
+        if isinstance(value, dict):
+            reasoning_items = value.get("reasoning_items", [])
+            if not isinstance(reasoning_items, list):
+                raise ValueError("mock reasoning_items must be an array")
+            output_items = [*reasoning_items, *output_items]
         if not isinstance(usage, dict) or not usage:
             usage = {
                 "input_tokens": 8,
@@ -188,7 +203,13 @@ class MockResponsesAPI:
                     owner._payload(response_value, index).decode("utf-8")
                 )
                 if request.get("stream") is True:
-                    output_text = response_payload["output"][0]["content"][0]["text"]
+                    output_text = "".join(
+                        content["text"]
+                        for item in response_payload["output"]
+                        if item.get("type") == "message"
+                        for content in item.get("content", [])
+                        if content.get("type") == "output_text"
+                    )
                     midpoint = max(1, len(output_text) // 2)
                     chunks = [output_text[:midpoint], output_text[midpoint:]]
                     events = [
@@ -267,7 +288,28 @@ class OfflineTests:
         self.work = self.root / "work"
         self.home.mkdir()
         self.work.mkdir()
-        self.command = [ 'mince' ]
+        self.contain_bin = self.root / "contain-bin"
+        self.contain_bin.mkdir()
+        self.systemd_run = self.contain_bin / "systemd-run"
+        # Inspect wrapper invocations without starting a real systemd service.
+        self.systemd_run.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "arguments = sys.argv[1:]\n"
+            "capture = os.environ.get('MINCE_TEST_SYSTEMD_CAPTURE')\n"
+            "if capture:\n"
+            "    Path(capture).write_text(json.dumps({\n"
+            "        'arguments': arguments,\n"
+            "        'environment': dict(os.environ),\n"
+            "    }), encoding='utf-8')\n"
+            "if os.environ.get('MINCE_TEST_SYSTEMD_EXECUTE') == '1':\n"
+            "    command = arguments[arguments.index('--') + 1:]\n"
+            "    os.execvpe(command[0], command, os.environ)\n"
+            "raise SystemExit(int(os.environ.get('MINCE_TEST_SYSTEMD_STATUS', '0')))\n",
+            encoding="utf-8",
+        )
+        self.systemd_run.chmod(0o700)
         cache_name = hashlib.sha1(
             b"https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
         ).hexdigest()
@@ -294,6 +336,8 @@ class OfflineTests:
         check: bool = True,
         cwd: Path | None = None,
         input_text: str | None = None,
+        executable: str = "mince",
+        environment_updates: dict[str, str | None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(
@@ -310,27 +354,40 @@ class OfflineTests:
                 "all_proxy": "",
             }
         )
-        tokenizing_options = {
-            "--ask", "--ask-file", "--task", "--task-file",
-            "--reuse-session", "--tree-task", "--tree-task-file",
-        }
-        if any(str(argument) in tokenizing_options for argument in arguments):
-            require(
-                self._token_cache_available,
-                "Offline tokenizer cache is missing. Before running mince-test, "
-                "prewarm o200k_base using: "
-                "TIKTOKEN_CACHE_DIR=\"$HOME/.local/state/mince/tiktoken\" "
-                "python3 -c 'import tiktoken; tiktoken.get_encoding(\"o200k_base\")'",
+        if executable == "mince-contain":
+            environment["PATH"] = os.pathsep.join(
+                (str(self.contain_bin), environment.get("PATH", os.defpath))
             )
-        command = [
-            *self.command,
-            "--base-url", "http://127.0.0.1:1/v1",
-            "--retry", "0",
-            *(str(argument) for argument in arguments),
-        ]
+        for name, value in (environment_updates or {}).items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
+
+        # Resolve both commands through PATH, not a repository path or interpreter.
+        command = [executable]
+        if executable == "mince":
+            tokenizing_options = {
+                "--ask", "--ask-file", "--task", "--task-file",
+                "--resume-session", "--reuse-session",
+                "--tree-task", "--tree-task-file",
+                "--tree-reuse-session",
+            }
+            if any(str(argument) in tokenizing_options for argument in arguments):
+                require(
+                    self._token_cache_available,
+                    "Offline tokenizer cache is missing. Before running mince-test, "
+                    "prewarm o200k_base using: "
+                    "TIKTOKEN_CACHE_DIR=\"$HOME/.local/state/mince/tiktoken\" "
+                    "python3 -c 'import tiktoken; tiktoken.get_encoding(\"o200k_base\")'",
+                )
+            command.extend(
+                ["--base-url", "http://127.0.0.1:1/v1", "--retry", "0"]
+            )
+        command.extend(str(argument) for argument in arguments)
         completed = subprocess.run(
             command,
-            cwd=cwd or ROOT,
+            cwd=cwd or self.work,
             env=environment,
             input=input_text,
             text=True,
@@ -346,6 +403,25 @@ class OfflineTests:
                 f"stderr:\n{completed.stderr}"
             )
         return completed
+
+    def contain_command(
+        self,
+        *arguments: object,
+        cwd: Path | None = None,
+        environment_updates: dict[str, str | None] | None = None,
+    ) -> list[str]:
+        result = self.run(
+            "--contain-dry-run", *arguments,
+            executable="mince-contain",
+            cwd=cwd,
+            environment_updates=environment_updates,
+        )
+        command = shlex.split(result.stdout)
+        require(
+            bool(command) and "--" in command,
+            "containment dry-run did not print a systemd-run command",
+        )
+        return command
 
     def shell_session_response(self, session_name: str) -> dict[str, Any]:
         result = self.run(
@@ -400,12 +476,15 @@ class OfflineTests:
             "patch mode default is incorrect",
         )
         require(
-            config["retry"] == 2
-            and config["agent_context_expires"] == "12 6 24"
+            config["retry"] == 3
+            and config["agent_context_expires"] == "28 14 54"
+            and config["system_prompt_with_task"] == "on"
+            and config["shell_timeout"] == 0
             and config["shell_networking"] == "off"
             and config["response_json_repair"] == "off"
+            and config["stream"] == "off"
             and config["explicit_prompt_cache"] == "off",
-            "retry, agent expiry, networking, repair, or cache defaults are incorrect",
+            "retry, expiry, task placement, shell, repair, streaming, or cache defaults are incorrect",
         )
 
     def test_inherited_profile_overrides(self) -> None:
@@ -513,8 +592,14 @@ class OfflineTests:
             for request in mock.requests
         ]
         require(
-            all("Summarize each tree file." in value for value in request_inputs),
-            "tree task was omitted from one or more requests",
+            all(
+                str(request.get("instructions", "")).startswith(
+                    "Summarize each tree file.\n"
+                )
+                for request in mock.requests
+            )
+            and all("Summarize each tree file." not in value for value in request_inputs),
+            "tree task was not prepended to system instructions by default",
         )
         require(
             any("1 alpha" in value for value in request_inputs),
@@ -573,33 +658,33 @@ class OfflineTests:
                 "off",
                 "--no-api-log",
             )
-        request_inputs = [
-            str(request.get("input", "")) for request in mock.requests
-        ]
-        python_input = next(
-            value for value in request_inputs if "1 python" in value
-        )
-        text_input = next(
-            value for value in request_inputs if "1 text" in value
-        )
-        require(
-            "Python-specific tree task" in python_input
-            and "General tree task" not in python_input,
-            "extension-specific tree task was not selected",
-        )
-        require(
-            "General tree task" in text_input
-            and "Python-specific tree task" not in text_input,
-            "wildcard tree task was not selected",
-        )
-        python_instructions = next(
-            str(request.get("instructions", ""))
-            for request in mock.requests
+        require(len(mock.requests) == 2, "expected two extension-specific tree requests")
+        python_request = next(
+            request for request in mock.requests
             if "1 python" in str(request.get("input", ""))
         )
+        text_request = next(
+            request for request in mock.requests
+            if "1 text" in str(request.get("input", ""))
+        )
+        python_instructions = str(python_request.get("instructions", ""))
+        text_instructions = str(text_request.get("instructions", ""))
         require(
-            "Python-specific system instruction" in python_instructions,
-            "extension-specific system prompt was not selected",
+            python_instructions.startswith("Python-specific tree task\n")
+            and "General tree task" not in python_instructions
+            and "Python-specific tree task" not in str(python_request["input"]),
+            "extension-specific tree task was not selected and placed in system instructions",
+        )
+        require(
+            text_instructions.startswith("General tree task\n")
+            and "Python-specific tree task" not in text_instructions
+            and "General tree task" not in str(text_request["input"]),
+            "wildcard tree task was not selected and placed in system instructions",
+        )
+        require(
+            "Python-specific system instruction" in python_instructions
+            and "General system instruction" in text_instructions,
+            "extension-specific or wildcard system prompt was not selected",
         )
 
     def test_prompt_library(self) -> None:
@@ -724,10 +809,13 @@ class OfflineTests:
         )
         task_input = str(mock.requests[1].get("input", ""))
         require(
-            "Task loaded from a file" in task_input
+            str(mock.requests[1].get("instructions", "")).startswith(
+                "Task loaded from a file\n"
+            )
+            and "Task loaded from a file" not in task_input
             and "1 First context line" in task_input
             and "1 Second context line" in task_input,
-            "task or files-list input was not included in the request",
+            "task-file placement or files-list context was incorrect",
         )
         require(
             "# ignored comment" not in task_input,
@@ -735,28 +823,36 @@ class OfflineTests:
         )
 
     def test_streaming_text_response(self) -> None:
-        with MockResponsesAPI(["offline streamed response"]) as mock:
-            result = self.run(
-                "--ask",
-                "Stream the offline response.",
-                "--stream",
-                "--model",
-                "offline-test-model",
-                "--base-url",
-                mock.url,
-                "--log",
-                "off",
-                "--no-api-log",
+        reasoning_item = MockResponsesAPI.reasoning_item("stream")
+        cases = [
+            ("off", "medium", "offline streamed response\n"),
+            ("on", "medium",
+             "<think>\nOffline reasoning summary\n</think>\n\noffline streamed response\n"),
+            ("on", "off", "offline streamed response\n"),
+        ]
+        for print_reasoning, reasoning, expected in cases:
+            with MockResponsesAPI([{
+                "output_text": "offline streamed response",
+                "reasoning_items": [reasoning_item],
+            }]) as mock:
+                result = self.run(
+                    "--ask", "Stream the offline response.", "--stream",
+                    "--print-reasoning", print_reasoning, "--reasoning", reasoning,
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log",
+                )
+            require(
+                result.stdout == expected,
+                "streamed text or buffered reasoning was duplicated, omitted, or misformatted",
             )
-        require(
-            result.stdout == "offline streamed response\n",
-            "streamed response text was not emitted correctly",
-        )
-        require(len(mock.requests) == 1, "expected one streaming request")
-        require(
-            mock.requests[0].get("stream") is True,
-            "streaming was not requested from the API",
-        )
+            require(
+                len(mock.requests) == 1 and mock.requests[0].get("stream") is True,
+                "expected exactly one streaming API request",
+            )
+            require(
+                (reasoning == "off") == ("reasoning" not in mock.requests[0]),
+                "disabled reasoning was sent to the API or enabled reasoning was omitted",
+            )
 
     def test_streaming_text_response_to_output_file(self) -> None:
         output_file = self.work / "streamed-output.txt"
@@ -1112,8 +1208,6 @@ class OfflineTests:
                 target,
                 "--patch",
                 "--patch-review",
-                "--patch-save",
-                "off",
                 "--model",
                 "offline-test-model",
                 "--base-url",
@@ -1159,11 +1253,9 @@ class OfflineTests:
         )
         require(len(mock.requests) == 1, "expected one text request")
         request = mock.requests[0]
-        input_value = request.get("input", "")
-        if isinstance(input_value, list):
-            input_value = json.dumps(input_value)
-        require("1 first" in str(input_value), "first numbered context line is missing")
-        require("2 second" in str(input_value), "second numbered context line is missing")
+        input_value = request_prompt(request)
+        require("1 first" in input_value, "first numbered context line is missing")
+        require("2 second" in input_value, "second numbered context line is missing")
         require(
             "offline system" in str(request.get("instructions", "")),
             "system prompt is missing",
@@ -1225,8 +1317,6 @@ class OfflineTests:
                 "--patch",
                 "--patch-review",
                 "off",
-                "--patch-save",
-                "off",
                 "--patch-suffix",
                 ".api",
                 "--model",
@@ -1244,6 +1334,45 @@ class OfflineTests:
             "API patch output was incorrect",
         )
         require(len(mock.requests) == 1, "expected one API patch request")
+
+    def test_api_patch_creates_file_without_context(self) -> None:
+        target = self.work / "api-generated" / "nested" / "created.txt"
+        output = target.with_name(target.name + ".created")
+        content = ["Created through the offline API", "Second created line"]
+        manifest = self._patch_manifest(
+            target, patches=[self._replacement_patch(content)],
+        )
+        with MockResponsesAPI([{"output": manifest}]) as mock:
+            result = self.run(
+                "--task", "Create a new file without initial file context.",
+                "--patch", "--patch-review", "off", "--patch-suffix", ".created",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 1, "expected one new-file patch request")
+        request = mock.requests[0]
+        require(
+            prompt_section(request_prompt(request), "files") == ""
+            and request["text"]["format"]["name"] == "line_replace_manifest",
+            "context-free patch generation omitted its schema or added file context",
+        )
+        require(
+            not target.exists() and output.is_file()
+            and output.read_text(encoding="utf-8") == "\n".join(content),
+            "context-free API patch did not create the suffixed file and parent directories",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        artifacts = self.state_artifacts(
+            session_name, "0", "request_files", "response_schema_patch",
+            "response_diff_patch", "response_schema_patch_applied",
+        )
+        require(
+            artifacts["request_files"] == ""
+            and json.loads(artifacts["response_schema_patch"]) == manifest
+            and "--- /dev/null\n" in artifacts["response_diff_patch"]
+            and artifacts["response_schema_patch_applied"] == str(output),
+            "new-file patch state omitted its empty context, manifest, creation diff, or output path",
+        )
 
     def test_reuse_session_rejects_changed_files(self) -> None:
         target = self.work / "reuse-target.txt"
@@ -1276,8 +1405,6 @@ class OfflineTests:
                 target,
                 "--patch",
                 "--noninteractive",
-                "--patch-save",
-                "off",
                 "--model",
                 "offline-test-model",
                 "--base-url",
@@ -1294,12 +1421,10 @@ class OfflineTests:
             failed = self.run(
                 "--task",
                 "Reuse the changed patch context.",
-                "--reuse-session",
+                "--resume-session",
                 session_name,
                 "--patch",
                 "--noninteractive",
-                "--patch-save",
-                "off",
                 "--model",
                 "offline-test-model",
                 "--base-url",
@@ -1367,7 +1492,7 @@ class OfflineTests:
                 "unexecuted shell commands were not saved",
             )
             resumed = self.run(
-                "--shell", "--reuse-session", session_name, "0",
+                "--shell", "--resume-session", session_name, "0",
                 "--noninteractive",
                 "--model", "offline-test-model",
                 "--base-url", mock.url,
@@ -1488,40 +1613,44 @@ class OfflineTests:
                 }
             },
         ]
-        with MockResponsesAPI(responses) as mock:
-            result = self.run(
-                "--task",
-                "Run the timeout check.",
-                "--shell",
-                "--llm-timeout",
-                "1",
-                "--model",
-                "offline-test-model",
-                "--base-url",
-                mock.url,
-                "--log",
-                "off",
-                "--no-api-log",
-                input_text="y\n",
+        for shell_options, expected_status in (
+            ((), "0"),
+            (("--shell-timeout", "1"), "timeout"),
+        ):
+            with MockResponsesAPI(responses) as mock:
+                result = self.run(
+                    "--task", "Run the timeout check.", "--shell",
+                    "--llm-timeout", "1", *shell_options,
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log",
+                    input_text="y\n",
+                )
+            session_name = session_name_from_result(result, noninteractive=False)
+            require(
+                self.shell_session_response(session_name) == responses[1]["output"],
+                "shell timeout completion reason was not saved",
             )
-        session_name = session_name_from_result(
-            result,
-            noninteractive=False,
-        )
-        shell_response = self.shell_session_response(session_name)
-        require(
-            shell_response.get("action") == "session_end"
-            and shell_response.get("reason")
-            == "Shell timeout output was inspected",
-            "shell timeout completion reason was not saved",
-        )
-        require(len(mock.requests) == 2, "expected initial and follow-up requests")
-        followup_input = str(mock.requests[1].get("input", ""))
-        require(
-            "<exit_status>timeout" in followup_input
-            and "command exceeded timeout of 1 seconds" in followup_input,
-            "shell timeout details were omitted from follow-up",
-        )
+            require(len(mock.requests) == 2, "expected initial and follow-up requests")
+            followup_input = str(mock.requests[1].get("input", ""))
+            artifacts = self.state_artifacts(
+                session_name, "0", "response_shell_output",
+            )
+            shell_output = artifacts["response_shell_output"]
+            require(
+                f"<exit_status>{expected_status}</exit_status>" in shell_output
+                and shell_output in followup_input,
+                "shell timeout status was not saved and sent to the follow-up",
+            )
+            if expected_status == "timeout":
+                require(
+                    "command exceeded timeout of 1 seconds" in shell_output,
+                    "shell timeout details were omitted",
+                )
+            else:
+                require(
+                    "command exceeded timeout" not in shell_output,
+                    "API timeout unexpectedly limited a shell command",
+                )
 
     def test_patch_branch_writes_and_commits(self) -> None:
         repo = self.work / "patch-branch-repo"
@@ -1586,8 +1715,6 @@ class OfflineTests:
                 "feature",
                 "--patch-review",
                 "off",
-                "--patch-save",
-                "off",
                 "--model",
                 "offline-test-model",
                 "--base-url",
@@ -1623,6 +1750,11 @@ class OfflineTests:
             {
                 "request_files",
                 "meta_task_list",
+                "request_agent_turn_metadata",
+                "response_agent_turn_metadata",
+                "request_agent_context_summary",
+                "response_agent_context_summary",
+                "response_reasoning_encrypted_content",
                 "response_schema_patch",
                 "response_shell_output",
                 "response_agent_tool_output",
@@ -1661,8 +1793,8 @@ class OfflineTests:
         input_value = str(request.get("input", ""))
         instructions = str(request.get("instructions", ""))
         require(
-            "Place the task in the system instructions." in instructions,
-            "task was not appended to the system instructions",
+            instructions.startswith("Place the task in the system instructions.\n"),
+            "task was not prepended to the system instructions",
         )
         require(
             "Place the task in the system instructions." not in input_value,
@@ -1738,48 +1870,25 @@ class OfflineTests:
                 }
             ],
         )
-        manifest_path = self.work / "saved-artifacts.json"
-        manifest_path.write_text(
-            json.dumps(manifest),
-            encoding="utf-8",
-        )
         with MockResponsesAPI([{"output": manifest}]) as mock:
             initial = self.run(
-                "--task",
-                "Update the saved patch fixture.",
-                "--files",
-                target,
-                "--patch",
-                "--patch-review",
-                "--patch-save",
-                "--patch-suffix",
-                ".reviewed",
-                "--model",
-                "offline-test-model",
-                "--base-url",
-                mock.url,
-                "--log",
-                "off",
-                "--no-api-log",
+                "--task", "Update the saved patch fixture.",
+                "--files", target, "--patch", "--patch-review",
+                "--patch-suffix", ".reviewed",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
                 input_text="y\n",
             )
-        saved_json_text = re_search(
-            r"patch_json_file=(\S+)",
-            initial.stderr,
-        )
-        require(saved_json_text is not None, "saved patch JSON path was not printed")
-        saved_json = Path(saved_json_text)
-        state = self.run(
-            "--state-print-json",
-            saved_json.stem,
-            "0",
+        require(len(mock.requests) == 1, "expected one patch-artifact request")
+        session_name = session_name_from_result(initial, noninteractive=False)
+        artifacts = self.state_artifacts(
+            session_name, "0",
             "response_schema_patch",
             "response_diff_patch",
             "response_schema_patch_applied",
         )
-        artifacts = json.loads(state.stdout)
         require(
-            "change-updated" in artifacts["response_schema_patch"],
+            json.loads(artifacts["response_schema_patch"]) == manifest,
             "validated patch JSON was not saved in state",
         )
         require(
@@ -1788,7 +1897,7 @@ class OfflineTests:
         )
         reviewed_target = target.with_name(target.name + ".reviewed")
         require(
-            str(reviewed_target) in artifacts["response_schema_patch_applied"],
+            artifacts["response_schema_patch_applied"] == str(reviewed_target),
             "applied patch paths were not saved in state",
         )
         require(
@@ -1797,28 +1906,23 @@ class OfflineTests:
             "reviewed patch output was incorrect",
         )
         printed = self.run(
-            "--patch-file-print",
-            saved_json,
-            "--log",
-            "off",
+            "--patch-file-print", session_name, "0", "--log", "off",
         )
         require(
             "-change" in printed.stdout and "+change-updated" in printed.stdout,
-            "saved patch JSON did not produce the expected diff",
+            "saved session patch did not produce the expected diff",
         )
+        saved_json = self.work / "saved-artifacts.json"
+        saved_json.write_text(artifacts["response_schema_patch"], encoding="utf-8")
         self.run(
-            "--patch-file-apply",
-            saved_json,
-            "--patch-suffix",
-            ".saved",
-            "--log",
-            "off",
+            "--patch-file-apply", saved_json,
+            "--patch-suffix", ".saved", "--log", "off",
         )
         require(
             target.with_name(target.name + ".saved").read_text(
                 encoding="utf-8"
             ) == "keep\nchange-updated\n",
-            "saved patch JSON could not be applied",
+            "exported session patch JSON could not be applied",
         )
 
     def test_patch_deletion_and_replacement_ranges(self) -> None:
@@ -1916,7 +2020,7 @@ class OfflineTests:
             )
             second = self.run(
                 "--shell",
-                "--reuse-session",
+                "--resume-session",
                 session_name,
                 "--noninteractive",
                 "--model",
@@ -2203,8 +2307,8 @@ class OfflineTests:
             result = self.run(
                 "--ask", "Ask without task-mode machinery.",
                 "--files", missing, "--plan", "--patch", "--shell",
-                "--agent", "--agent-auto",
-                "--reuse-session", "nonexistent-session",
+                "--agent",
+                "--resume-session", "nonexistent-session",
                 "--system-prompt", "ask system", "--system-prompt-with-task",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
@@ -2237,7 +2341,7 @@ class OfflineTests:
             )
             session_name = session_name_from_result(first, noninteractive=False)
             second = self.run(
-                "--shell", "--reuse-session", session_name, "1",
+                "--shell", "--resume-session", session_name, "1",
                 "--task", "Use the revised output instead.", "--noninteractive",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--no-api-log",
@@ -2252,8 +2356,11 @@ class OfflineTests:
             "<shell_revision" in revision_input
             and "<previous_task>\nRun the original check.\n</previous_task>" in revision_input
             and "printf old-output" in revision_input
-            and "Use the revised output instead." in revision_input,
-            "revision did not recover the last command turn before session_end",
+            and str(mock.requests[2]["instructions"]).startswith(
+                "Use the revised output instead.\n"
+            )
+            and "Use the revised output instead." not in revision_input,
+            "revision did not recover the last command turn or place the updated task correctly",
         )
         state = json.loads(self.run(
             "--state-print-json", session_name, "2",
@@ -2323,7 +2430,7 @@ class OfflineTests:
         ]
         with MockResponsesAPI(responses) as mock:
             result = self.run(
-                "--task", "Apply an agent patch.", "--agent", "--agent-auto",
+                "--task", "Apply an agent patch.", "--agent",
                 "--agent-context-expires", "3", "1", "4",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
@@ -2363,7 +2470,7 @@ class OfflineTests:
             and "<current_unix_time>" in followup,
             "patch companion did not refresh numbered, timestamped file context",
         )
-        history = followup.split("<agent_history>\n", 1)[1].split("\n</agent_history>", 1)[0]
+        history = prompt_section(followup, "agent_history")
         require(
             history.count("<agent_turn") == 1,
             "patch readfile companion incorrectly created a separate history turn",
@@ -2407,13 +2514,13 @@ class OfflineTests:
         ]
         with MockResponsesAPI(responses) as mock:
             result = self.run(
-                "--task", "Maintain an atomic task list.", "--agent", "--agent-auto",
+                "--task", "Maintain an atomic task list.", "--agent",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
         require(len(mock.requests) == 4, "unexpected task-list controller request count")
         failed_followup = str(mock.requests[2]["input"])
-        task_block = failed_followup.split("<meta_task_list>\n", 1)[1].split("\n</meta_task_list>", 1)[0]
+        task_block = prompt_section(failed_followup, "meta_task_list")
         require(
             task_block.splitlines()[0] == "1. [todo] Capacity task 1"
             and len(task_block.splitlines()) == 25
@@ -2421,7 +2528,7 @@ class OfflineTests:
             "failed task-list batch partially changed the persistent tasks",
         )
         final_followup = str(mock.requests[3]["input"])
-        final_block = final_followup.split("<meta_task_list>\n", 1)[1].split("\n</meta_task_list>", 1)[0]
+        final_block = prompt_section(final_followup, "meta_task_list")
         require(
             len(final_block.splitlines()) == 25
             and final_block.splitlines()[0] == "1. [todo] Capacity task 2"
@@ -2444,13 +2551,13 @@ class OfflineTests:
         with MockResponsesAPI(["Invalid plain-text controller answer", ended]) as mock:
             result = self.run(
                 "--task", "Exercise controller response recovery.",
-                "--agent", "--agent-auto", "--retry", "1",
+                "--agent", "--retry", "1",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--no-api-log",
             )
         require(
             len(mock.requests) == 2 and mock.requests[0] == mock.requests[1]
-            and "Agent response failed (attempt 1/2)" in result.stderr,
+            and "Agent request failed (attempt 1/2)" in result.stderr,
             "invalid controller response was not retried with the same request",
         )
         session_name = session_name_from_result(result, noninteractive=False)
@@ -2469,7 +2576,7 @@ class OfflineTests:
         log = (self.home / ".local/state/mince/logs" / f"{session_name}.txt").read_text(
             encoding="utf-8",
         )
-        require("Agent response failed (attempt 1/2)" in log, "controller retry was not logged")
+        require("Agent request failed (attempt 1/2)" in log, "controller retry was not logged")
         meta_only = MockResponsesAPI.tool_response(("meta_context_control", {
             "action": "pin", "context_id": "turn:1", "reason": "No executable call",
         }))
@@ -2480,13 +2587,13 @@ class OfflineTests:
             with MockResponsesAPI([invalid]) as mock:
                 failed = self.run(
                     "--task", "Reject an invalid controller call batch.",
-                    "--agent", "--agent-auto", "--retry", "0",
+                    "--agent", "--retry", "0",
                     "--model", "offline-test-model", "--base-url", mock.url,
                     "--log", "off", "--no-api-log", check=False,
                 )
             require(
                 failed.returncode != 0 and len(mock.requests) == 1
-                and "Agent response failed (attempt 1/1)" in failed.stderr,
+                and "Agent request failed (attempt 1/1)" in failed.stderr,
                 "invalid controller ordering or session companion was accepted",
             )
 
@@ -2518,13 +2625,21 @@ class OfflineTests:
                 "agent profile listing omitted the description",
             )
             tool_name = f"agent_{names[0]}"
+            controller_reasoning = MockResponsesAPI.reasoning_item("controller")
+            worker_reasoning = MockResponsesAPI.reasoning_item("worker")
             responses = [
-                MockResponsesAPI.tool_response((tool_name, {
-                    "task": "Return the worker answer.",
-                    "context": "Worker-only context",
-                    "reason": "Delegate the structured answer",
-                })),
-                {"output": {"answer": "worker result"}},
+                {
+                    **MockResponsesAPI.tool_response((tool_name, {
+                        "task": "Return the worker answer.",
+                        "context": "Worker-only context",
+                        "reason": "Delegate the structured answer",
+                    })),
+                    "reasoning_items": [controller_reasoning],
+                },
+                {
+                    "output": {"answer": "worker result"},
+                    "reasoning_items": [worker_reasoning],
+                },
                 MockResponsesAPI.tool_response(("session", {
                     "action": "end", "reason": "Worker completed",
                 })),
@@ -2532,7 +2647,7 @@ class OfflineTests:
             with MockResponsesAPI(responses) as mock:
                 result = self.run(
                     "--task", "Delegate to the selected worker.",
-                    "--agent", "--agent-auto", "--agent-profile", names[0],
+                    "--agent", "--agent-profile", names[0],
                     "--model", "offline-test-model", "--base-url", mock.url,
                     "--log", "off", "--no-api-log",
                 )
@@ -2547,19 +2662,45 @@ class OfflineTests:
                     "type": "json_schema", "name": tool_name, "strict": True, "schema": schema,
                 }
                 and "tools" not in worker_request
-                and "Worker-only context" in worker_request["input"]
+                and "Worker-only context" in request_prompt(worker_request)
                 and "Produce an offline structured answer." in worker_request["instructions"],
                 "worker schema, context, or description was not propagated",
             )
             require(
-                "worker result" in mock.requests[2]["input"],
+                "worker result" in request_prompt(mock.requests[2]),
                 "worker result was not returned to the controller history",
             )
+            require(
+                all(request.get("include") == ["reasoning.encrypted_content"]
+                    for request in mock.requests),
+                "controller or worker requests did not request encrypted reasoning",
+            )
+            for request, reasoning_item in (
+                (worker_request, controller_reasoning),
+                (mock.requests[2], worker_reasoning),
+            ):
+                require(
+                    request["input"] == [
+                        reasoning_item,
+                        {"role": "user", "content": request_prompt(request)},
+                    ],
+                    "delegation did not replay the latest reasoning before the user prompt",
+                )
             session_name = session_name_from_result(result, noninteractive=False)
             session_dir = self.home / ".local/state/mince/state" / session_name
             require(
                 sorted(path.name for path in session_dir.iterdir() if path.is_dir()) == ["0", "1"],
                 "worker request should not create a separate controller state turn",
+            )
+            saved_reasoning = self.state_artifacts(
+                session_name, "0", "response_reasoning_encrypted_content",
+            )
+            require(
+                json.loads(saved_reasoning["response_reasoning_encrypted_content"])
+                == [worker_reasoning]
+                and "response_reasoning_encrypted_content"
+                not in self.state_artifacts(session_name, "1"),
+                "worker reasoning was not persisted or absent final reasoning retained stale state",
             )
         finally:
             for name in names:
@@ -2648,7 +2789,7 @@ class OfflineTests:
         with MockResponsesAPI([{"output": original}, {"output": revised}]) as mock:
             result = self.run(
                 "--task", original_task, "--files", target,
-                "--patch", "--patch-review", "--patch-save", "off",
+                "--patch", "--patch-review",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
                 input_text=f"E {revision_task}\n<\n>\ny\n",
@@ -2658,9 +2799,10 @@ class OfflineTests:
         require(
             f"<json_patch_task>\n{original_task}\n</json_patch_task>" in revision_input
             and "first-proposal" in revision_input
-            and revision_task in revision_input
+            and str(mock.requests[1]["instructions"]).startswith(revision_task + "\n")
+            and revision_task not in revision_input
             and "1 original" in revision_input,
-            "patch revision omitted the previous task, proposal, or original file context",
+            "patch revision omitted prior context or misplaced the updated task",
         )
         require(
             target.read_text(encoding="utf-8") == "revised-proposal\n"
@@ -2709,7 +2851,7 @@ class OfflineTests:
             turn_dir = self.home / ".local/state/mince/state" / session_name / "0"
             saved_output = (turn_dir / "response_shell_output").read_text(encoding="utf-8")
             resumed = self.run(
-                "--shell", "--reuse-session", session_name, "0", "--noninteractive",
+                "--shell", "--resume-session", session_name, "0", "--noninteractive",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
@@ -2766,14 +2908,14 @@ class OfflineTests:
         ]
         with MockResponsesAPI(responses) as mock:
             self.run(
-                "--task", task, "--agent", "--agent-auto",
+                "--task", task, "--agent",
                 "--agent-context-expires", "1", "0", "2",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
         require(len(mock.requests) == 6, "unexpected context-retention controller request count")
         file_contexts = [
-            str(request["input"]).split("<files ", 1)[1].split("\n</files>", 1)[0]
+            prompt_section(str(request["input"]), "files")
             for request in mock.requests
         ]
         require(
@@ -2818,7 +2960,7 @@ class OfflineTests:
         ]
         with MockResponsesAPI(responses) as mock:
             first = self.run(
-                "--task", task, "--agent", "--agent-auto",
+                "--task", task, "--agent",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
@@ -2830,7 +2972,7 @@ class OfflineTests:
             )
             target.write_text("Current disk context\n", encoding="utf-8")
             resumed = self.run(
-                "--agent", "--agent-auto", "--reuse-session", session_name, "1",
+                "--agent", "--resume-session", session_name, "1",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
@@ -2840,12 +2982,12 @@ class OfflineTests:
             "agent reuse changed sessions or replayed completed tool calls",
         )
         resumed_input = str(mock.requests[4]["input"])
-        task_block = resumed_input.split("<meta_task_list>\n", 1)[1].split("\n</meta_task_list>", 1)[0]
-        history = resumed_input.split("<agent_history>\n", 1)[1].split("\n</agent_history>", 1)[0]
+        task_block = prompt_section(resumed_input, "meta_task_list")
+        history = prompt_section(resumed_input, "agent_history")
         require(
             task_block == "1. [todo] Inspect the resumed fixture"
             and history.count("<agent_turn") == 2
-            and task in resumed_input,
+            and str(mock.requests[4]["instructions"]).startswith(task + "\n"),
             "agent reuse did not reconstruct the selected turn's task list and history",
         )
         require(
@@ -2856,6 +2998,20 @@ class OfflineTests:
         require(
             "1. [done] Inspect the resumed fixture" in mock.requests[5]["input"],
             "resumed task-list changes were not returned to the controller",
+        )
+        selected_metadata = json.loads(self.state_artifacts(
+            session_name, "1", "response_agent_turn_metadata",
+        )["response_agent_turn_metadata"])
+        resumed_metadata = json.loads(self.state_artifacts(
+            session_name, "4", "request_agent_turn_metadata",
+        )["request_agent_turn_metadata"])
+        require(
+            selected_metadata["turn_range"] == resumed_metadata["turn_range"] == [1, 2]
+            and selected_metadata["turn_count"] == resumed_metadata["turn_count"] == 2
+            and resumed_metadata["meta_task_list"] == tasks
+            and [entry["expires_in_turns"] for entry in resumed_metadata["turns"]]
+            == [entry["expires_in_turns"] - 1 for entry in selected_metadata["turns"]],
+            "agent resume did not restore saved history IDs, tasks, and remaining expiry",
         )
         session_dir = self.home / ".local/state/mince/state" / session_name
         require(
@@ -3056,7 +3212,7 @@ class OfflineTests:
         ]
         with MockResponsesAPI(responses) as mock:
             result = self.run(
-                "--task", task, "--agent", "--agent-auto",
+                "--task", task, "--agent",
                 "--agent-hook-context", successful, unsuccessful, missing,
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log", input_text=stdin_marker,
@@ -3102,17 +3258,13 @@ class OfflineTests:
         with MockResponsesAPI(responses) as mock:
             result = self.run(
                 "--task", "Refresh the offline readfile fixture.",
-                "--agent", "--agent-auto",
+                "--agent",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
         require(len(mock.requests) == 4, "unexpected readfile-refresh controller request count")
-        original_files = str(mock.requests[1]["input"]).split(
-            "<files ", 1,
-        )[1].split("\n</files>", 1)[0]
-        refreshed_files = str(mock.requests[3]["input"]).split(
-            "<files ", 1,
-        )[1].split("\n</files>", 1)[0]
+        original_files = prompt_section(str(mock.requests[1]["input"]), "files")
+        refreshed_files = prompt_section(str(mock.requests[3]["input"]), "files")
         require(
             "1 Original readfile context" in original_files
             and "1 Refreshed readfile context" in refreshed_files
@@ -3159,7 +3311,7 @@ class OfflineTests:
             }],
         }
         cases = [
-            ("patch", patch, ("--patch", "--patch-review", "--patch-save", "off")),
+            ("patch", patch, ("--patch", "--patch-review")),
             ("shell", shell, ("--shell",)),
         ]
         for name, proposal, options in cases:
@@ -3217,8 +3369,8 @@ class OfflineTests:
             original_state = self.state_artifacts(session_name, "0")
             target.write_text(changed_source, encoding="utf-8")
             resumed = self.run(
-                "--task", revision_task, "--reuse-session", session_name, "0",
-                "--reuse-session-skip-verify", *common,
+                "--task", revision_task, "--resume-session", session_name, "0",
+                "--resume-session-skip-verify", *common,
             )
         require(
             session_name_from_result(resumed, noninteractive=True) == session_name
@@ -3226,13 +3378,12 @@ class OfflineTests:
             "checksum-skip patch reuse changed sessions or made unexpected requests",
         )
         revision_input = str(mock.requests[1]["input"])
-        previous_manifest = revision_input.split(
-            "<json_patch>\n", 1,
-        )[1].split("\n</json_patch>", 1)[0]
+        previous_manifest = prompt_section(revision_input, "json_patch")
         require(
             f"<json_patch_task>\n{original_task}\n</json_patch_task>" in revision_input
             and json.loads(previous_manifest) == original
-            and revision_task in revision_input
+            and str(mock.requests[1]["instructions"]).startswith(revision_task + "\n")
+            and revision_task not in revision_input
             and "1 changed-source" in revision_input,
             "patch reuse omitted the saved proposal, previous task, or current file context",
         )
@@ -3271,7 +3422,7 @@ class OfflineTests:
         with MockResponsesAPI(responses) as mock:
             result = self.run(
                 "--task", "Apply an agent patch using the explicit suffix.",
-                "--agent", "--agent-auto", "--patch-suffix", ".agent",
+                "--agent", "--patch-suffix", ".agent",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
@@ -3328,7 +3479,7 @@ class OfflineTests:
         with MockResponsesAPI(responses) as mock:
             result = self.run(
                 "--task", "Check task-list rejection and removal numbering.",
-                "--agent", "--agent-auto",
+                "--agent",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off", "--no-api-log",
             )
@@ -3342,9 +3493,7 @@ class OfflineTests:
             (3, "task does not exist: 26"),
         ):
             prompt = str(mock.requests[request_index]["input"])
-            task_block = prompt.split(
-                "<meta_task_list>\n", 1,
-            )[1].split("\n</meta_task_list>", 1)[0]
+            task_block = prompt_section(prompt, "meta_task_list")
             require(
                 task_block.splitlines() == original_lines and diagnostic in prompt,
                 "rejected overflow or removal partially changed the task list or omitted its error",
@@ -3355,9 +3504,7 @@ class OfflineTests:
         ]
         expected_tasks[1]["status"] = "done"
         expected_tasks.extend(replacements)
-        final_block = str(mock.requests[4]["input"]).split(
-            "<meta_task_list>\n", 1,
-        )[1].split("\n</meta_task_list>", 1)[0]
+        final_block = prompt_section(str(mock.requests[4]["input"]), "meta_task_list")
         require(
             final_block.splitlines() == [
                 f"{number}. [{task['status']}] {task['task']}"
@@ -3372,15 +3519,942 @@ class OfflineTests:
             "task-list removal snapshot differs from the final controller context",
         )
 
+    def test_session_reasoning_replay(self) -> None:
+        target = self.work / "reasoning-context.txt"
+        target.write_text("Offline reasoning context\n", encoding="utf-8")
+        task = "Preserve reasoning across the resumed task."
+        reasoning_item = MockResponsesAPI.reasoning_item("replay")
+        responses = [
+            {
+                "output_text": "First reasoning answer",
+                "reasoning_items": [reasoning_item],
+            },
+            "Resumed reasoning answer",
+        ]
+        with MockResponsesAPI(responses) as mock:
+            first = self.run(
+                "--task", task, "--files", target, "--print-reasoning",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+            session_name = session_name_from_result(first, noninteractive=False)
+            original_state = self.state_artifacts(session_name, "0")
+            resumed = self.run(
+                "--resume-session", session_name, "0",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(
+            first.stdout == "<think>\nOffline reasoning summary\n</think>\n\nFirst reasoning answer\n"
+            and resumed.stdout == "Resumed reasoning answer\n"
+            and session_name_from_result(resumed, noninteractive=False) == session_name,
+            "reasoning output or resumed session identity was incorrect",
+        )
+        require(
+            len(mock.requests) == 2
+            and all(request.get("include") == ["reasoning.encrypted_content"]
+                    for request in mock.requests),
+            "stateful requests did not request encrypted reasoning",
+        )
+        resumed_input = mock.requests[1]["input"]
+        require(
+            isinstance(resumed_input, list) and len(resumed_input) == 2
+            and resumed_input[0] == reasoning_item
+            and resumed_input[1]["role"] == "user"
+            and "1 Offline reasoning context" in resumed_input[1]["content"]
+            and str(mock.requests[1]["instructions"]).startswith(task + "\n"),
+            "resumed request did not replay saved reasoning and recover task context",
+        )
+        next_state = self.state_artifacts(session_name, "1")
+        require(
+            json.loads(original_state["response_reasoning_encrypted_content"]) == [reasoning_item]
+            and self.state_artifacts(session_name, "0") == original_state
+            and next_state["request_task"] == task
+            and next_state["response"] == "Resumed reasoning answer"
+            and "response_reasoning_encrypted_content" not in next_state,
+            "reasoning replay modified old state or retained absent reasoning in a new turn",
+        )
+
+    def test_agent_review_modes(self) -> None:
+        cases = [
+            ("saved", ("--agent-review", "--noninteractive"), None, False, True),
+            ("rejected", ("--agent-review",), "n\n", False, False),
+            ("accepted", ("--agent-review",), "y\ny\ny\n", True, False),
+            ("automatic", ("--noninteractive",), None, True, True),
+        ]
+        for name, options, review_input, executed, noninteractive in cases:
+            marker = self.work / f"agent-review-{name}.txt"
+            shell = MockResponsesAPI.tool_response(("shell", {
+                "commands": [{
+                    "command": f"printf executed > {shlex.quote(str(marker))}",
+                    "reason": "Record whether the agent shell tool was accepted",
+                }],
+            }))
+            ended = MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Agent review check completed",
+            }))
+            with MockResponsesAPI([shell, ended] if executed else [shell]) as mock:
+                result = self.run(
+                    "--task", "Inspect the offline agent review mode.", "--agent", *options,
+                    "--model", "offline-test-model", "--base-url", mock.url,
+                    "--log", "off", "--no-api-log", input_text=review_input,
+                )
+            session_name = session_name_from_result(result, noninteractive=noninteractive)
+            artifacts = self.state_artifacts(session_name, "0")
+            require(
+                len(mock.requests) == (2 if executed else 1)
+                and marker.exists() == executed
+                and json.loads(artifacts["response"])["tool"] == "shell",
+                f"{name} agent review made an unexpected request or executed an unaccepted tool",
+            )
+            if executed:
+                require(
+                    marker.read_text(encoding="utf-8") == "executed"
+                    and "<exit_status>0</exit_status>" in artifacts["response_shell_output"]
+                    and artifacts["response_agent_tool_output"] == artifacts["response_shell_output"],
+                    f"{name} agent review did not persist the accepted shell output",
+                )
+            else:
+                require(
+                    "response_shell_output" not in artifacts
+                    and "response_agent_tool_output" not in artifacts,
+                    f"{name} agent review recorded execution for an unexecuted proposal",
+                )
+            if noninteractive:
+                require(
+                    result.stdout == f"{session_name}\n",
+                    "noninteractive agent output should contain only its session name",
+                )
+            elif executed:
+                require(
+                    "Run these agent tool calls?" in result.stdout
+                    and "Run these shell commands?" in result.stdout,
+                    "agent-review did not review both the controller call and shell command",
+                )
+        failed = self.run("--agent-review", check=False)
+        require(
+            failed.returncode == 2 and "--agent-review requires --agent" in failed.stderr,
+            "agent-review was accepted without agent mode",
+        )
+
+    def test_agent_markdown_context_summary(self) -> None:
+        target = self.work / "summarized-agent-context.txt"
+        target.write_text("Context to summarize\n", encoding="utf-8")
+        summary = f"# Offline summary\n\nThe file was inspected.\n\n- `{target}`: temporary fixture."
+        responses = [
+            MockResponsesAPI.tool_response(("readfile", {"paths": [str(target)]})),
+            MockResponsesAPI.tool_response(("meta_context_control", {
+                "action": "summary", "context_id": "all",
+                "reason": summary, "expires_in_turns": 1,
+            })),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Markdown context summary checked",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Summarize the inspected offline context.", "--agent",
+                "--agent-context-expires", "3", "1", "4",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 3, "unexpected context-summary request count")
+        followup = str(mock.requests[2]["input"])
+        require(
+            prompt_section(followup, "agent_context_summary") == summary
+            and "<agent_context_summary expires_in_turns='3'>" in followup
+            and prompt_section(followup, "files") == ""
+            and "1 Context to summarize" not in followup,
+            "Markdown summary did not replace the summarized file context with default summary expiry",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        snapshot = json.loads(self.state_artifacts(
+            session_name, "1", "response_agent_context_summary",
+        )["response_agent_context_summary"])
+        require(
+            snapshot["content"] == summary
+            and snapshot["removed_turn_numbers"] == [1]
+            and snapshot["expires_in_turns"] == 3,
+            "context summary content, compacted history, or expiry was not persisted",
+        )
+
+    def test_deprecated_option_aliases(self) -> None:
+        target = self.work / "deprecated-alias-patch.txt"
+        target.write_text("alias-original\n", encoding="utf-8")
+        manifest = self._patch_manifest(
+            target, patches=[self._replacement_patch(["alias-proposal"])],
+        )
+        ended = MockResponsesAPI.tool_response(("session", {
+            "action": "end", "reason": "Deprecated agent alias checked",
+        }))
+        with MockResponsesAPI([{"output": manifest}, {"output": manifest}, ended]) as mock:
+            common = (
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+            saved = self.run(
+                "--task", "Save the deprecated-option proposal.", "--files", target,
+                "--patch", "--patch-save", "off", "--noninteractive", *common,
+            )
+            session_name = session_name_from_result(saved, noninteractive=True)
+            target.write_text("alias-changed\n", encoding="utf-8")
+            resumed = self.run(
+                "--task", "Revise the deprecated-option proposal.", "--patch",
+                "--reuse-session", session_name, "0", "--reuse-session-skip-verify",
+                "--patch-save", "on", "--noninteractive", *common,
+            )
+            automatic = self.run(
+                "--task", "Check the deprecated automatic agent alias.",
+                "--agent", "--agent-auto", *common,
+            )
+        require(
+            len(mock.requests) == 3
+            and session_name_from_result(resumed, noninteractive=True) == session_name
+            and "--reuse-session is deprecated; use --resume-session instead." in resumed.stderr
+            and "--reuse-session-skip-verify is deprecated; use --resume-session-skip-verify instead."
+            in resumed.stderr
+            and "--agent-auto is deprecated; use --agent instead." in automatic.stderr
+            and "Tool: session" in automatic.stdout,
+            "deprecated session or agent aliases lost compatibility or their warnings",
+        )
+        for turn, result in (("0", saved), ("1", resumed)):
+            artifacts = self.state_artifacts(session_name, turn)
+            require(
+                "--patch-save is deprecated and has no effect" in result.stderr
+                and json.loads(artifacts["response_schema_patch"]) == manifest
+                and "response_schema_patch_applied" not in artifacts,
+                "deprecated patch-save changed unconditional session persistence",
+            )
+        require(
+            target.read_text(encoding="utf-8") == "alias-changed\n"
+            and not target.with_name(target.name + ".mcepatched").exists(),
+            "deprecated aliases unexpectedly applied a noninteractive patch",
+        )
+
+    def test_agent_ignores_standalone_patch_and_shell_options(self) -> None:
+        target = self.work / "agent-only-context.txt"
+        source = "Agent-only context\n"
+        target.write_text(source, encoding="utf-8")
+        missing_manifest = self.work / "ignored-agent-patch.json"
+        ended = MockResponsesAPI.tool_response(("session", {
+            "action": "end", "reason": "Conflicting standalone options were ignored",
+        }))
+        with MockResponsesAPI([ended]) as mock:
+            result = self.run(
+                "--task", "Run only the agent controller.", "--files", target, "--agent",
+                "--patch", "--patch-branch", "ignored",
+                "--patch-branch-remove", "ignored", "--patch-merge", "Ignored merge",
+                "--patch-file-apply", missing_manifest,
+                "--patch-file-print", missing_manifest, "--shell",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(
+            len(mock.requests) == 1 and "Tool: session" in result.stdout,
+            "standalone options prevented or added work to the agent controller request",
+        )
+        request = mock.requests[0]
+        require(
+            request.get("tool_choice") == "required" and bool(request.get("tools"))
+            and request["text"]["format"] == {"type": "text"}
+            and "1 Agent-only context" in request_prompt(request),
+            "conflicting options changed the agent response format, tools, or file context",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        artifacts = self.state_artifacts(session_name, "0")
+        require(
+            json.loads(artifacts["response"])["tool"] == "session"
+            and "response_schema_patch" not in artifacts
+            and "response_shell_output" not in artifacts
+            and target.read_text(encoding="utf-8") == source
+            and not target.with_name(target.name + ".mcepatched").exists()
+            and not missing_manifest.exists(),
+            "ignored standalone options applied changes or recorded a standalone tool execution",
+        )
+
+    def test_agent_readfile_budget_and_missing_expiry(self) -> None:
+        large = self.work / "over-budget-agent-context.txt"
+        small = self.work / "usable-agent-context.txt"
+        missing = self.work / "missing-agent-context.txt"
+        # Stay below the file-size limit while exceeding the input token budget.
+        source = "Budget-only sentinel " + "x " * 100000 + "\n"
+        large.write_text(source, encoding="utf-8")
+        small.write_text("Usable readfile context\n", encoding="utf-8")
+        task = "Inspect bounded and missing offline readfile context."
+        responses = [
+            MockResponsesAPI.tool_response(("readfile", {
+                "paths": [str(large), str(missing), str(small)],
+                "expires_in_turns": 4,
+            })),
+            MockResponsesAPI.tool_response(("agent", {
+                "task": task, "context": "", "reason": "Advance missing-file expiry",
+            })),
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Bounded readfile context checked",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", task, "--agent", "--no-line-numbers",
+                "--agent-context-expires", "3", "1", "4",
+                "--token-limit", "65534",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 3, "unexpected bounded-readfile request count")
+        session_name = session_name_from_result(result, noninteractive=False)
+        artifacts = self.state_artifacts(
+            session_name, "0", "response_agent_file_contexts",
+        )
+        entries = json.loads(artifacts["response_agent_file_contexts"])
+        contexts = {entry["path"]: entry["section"] for entry in entries}
+        require(
+            len(entries) == 3 and set(contexts) == {str(large), str(missing), str(small)}
+            and "error='TOKEN LIMIT EXCEEDED: file could not be loaded'" in contexts[str(large)]
+            and "total_lines='1'>" in contexts[str(large)]
+            and contexts[str(large)].split("\n", 1)[1] == "</file>"
+            and f"error='MISSING FILE: {missing}'" in contexts[str(missing)]
+            and "expires_in_turns='1'" in contexts[str(missing)]
+            and "1 Usable readfile context" in contexts[str(small)]
+            and all("last_refreshed_time='" in section for section in contexts.values()),
+            "readfile did not persist bounded errors, minimum missing-file expiry, and usable numbered context",
+        )
+        first_files = prompt_section(request_prompt(mock.requests[1]), "files")
+        final_files = prompt_section(request_prompt(mock.requests[2]), "files")
+        require(
+            f"path='{missing}'" in first_files and "expires_in_turns='0'" in first_files
+            and f"path='{missing}'" not in final_files
+            and "TOKEN LIMIT EXCEEDED: file could not be loaded" in first_files
+            and all(
+                "1 Usable readfile context" in files
+                for files in (first_files, final_files)
+            ),
+            "missing-file context did not expire independently of the retained readfile turn",
+        )
+        require(
+            all("1 Budget-only sentinel" not in request_prompt(request) for request in mock.requests)
+            and large.read_text(encoding="utf-8") == source and not missing.exists(),
+            "over-budget content reached the controller or readfile modified its input paths",
+        )
+
+    def test_agent_automatic_context_summary_and_resume(self) -> None:
+        target = self.work / "automatic-summary-context.txt"
+        target.write_text(
+            "Automatic summary fixture\n" + "context " * 4096 + "\n",
+            encoding="utf-8",
+        )
+        task = "Compact the offline agent context and preserve its state."
+        ended = MockResponsesAPI.tool_response(("session", {
+            "action": "end", "reason": "Automatic context summary checked",
+        }))
+        common = (
+            "--agent", "--agent-context-expires", "3", "1", "4",
+            "--model", "offline-test-model", "--log", "off", "--no-api-log",
+        )
+        # Measure the real controller envelope rather than duplicating tokenization.
+        with MockResponsesAPI([ended]) as calibration:
+            self.run(
+                "--task", task, "--files", target, *common,
+                "--base-url", calibration.url,
+            )
+        require(len(calibration.requests) == 1, "summary calibration made an extra request")
+        estimate = re_search(
+            r"<current_token_estimate token_estimate='(\d+)'",
+            request_prompt(calibration.requests[0]),
+        )
+        require(estimate is not None, "controller request omitted its token estimate")
+        token_limit = int(str(estimate)) + 1024
+        summary = f"# Automatic offline summary\n\n- `{target}`: inspected temporary fixture."
+        with MockResponsesAPI([summary, ended, ended]) as mock:
+            result = self.run(
+                "--task", task, "--files", target, *common,
+                "--token-limit", token_limit, "--base-url", mock.url,
+            )
+            session_name = session_name_from_result(result, noninteractive=False)
+            compacted = self.state_artifacts(
+                session_name, "0", "response", "response_agent_context_summary",
+                "response_agent_turn_metadata",
+            )
+            resumed = self.run(
+                "--resume-session", session_name, "0", *common,
+                "--token-limit", token_limit, "--base-url", mock.url,
+            )
+        require(
+            len(mock.requests) == 3
+            and session_name_from_result(resumed, noninteractive=False) == session_name,
+            "automatic summary or summary-turn resume made unexpected requests or changed sessions",
+        )
+        summary_request = mock.requests[0]
+        require(
+            "tools" not in summary_request and "tool_choice" not in summary_request
+            and summary_request["text"]["format"] == {"type": "text"}
+            and "1 Automatic summary fixture" in request_prompt(summary_request),
+            "automatic compaction did not request Markdown without tools using the visible file context",
+        )
+        for request in mock.requests[1:]:
+            prompt = request_prompt(request)
+            require(
+                request.get("tool_choice") == "required" and bool(request.get("tools"))
+                and str(request["instructions"]).startswith(task + "\n")
+                and prompt_section(prompt, "files") == ""
+                and prompt_section(prompt, "agent_context_summary") == summary
+                and "<agent_context_summary expires_in_turns='3'>" in prompt,
+                "controller continuation or resume lost the summary or restored compacted file context",
+            )
+        snapshot = json.loads(compacted["response_agent_context_summary"])
+        metadata = json.loads(compacted["response_agent_turn_metadata"])
+        require(
+            compacted["response"] == summary and snapshot["content"] == summary
+            and snapshot["removed_file_paths"] == [str(target)]
+            and snapshot["removed_turn_numbers"] == [] and snapshot["expires_in_turns"] == 3
+            and metadata["turn_count"] == 0 and metadata["file_expires_in_turns"] == {}
+            and metadata["pinned_file_paths"] == [],
+            "automatic summary did not persist Markdown and compact even pinned initial file context",
+        )
+        session_dir = self.home / ".local/state/mince/state" / session_name
+        require(
+            sorted(path.name for path in session_dir.iterdir() if path.is_dir()) == ["0", "1", "2"]
+            and self.state_artifacts(
+                session_name, "0", "response", "response_agent_context_summary",
+                "response_agent_turn_metadata",
+            ) == compacted,
+            "resuming a summary-only turn overwrote saved state or created extra controller turns",
+        )
+
+    def test_agent_summary_expiry_refreshes_live_context(self) -> None:
+        target = self.work / "summary-refresh-context.txt"
+        target.write_text("Live context after the initial summary\n", encoding="utf-8")
+        initial_summary = "# Initial offline summary\n\nNo file context has been loaded yet."
+        refreshed_summary = f"# Refreshed offline summary\n\n- `{target}`: active readfile fixture."
+        responses = [
+            MockResponsesAPI.tool_response(("meta_context_control", {
+                "action": "summary", "context_id": "all", "reason": initial_summary,
+            })),
+            MockResponsesAPI.tool_response(("readfile", {
+                "paths": [str(target)], "expires_in_turns": 2,
+            })),
+            refreshed_summary,
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Expired context summary refreshed",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            result = self.run(
+                "--task", "Refresh an expired summary without compacting live context.",
+                "--agent", "--agent-context-expires", "1", "0", "2",
+                "--model", "offline-test-model", "--base-url", mock.url,
+                "--log", "off", "--no-api-log",
+            )
+        require(len(mock.requests) == 4, "expired summary was not refreshed exactly once")
+        refresh_request = mock.requests[2]
+        refresh_prompt = request_prompt(refresh_request)
+        final_prompt = request_prompt(mock.requests[3])
+        require(
+            "tools" not in refresh_request
+            and refresh_request["text"]["format"] == {"type": "text"}
+            and prompt_section(refresh_prompt, "agent_context_summary") == initial_summary
+            and "<agent_context_summary expires_in_turns='0'>" in refresh_prompt
+            and "1 Live context after the initial summary" in prompt_section(refresh_prompt, "files")
+            and "<file turn='2' expires_in_turns='2'" in refresh_prompt,
+            "expiry refresh omitted the old summary or advanced live context before summarizing",
+        )
+        require(
+            mock.requests[3].get("tool_choice") == "required"
+            and prompt_section(final_prompt, "agent_context_summary") == refreshed_summary
+            and "<agent_context_summary expires_in_turns='1'>" in final_prompt
+            and "1 Live context after the initial summary" in prompt_section(final_prompt, "files")
+            and "<file turn='2' expires_in_turns='1'" in final_prompt,
+            "summary refresh compacted live files or advanced their expiry more than once",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        state = self.state_artifacts(
+            session_name, "2", "response", "response_agent_context_summary",
+            "response_agent_turn_metadata",
+        )
+        snapshot = json.loads(state["response_agent_context_summary"])
+        before_metadata = json.loads(state["response_agent_turn_metadata"])
+        next_metadata = json.loads(self.state_artifacts(
+            session_name, "3", "request_agent_turn_metadata",
+        )["request_agent_turn_metadata"])
+        before_turn = next(entry for entry in before_metadata["turns"] if entry["state_turn"] == 1)
+        next_turn = next(entry for entry in next_metadata["turns"] if entry["state_turn"] == 1)
+        require(
+            state["response"] == refreshed_summary and snapshot["content"] == refreshed_summary
+            and snapshot["expires_in_turns"] == 1
+            and snapshot["removed_file_paths"] == [] and snapshot["removed_turn_numbers"] == []
+            and before_metadata["turn_count"] == next_metadata["turn_count"] == 2
+            and before_turn["expires_in_turns"] == 2 and next_turn["expires_in_turns"] == 1
+            and set(next_turn["readfile_contexts"]) == {str(target)},
+            "summary refresh state lost live history, changed turn IDs, or persisted incorrect expiry",
+        )
+
+    def test_contain_default_command_and_passthrough(self) -> None:
+        task = "Quoted 'offline' task; $(printf never-run)\nSecond line"
+        arguments = ("--task", task, "--files", "context with spaces.txt", "--quiet")
+        command = self.contain_command(*arguments, cwd=self.work)
+        properties = systemd_properties(command)
+        expected = {
+            "Type": "exec",
+            "ProtectSystem": "strict",
+            "ProtectHome": "read-only",
+            "PrivateTmp": "yes",
+            "PrivateDevices": "yes",
+            "NoNewPrivileges": "yes",
+            "ProtectClock": "yes",
+            "ProtectControlGroups": "yes",
+            "ProtectHostname": "yes",
+            "ProtectKernelLogs": "yes",
+            "ProtectKernelModules": "yes",
+            "ProtectKernelTunables": "yes",
+            "LockPersonality": "yes",
+            "RestrictRealtime": "yes",
+            "RestrictSUIDSGID": "yes",
+            "RestrictNamespaces": "yes",
+        }
+        require(
+            command[0] == str(self.systemd_run)
+            and all(option in command for option in ("--user", "--quiet", "--wait", "--collect", "--pipe"))
+            and "--pty" not in command
+            and f"--working-directory={self.work.resolve()}" in command
+            and all(properties.get(name) == value for name, value in expected.items()),
+            "default containment service flags or hardening properties were incorrect",
+        )
+        state = self.home / ".local/state/mince"
+        require(
+            shlex.split(properties["ReadWritePaths"]) == [str(state)]
+            and "PrivateNetwork" not in properties
+            and "RestrictAddressFamilies" not in properties
+            and "RuntimeMaxSec" not in properties
+            and contained_arguments(command) == ["mince", *arguments],
+            "default containment grants, networking, timeout, or argument forwarding were incorrect",
+        )
+        stopped = self.contain_command(
+            "--task", task, "--", "--contain-home", "invalid", "-W", "missing",
+            cwd=self.work,
+        )
+        require(
+            contained_arguments(stopped)
+            == ["mince", "--task", task, "--contain-home", "invalid", "-W", "missing"]
+            and systemd_properties(stopped)["ProtectHome"] == "read-only",
+            "wrapper separator did not stop containment option parsing",
+        )
+
+    def test_contain_modes_and_shell_selection(self) -> None:
+        state = self.home / ".local/state/mince"
+        state.mkdir(parents=True, exist_ok=True)
+        cases = [
+            ("readonly", "persistent", "on", "host", (), "read-only", "persistent"),
+            ("private", "temporary", "off", "private",
+             ("--contain-allow-namespaces", "--contain-timeout=9"), "tmpfs", "ephemeral"),
+            ("inaccessible", "readonly", "off", "off", (), "yes", "read-only"),
+            ("off", "persistent", "false", "on", ("--contain-no-private-tmp",), "no", "persistent"),
+        ]
+        for home, state_mode, private_tmp, network, extra, expected_home, expected_state in cases:
+            command = self.contain_command(
+                f"--contain-home={home}", "--contain-state", state_mode,
+                "--contain-private-tmp", private_tmp, f"--contain-network={network}",
+                *extra, "--print-default-config", cwd=self.work,
+            )
+            properties = systemd_properties(command)
+            require(
+                properties["ProtectHome"] == expected_home
+                and properties["PrivateTmp"] == ("yes" if private_tmp == "on" else "no")
+                and properties["PrivateDevices"] == "yes"
+                and ("RestrictNamespaces" not in properties)
+                == ("--contain-allow-namespaces" in extra),
+                "containment visibility, temporary directory, device, or namespace mode was incorrect",
+            )
+            if network in ("private", "off"):
+                require(
+                    properties.get("PrivateNetwork") == "yes"
+                    and properties.get("RestrictAddressFamilies") == "AF_UNIX",
+                    "disabled containment networking omitted its restrictions",
+                )
+            else:
+                require(
+                    "PrivateNetwork" not in properties and "RestrictAddressFamilies" not in properties,
+                    "host containment networking unexpectedly added restrictions",
+                )
+            require(
+                properties.get("RuntimeMaxSec") == ("9s" if "--contain-timeout=9" in extra else None),
+                "containment runtime limit was not applied only when requested",
+            )
+            writable = shlex.split(properties.get("ReadWritePaths", ""))
+            read_only = shlex.split(properties.get("ReadOnlyPaths", ""))
+            temporary = shlex.split(properties.get("TemporaryFileSystem", ""))
+            if expected_state == "read-only":
+                require(
+                    str(state) in read_only and str(state) not in writable and not temporary,
+                    "read-only state was exposed as writable or ephemeral",
+                )
+            else:
+                require(
+                    str(state) in writable and str(state) not in read_only
+                    and temporary == ([f"{state}:rw"] if expected_state == "ephemeral" else []),
+                    "persistent or ephemeral state grants were incorrect",
+                )
+                if expected_state == "ephemeral":
+                    require(
+                        str(state) not in shlex.split(properties.get("BindPaths", "")),
+                        "ephemeral state explicitly bound the host state directory",
+                    )
+        shell_path = shutil.which("sh")
+        require(shell_path is not None, "sh is required for shell-selection coverage")
+        command = self.contain_command(
+            "--contain-use-shell", "--agent", "--task", "Ignored shell-mode arguments",
+            cwd=self.work, environment_updates={"SHELL": "sh"},
+        )
+        require(
+            contained_arguments(command) == [str(Path(str(shell_path)).absolute())]
+            and systemd_properties(command)["PrivateDevices"] == "yes",
+            "shell mode did not resolve SHELL through PATH or ignored arguments changed its command",
+        )
+
+    def test_contain_grants_and_bindings(self) -> None:
+        selected = self.work / "contain grants"
+        selected.mkdir()
+        read_only = selected / 'read % "quoted" \\path.txt'
+        read_only.write_text("read-only fixture\n", encoding="utf-8")
+        source_tree = selected / "source-tree"
+        source_tree.mkdir()
+        source_write = selected / "write-source.txt"
+        source_write.write_text("bound fixture\n", encoding="utf-8")
+        link_source = self.root / "source outside.txt"
+        link_source.write_text("linked fixture\n", encoding="utf-8")
+        link = self.root / "contain-link.txt"
+        link.symlink_to(link_source)
+        mapped_read = selected / "mapped-read"
+        mapped_write = selected / "mapped-write.txt"
+        command = self.contain_command(
+            "--contain-working-directory", selected.name,
+            "--contain-read-path", read_only.name,
+            "--contain-read-only-path", link,
+            f"--contain-write-path={link}", "-W", link,
+            "--contain-bind-read-only", source_tree.name, mapped_read.name,
+            "--contain-bind-write", source_write.name, mapped_write.name,
+            "--print-default-config", cwd=self.work,
+        )
+        properties = systemd_properties(command)
+        writable = shlex.split(properties["ReadWritePaths"])
+        read_paths = shlex.split(properties["ReadOnlyPaths"])
+        bindings = shlex.split(properties["BindPaths"])
+        require(
+            f"--working-directory={selected.resolve()}" in command
+            and read_paths.count(str(read_only).replace("%", "%%")) == 1
+            and str(mapped_read) in read_paths
+            and str(mapped_write) in writable
+            and writable.count(str(link)) == 1
+            and str(link) not in read_paths
+            and str(source_write) not in writable,
+            "relative grants, path quoting, deduplication, or writable precedence were incorrect",
+        )
+        require(
+            f"{source_tree.resolve()}:{mapped_read}" in bindings
+            and f"{source_write.resolve()}:{mapped_write}" in bindings
+            and f"{link_source.resolve()}:{link}" in bindings,
+            "custom or symlink visibility bindings omitted their source and destination",
+        )
+        destinations = [binding.partition(":")[2] or binding for binding in bindings]
+        ordering = [(len(Path(destination).parts), destination) for destination in destinations]
+        require(
+            ordering == sorted(ordering)
+            and read_only.read_text(encoding="utf-8") == "read-only fixture\n"
+            and source_write.read_text(encoding="utf-8") == "bound fixture\n"
+            and not mapped_read.exists() and not mapped_write.exists(),
+            "dry-run reordered bindings incorrectly or modified fixture paths",
+        )
+
+    def test_contain_mapped_working_directory_grants(self) -> None:
+        source = self.work / "mapped-contain-source"
+        destination = self.work / "mapped-contain-work"
+        source.mkdir()
+        destination.mkdir()
+        covered_source = source / "covered.txt"
+        covered_source.write_text("Covered source fixture\n", encoding="utf-8")
+        covered = destination / covered_source.name
+        covered.symlink_to(covered_source)
+        mapped_override = source / "override.txt"
+        mapped_override.write_text("Mapped source fixture\n", encoding="utf-8")
+        override = destination / mapped_override.name
+        override.write_text("Explicit host fixture\n", encoding="utf-8")
+        command = self.contain_command(
+            "--contain-working-directory", destination,
+            "--contain-bind-read-only", source, destination,
+            "--contain-write-path", covered.name,
+            "--contain-write-path", override.name,
+            "--print-default-config", cwd=self.work,
+        )
+        properties = systemd_properties(command)
+        bindings = shlex.split(properties["BindPaths"])
+        parent_binding = f"{source.resolve()}:{destination.resolve()}"
+        require(
+            parent_binding in bindings and str(destination) not in bindings
+            and str(override) in bindings
+            and str(covered) not in bindings
+            and f"{covered_source.resolve()}:{covered}" not in bindings
+            and bindings.index(parent_binding) < bindings.index(str(override)),
+            "visibility bindings replaced a mapped work directory, duplicated a covered grant, or hid an explicit override",
+        )
+        require(
+            f"--working-directory={destination.resolve()}" in command
+            and str(destination) in shlex.split(properties["ReadOnlyPaths"])
+            and {str(covered), str(override)}.issubset(
+                shlex.split(properties["ReadWritePaths"])
+            )
+            and covered.is_symlink()
+            and covered.read_text(encoding="utf-8") == "Covered source fixture\n"
+            and mapped_override.read_text(encoding="utf-8") == "Mapped source fixture\n"
+            and override.read_text(encoding="utf-8") == "Explicit host fixture\n",
+            "mapped containment grants had incorrect permissions or dry-run modified host fixtures",
+        )
+
+    def test_contain_nested_shell_options(self) -> None:
+        writable = self.work / "nested-write"
+        other = self.work / "nested other"
+        bound_source = self.work / "nested-bind-source"
+        bound_destination = self.work / "nested-bind-destination"
+        for directory in (writable, other, bound_source):
+            directory.mkdir()
+        task = "Run contained shell work."
+        for modes in (
+            ("--shell",), ("--shell=off",), ("--agent",),
+            ("--agent", "--shell"), ("--shell", "--agent"),
+        ):
+            command = self.contain_command(
+                "--task", task, "-W", writable.name, "--contain-write-path", other,
+                "--contain-bind-write", bound_source, bound_destination,
+                *modes, "--quiet", cwd=self.work,
+            )
+            require(
+                contained_arguments(command)
+                == ["mince", "--task", task, "--contain", writable.name, str(other), *modes, "--quiet"]
+                and systemd_properties(command)["PrivateDevices"] == "no"
+                and systemd_properties(command)["RestrictNamespaces"] == "yes",
+                "nested containment did not forward write grants exactly once before the first mode option",
+            )
+        empty = self.contain_command("--shell", cwd=self.work)
+        require(
+            contained_arguments(empty) == ["mince", "--contain", "--shell"],
+            "nested shell containment without grants omitted the empty containment option",
+        )
+        stopped = self.contain_command(
+            "--", "--", "--agent", "--contain-home", "invalid", cwd=self.work,
+        )
+        require(
+            contained_arguments(stopped) == ["mince", "--", "--agent", "--contain-home", "invalid"]
+            and systemd_properties(stopped)["PrivateDevices"] == "yes",
+            "mince argument separator did not stop nested-mode detection",
+        )
+
+    def test_contain_validation(self) -> None:
+        directory = self.work / "contain-validation"
+        directory.mkdir()
+        other_directory = self.work / "contain-validation-other"
+        other_directory.mkdir()
+        regular = directory / "regular.txt"
+        regular.write_text("validation fixture\n", encoding="utf-8")
+        missing = directory / "missing"
+        destination = directory / "destination"
+        fifo = directory / "fifo"
+        os.mkfifo(fifo)
+        capture = self.work / "invalid-containment-executed.json"
+        cases = [
+            (("--contain-unknown",), "unknown containment option"),
+            (("-W",), "requires an argument"),
+            (("--contain-read-path=",), "argument cannot be empty"),
+            (("--contain-bind-write", regular), "requires SOURCE and DESTINATION"),
+            (("--contain-home=invalid",), "must be read-only, tmpfs, inaccessible, or off"),
+            (("--contain-state=invalid",), "must be persistent, ephemeral, or read-only"),
+            (("--contain-private-tmp=invalid",), "must be on or off"),
+            (("--contain-network=invalid",), "must be host or none"),
+            (("--contain-timeout=0",), "must be a positive integer"),
+            (("--contain-timeout=-1",), "must be a positive integer"),
+            (("--contain-timeout=invalid",), "must be a positive integer"),
+            (("--contain-working-directory", missing), "working directory does not exist"),
+            (("--contain-working-directory", regular), "working directory is not a directory"),
+            (("--contain-write-path", missing), "writable path does not exist"),
+            (("--contain-read-path", fifo), "existing regular file or directory"),
+            (("--contain-read-path", "bad\npath"), "cannot contain control characters"),
+            (("--contain-bind-read-only", missing, destination), "bind source does not exist"),
+            (("--contain-bind-write", regular, directory), "must both be files or both be directories"),
+            (("--contain-bind-read-only", directory, destination,
+              "--contain-bind-write", other_directory, destination),
+             "multiple bind sources target the same destination"),
+            (("--contain-bind-write", regular, directory / "destination:invalid"), "cannot contain ':'"),
+        ]
+        for arguments, diagnostic in cases:
+            failed = self.run(
+                "--contain-dry-run", *arguments, executable="mince-contain",
+                cwd=self.work, check=False,
+                environment_updates={"MINCE_TEST_SYSTEMD_CAPTURE": str(capture)},
+            )
+            require(
+                failed.returncode == 2 and diagnostic in failed.stderr
+                and failed.stdout == "" and not capture.exists(),
+                f"invalid containment arguments {arguments!r} were accepted or executed: {failed.stderr}",
+            )
+        for shell, diagnostic in ((None, "requires SHELL to be set"), (str(missing), "executable was not found")):
+            failed = self.run(
+                "--contain-use-shell", executable="mince-contain",
+                cwd=self.work, check=False, environment_updates={"SHELL": shell},
+            )
+            require(
+                failed.returncode == 2 and diagnostic in failed.stderr,
+                "invalid SHELL was accepted by the containment wrapper",
+            )
+        failed = self.run(
+            "--contain-state", "read-only", "--contain-dry-run",
+            executable="mince-contain", cwd=self.work, check=False,
+            environment_updates={"HOME": str(self.root / "missing-contain-home")},
+        )
+        require(
+            failed.returncode == 2 and "read-only Mince state directory does not exist" in failed.stderr,
+            "read-only containment state was silently created",
+        )
+        isolated_bin = self.root / "no-systemd-bin"
+        isolated_bin.mkdir()
+        wrapper = shutil.which("mince-contain")
+        require(wrapper is not None, "mince-contain was not found on PATH")
+        (isolated_bin / "mince-contain").symlink_to(Path(str(wrapper)).absolute())
+        (isolated_bin / "python3").symlink_to(sys.executable)
+        environment = {"PATH": str(isolated_bin)}
+        no_arguments = self.run(
+            executable="mince-contain", environment_updates=environment,
+        )
+        help_result = self.run(
+            "--contain-help", executable="mince-contain", environment_updates=environment,
+        )
+        failed = self.run(
+            "--contain-dry-run", "--print-default-config",
+            executable="mince-contain", environment_updates=environment, check=False,
+        )
+        require(
+            "No arguments supplied." in no_arguments.stdout
+            and "Usage: mince-contain" in help_result.stdout
+            and failed.returncode == 2 and "systemd-run was not found on PATH" in failed.stderr,
+            "wrapper help required systemd-run or a missing systemd-run was not reported",
+        )
+
+    def test_contain_exec_and_environment(self) -> None:
+        selected = self.work / "contain-exec"
+        selected.mkdir()
+        capture = self.work / "contain-exec.json"
+        secret = "offline-secret-not-for-command-lines"
+        environment = {
+            "MINCE_TEST_SYSTEMD_CAPTURE": str(capture),
+            "MINCE_TEST_SYSTEMD_EXECUTE": "1",
+            "OPENAI_API_KEY": secret,
+            "MINCE_TEST_SECRET": secret,
+            "MINCE-INVALID-NAME": "invalid environment name",
+            "INVOCATION_ID": "stale-service-id",
+            "JOURNAL_STREAM": "stale-journal-stream",
+            "LISTEN_FDS": "0",
+            "NOTIFY_SOCKET": "stale-notify-socket",
+            "PWD": str(self.root / "stale-working-directory"),
+        }
+        arguments = ("--contain-working-directory", selected, "--print-default-config")
+        command = self.contain_command(
+            *arguments, cwd=self.work, environment_updates=environment,
+        )
+        environment_flags = [
+            argument for argument in command[:command.index("--")]
+            if argument.startswith("--setenv=")
+        ]
+        imported_names = [argument[len("--setenv="):] for argument in environment_flags[:-1]]
+        require(
+            all(f"--setenv={name}" in environment_flags
+                for name in ("PATH", "HOME", "OPENAI_API_KEY", "MINCE_TEST_SECRET"))
+            and imported_names == sorted(imported_names)
+            and all("=" not in name for name in imported_names)
+            and environment_flags[-1] == f"--setenv=PWD={selected.resolve()}"
+            and not any(f"--setenv={name}" in environment_flags for name in (
+                "MINCE-INVALID-NAME", "INVOCATION_ID", "JOURNAL_STREAM", "LISTEN_FDS", "NOTIFY_SOCKET",
+            ))
+            and secret not in shlex.join(command),
+            "containment environment import exposed values, imported service metadata, or retained stale PWD",
+        )
+        result = self.run(
+            *arguments, executable="mince-contain", cwd=self.work,
+            environment_updates=environment,
+        )
+        recorded = json.loads(capture.read_text(encoding="utf-8"))
+        expected_path = os.pathsep.join(
+            (str(self.contain_bin), os.environ.get("PATH", os.defpath))
+        )
+        require(
+            json.loads(result.stdout)["retry"] == 3
+            and recorded["arguments"] == command[1:]
+            and recorded["environment"]["PATH"] == expected_path
+            and recorded["environment"]["HOME"] == str(self.home)
+            and recorded["environment"]["OPENAI_API_KEY"] == secret
+            and contained_arguments(command) == ["mince", "--print-default-config"],
+            "wrapper execution did not preserve arguments and environment or resolve mince through PATH",
+        )
+        failed = self.run(
+            *arguments, executable="mince-contain", cwd=self.work, check=False,
+            environment_updates={
+                **environment,
+                "MINCE_TEST_SYSTEMD_EXECUTE": "0",
+                "MINCE_TEST_SYSTEMD_STATUS": "7",
+            },
+        )
+        require(
+            failed.returncode == 7 and failed.stdout == "" and failed.stderr == "",
+            "wrapper execution did not propagate the systemd-run exit status",
+        )
+
     def close(self) -> None:
         self._temporary_directory.cleanup()
 
 
 def re_search(pattern: str, text: str) -> str | None:
-    import re
-
     match = re.search(pattern, text)
     return match.group(1) if match else None
+
+
+def request_prompt(request: dict[str, Any]) -> str:
+    input_value = request.get("input")
+    if isinstance(input_value, str):
+        return input_value
+    require(isinstance(input_value, list), "request input was neither text nor an item array")
+    messages = [
+        item for item in input_value
+        if isinstance(item, dict) and item.get("role") == "user"
+    ]
+    require(
+        len(messages) == 1 and isinstance(messages[0].get("content"), str),
+        "request input did not contain exactly one text user message",
+    )
+    return str(messages[0]["content"])
+
+
+def prompt_section(prompt: str, tag: str) -> str:
+    section = re_search(
+        rf"(?s)<{re.escape(tag)}(?:\s[^>]*)?>\n(.*?)\n</{re.escape(tag)}>",
+        prompt,
+    )
+    require(section is not None, f"request prompt omitted <{tag}>")
+    return str(section)
+
+
+def contained_arguments(command: list[str]) -> list[str]:
+    require("--" in command, "systemd-run command omitted its argument separator")
+    return command[command.index("--") + 1:]
+
+
+def systemd_properties(command: list[str]) -> dict[str, str]:
+    require("--" in command, "systemd-run command omitted its argument separator")
+    properties: dict[str, str] = {}
+    for argument in command[:command.index("--")]:
+        if not argument.startswith("--property="):
+            continue
+        name, separator, value = argument[len("--property="):].partition("=")
+        require(
+            bool(separator) and bool(name) and name not in properties,
+            f"invalid or duplicate systemd property: {argument}",
+        )
+        properties[name] = value
+    return properties
 
 
 def session_name_from_result(
@@ -3424,19 +4498,20 @@ def main() -> int:
         ("validates patches and preserves line endings", "test_saved_patch_validation_and_line_endings"),
         ("reviews patches interactively without a suffix", "test_patch_review_without_suffix"),
         ("handles text and JSON responses from a local API", "test_text_and_json_api_responses"),
-        ("handles streamed text responses", "test_streaming_text_response"),
+        ("handles streamed text and buffered reasoning responses", "test_streaming_text_response"),
         ("streams text responses to an output file", "test_streaming_text_response_to_output_file"),
         ("enables text streaming from configuration", "test_streaming_from_configuration"),
         ("preserves prompt placement and line-number overrides", "test_prompt_placement_and_line_number_override"),
         ("handles custom JSON-schema responses", "test_custom_schema_response"),
         ("validates and writes an API patch response", "test_api_patch"),
-        ("records patch artifacts and reapplies saved JSON", "test_patch_state_artifacts_and_saved_json"),
+        ("creates API patch files without initial context", "test_api_patch_creates_file_without_context"),
+        ("records session patch artifacts and reapplies exported JSON", "test_patch_state_artifacts_and_saved_json"),
         ("applies deletion and replacement patch ranges", "test_patch_deletion_and_replacement_ranges"),
-        ("rejects reused sessions with changed files", "test_reuse_session_rejects_changed_files"),
+        ("rejects resumed sessions with changed files", "test_reuse_session_rejects_changed_files"),
         ("executes shell scripts and saves state offline", "test_shell_script_and_state"),
         ("handles shell follow-up commands and failures", "test_shell_followup_commands_and_failures"),
-        ("reports shell command timeouts", "test_shell_timeout_is_reported"),
-        ("reuses completed shell sessions without an extra request", "test_successful_shell_session_reuse"),
+        ("separates shell execution timeouts from API timeouts", "test_shell_timeout_is_reported"),
+        ("resumes completed shell sessions without an extra request", "test_successful_shell_session_reuse"),
         ("writes and commits patch changes on a git branch", "test_patch_branch_writes_and_commits"),
         ("merges and removes patch branches", "test_patch_branch_merge_and_remove"),
         ("rejects invalid patch ranges, content, endings, and duplicate paths", "test_patch_rejects_invalid_inputs"),
@@ -3444,17 +4519,19 @@ def main() -> int:
         ("repairs JSON and controls explicit prompt caching", "test_json_repair_and_explicit_prompt_cache"),
         ("retries transient but not permanent API failures", "test_api_retry_classification"),
         ("disables conflicting task modes for ask requests", "test_ask_disables_task_modes"),
+        ("ignores standalone patch and shell options in agent mode", "test_agent_ignores_standalone_patch_and_shell_options"),
         ("revises the last shell command turn after session completion", "test_shell_session_revision"),
         ("restricts shell network address families unless enabled", "test_shell_network_address_families"),
         ("applies native agent patches and refreshes companion file context", "test_agent_patch_readfile_companion"),
+        ("bounds readfile content and expires missing files independently", "test_agent_readfile_budget_and_missing_expiry"),
         ("updates persistent agent tasks atomically at capacity", "test_agent_task_list_atomic_capacity"),
-        ("retries invalid agent responses and rejects invalid call batches", "test_agent_controller_retries"),
-        ("manages agent profiles and delegates schema-constrained worker requests", "test_agent_profile_worker"),
+        ("retries invalid agent requests and rejects invalid call batches", "test_agent_controller_retries"),
+        ("manages agent profiles and replays reasoning across worker delegation", "test_agent_profile_worker"),
         ("reviews plans and preserves accepted, rejected, and saved state", "test_plan_review_and_saved_state"),
         ("navigates patch revisions and applies the selected state turn", "test_patch_revision_navigation"),
-        ("reuses saved shell output without executing commands again", "test_shell_reuse_keeps_existing_output"),
+        ("resumes saved shell output without executing commands again", "test_shell_reuse_keeps_existing_output"),
         ("pins agent file context and extends unpinned context expiry", "test_agent_context_control_and_expiry"),
-        ("restores selected agent history, tasks, and persisted file context", "test_agent_reuse_restores_selected_history"),
+        ("restores selected agent history, tasks, file context, and remaining expiry", "test_agent_reuse_restores_selected_history"),
         ("redacts API keys in configuration output and session logs", "test_api_key_redaction"),
         ("writes text and JSON output files without duplicating stdout", "test_text_and_json_output_files"),
         ("estimates tokens and rejects oversized requests before API calls", "test_input_token_estimation_and_limit"),
@@ -3462,9 +4539,22 @@ def main() -> int:
         ("runs agent hooks per turn and omits failed output and stdin", "test_agent_hook_context_scripts"),
         ("refreshes readfile context without retaining stale files or overwriting snapshots", "test_agent_readfile_refresh_removes_stale_context"),
         ("preserves rejected tool proposals without applying patches or executing commands", "test_tool_review_rejections"),
-        ("revises saved patches with checksum verification explicitly skipped", "test_patch_reuse_skip_verify"),
+        ("revises resumed patches with checksum verification explicitly skipped", "test_patch_reuse_skip_verify"),
         ("honors explicit automatic-agent patch suffixes without modifying source files", "test_agent_patch_explicit_suffix"),
         ("rejects task-list overflow atomically and renumbers removal batches", "test_agent_task_list_capacity_and_removals"),
+        ("persists encrypted reasoning and replays it when resuming a task", "test_session_reasoning_replay"),
+        ("distinguishes automatic, reviewed, rejected, and saved agent execution", "test_agent_review_modes"),
+        ("compacts agent context into persisted Markdown summaries", "test_agent_markdown_context_summary"),
+        ("automatically compacts pinned context and resumes summary-only turns", "test_agent_automatic_context_summary_and_resume"),
+        ("refreshes expired summaries without compacting or double-aging live context", "test_agent_summary_expiry_refreshes_live_context"),
+        ("retains deprecated option compatibility with explicit warnings", "test_deprecated_option_aliases"),
+        ("builds default containment commands and preserves argument boundaries", "test_contain_default_command_and_passthrough"),
+        ("selects containment state, visibility, network, runtime, and shell modes", "test_contain_modes_and_shell_selection"),
+        ("resolves, quotes, deduplicates, and orders containment grants and bindings", "test_contain_grants_and_bindings"),
+        ("preserves mapped working directories and exposes explicit grant overrides", "test_contain_mapped_working_directory_grants"),
+        ("forwards nested shell containment grants and respects argument separators", "test_contain_nested_shell_options"),
+        ("rejects invalid containment options and paths before execution", "test_contain_validation"),
+        ("imports containment environment by name and executes commands through PATH", "test_contain_exec_and_environment"),
     ]
     print("TAP version 13")
     print(f"1..{len(tests)}")

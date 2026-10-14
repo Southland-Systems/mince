@@ -63,6 +63,7 @@ class WrapperOptions:
     home_mode: str = "read-only"
     state_mode: str = "persistent"
     private_tmp: bool = True
+    private_devices: bool = True
     network_mode: str = "host"
     runtime_seconds: int | None = None
     allow_namespaces: bool = False
@@ -502,7 +503,18 @@ def resolve_contained_command(
     invocation_directory: Path,
 ) -> tuple[list[str], list[PathGrant]]:
     if not options.use_shell:
-        return ["mince", *mince_arguments], runtime_path_grants(
+        command = ["mince", *mince_arguments]
+        for index, argument in enumerate(mince_arguments, start=1):
+            if argument == "--":
+                break
+            if argument.partition("=")[0] in ("--agent", "--shell"):
+                options.private_devices = False
+                command[index:index] = [
+                    "--contain",
+                    *options.write_paths,
+                ]
+                break
+        return command, runtime_path_grants(
             find_python(), invocation_directory
         )
 
@@ -609,7 +621,11 @@ def build_systemd_command(
         "--property=ProtectSystem=strict",
         f"--property=ProtectHome={options.home_mode}",
         f"--property=PrivateTmp={'yes' if options.private_tmp else 'no'}",
-        "--property=PrivateDevices=yes",
+        (
+            "--property=PrivateDevices=yes"
+            if options.private_devices
+            else "--property=PrivateDevices=no"
+        ),
         "--property=NoNewPrivileges=yes",
         "--property=ProtectClock=yes",
         "--property=ProtectControlGroups=yes",
