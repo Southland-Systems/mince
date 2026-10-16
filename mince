@@ -30,7 +30,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random, string
 import dbm
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import difflib
 import pydoc
@@ -3685,7 +3685,7 @@ def write_patch_files(
         write_text_preserving_line_endings(target_path, updated_text)
         written_paths.append(str(target_path))
         if VERBOSE:
-            print(f"file_written={target_path}")
+            print(f"patch_file_written={target_path}")
     return written_paths
 
 
@@ -4011,38 +4011,90 @@ def usage_to_dict(usage: Any) -> dict[str, Any] | None:
 @dataclass
 class ModelRequestTimer:
     start_time: float | None = None
+    initial_start_time: float | None = None
 
     def reset(self) -> None:
         self.start_time = time.perf_counter()
+        if self.initial_start_time is None:
+            self.initial_start_time = self.start_time
 
-    def elapsed(self) -> float:
-        if self.start_time is None:
+    def elapsed(self, total: bool = False) -> float:
+        start_time = self.initial_start_time if total else self.start_time
+        if start_time is None:
             return 0.0
-        return time.perf_counter() - self.start_time
+        return time.perf_counter() - start_time
+
+
+RESPONSE_TOKEN_KEYS = ("input_tokens", "output_tokens", "total_tokens")
 
 
 def print_stats(
     *,
     request_characters: int,
     request_tokens: int,
-    processing_time: float | None = None,
+    processing_time: float = 0.0,
     response_text: str,
     usage: dict[str, Any] | None = None,
     response_cost: str | None = None,
+    turn: int | None = None,
  ) -> str:
-    stats: list[str] = [
+    stats: list[str] = [f"turn={turn}"] if turn is not None else []
+    stats.extend([
         f"processing_time={int(processing_time)}s",
         f"request_characters={request_characters}",
         f"request_tokens_estimate={request_tokens}",
         f"response_characters={len(response_text)}",
-    ]
+    ])
     if usage:
-        for key in ("input_tokens", "output_tokens", "total_tokens"):
+        for key in RESPONSE_TOKEN_KEYS:
             if key in usage:
                 stats.append(f"response_{key}={usage[key]}")
     if response_cost is not None:
         stats.append(response_cost)
     return " ".join(stats)
+
+
+@dataclass
+class CumulativeStats:
+    processing_time: float = 0.0
+    usage: dict[str, int] = field(default_factory=dict)
+    enabled: bool = False
+    token_cost: tuple[float, float] | None = None
+    log_path: Path | None = None
+    log_enabled: bool = False
+
+    def add(
+        self,
+        processing_time: float,
+        usage: dict[str, Any] | None,
+    ) -> None:
+        self.processing_time += processing_time
+        usage = usage or {}
+        for key in RESPONSE_TOKEN_KEYS:
+            self.usage[key] = (
+                self.usage.get(key, 0) + coerce_int(usage.get(key), 0)
+            )
+
+    def emit(self) -> None:
+        if not self.enabled:
+            return
+        usage = {key: self.usage.get(key, 0) for key in RESPONSE_TOKEN_KEYS}
+        stats = [f"total_processing_time={int(self.processing_time)}s"]
+        stats.extend(
+            f"total_response_{key}={usage[key]}"
+            for key in RESPONSE_TOKEN_KEYS
+        )
+        response_cost = response_cost_line(self.token_cost, usage)
+        if response_cost is not None:
+            stats.append(f"total_{response_cost}")
+        statsline = " ".join(stats)
+        append_session_log(
+            self.log_path,
+            f"<cumulative_stats>\n{statsline}\n</cumulative_stats>\n",
+            self.log_enabled,
+        )
+        if VERBOSE:
+            print(statsline, file=sys.stderr)
 
 def coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -4787,6 +4839,7 @@ class AgentContextSummary:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "turn_number_base": 0,
             "content": self.content,
             "removed_file_paths": list(self.removed_file_paths),
             "removed_turn_numbers": list(self.removed_turn_numbers),
@@ -4869,13 +4922,14 @@ class AgentRunSettings:
     context_summary: AgentContextSummary | None = None
     initial_reasoning_items: tuple[dict[str, Any], ...] = ()
     initial_turn_metadata: dict[str, Any] | None = None
+    initial_turn_number_base: int = 0
     refresh_initial_file_contexts: bool = False
+    cumulative_stats: CumulativeStats = field(default_factory=CumulativeStats)
 
 @dataclass(frozen=True)
 class AgentModelResult:
     response: str
     reasoning: str
-    statsline: str
     turn_dir: Path | None
     turn_unix_time: int | None = None
     tool_calls: tuple[AgentToolCall, ...] = ()
@@ -6062,8 +6116,8 @@ def advance_agent_history_purges(
             continue
         turn = advance_agent_readfile_context_expirations(
             turn,
-            turn_index + 1,
-            turn_index + 1 in pinned_turn_numbers,
+            turn_index,
+            turn_index in pinned_turn_numbers,
         )
         turns[turn_index] = turn
         if turn.expires_in_turns > 0:
@@ -6072,7 +6126,7 @@ def advance_agent_history_purges(
                 expires_in_turns=turn.expires_in_turns - 1,
             )
             continue
-        if turn_index + 1 not in pinned_turn_numbers:
+        if turn_index not in pinned_turn_numbers:
             remove_agent_history_turn(
                 turns,
                 turn_index,
@@ -6085,7 +6139,7 @@ def agent_history_turn_numbers(
     turn_numbers: list[int] | None = None,
  ) -> list[int]:
     if turn_numbers is None:
-        turn_numbers = list(range(1, len(turns) + 1))
+        turn_numbers = list(range(len(turns)))
     if len(turn_numbers) != len(turns):
         raise ValueError("agent turn numbers must match agent turns")
     return [
@@ -6103,7 +6157,7 @@ def format_agent_history(
     visible_turn_numbers: set[int] | None = None,
  ) -> str:
     if turn_numbers is None:
-        turn_numbers = list(range(1, len(turns) + 1))
+        turn_numbers = list(range(len(turns)))
     if pinned_turn_numbers is None:
         pinned_turn_numbers = set()
     if len(turn_numbers) != len(turns):
@@ -6213,6 +6267,7 @@ def resolve_agent_context_pin(
     file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
     available_turn_numbers: set[int] | None = None,
+    turn_number_base: int = 0,
 ) -> tuple[str, str | int]:
     for path, _ in file_contexts:
         if agent_context_path_matches(context_id, path):
@@ -6224,12 +6279,12 @@ def resolve_agent_context_pin(
         flags=re.IGNORECASE,
     )
     if turn_match is not None:
-        turn_number = int(turn_match.group(1))
+        turn_number = int(turn_match.group(1)) - turn_number_base
         if available_turn_numbers is None:
-            available_turn_numbers = set(range(1, len(turns) + 1))
+            available_turn_numbers = set(range(len(turns)))
         if turn_number in available_turn_numbers:
             return "turn", turn_number
-        if 1 <= turn_number <= len(turns):
+        if 0 <= turn_number < len(turns):
             raise ValueError(f"agent turn has expired: turn:{turn_number}")
         raise ValueError(f"agent turn does not exist: turn:{turn_number}")
 
@@ -6245,12 +6300,14 @@ def apply_agent_context_control(
     file_expires_in_turns: dict[str, int],
     pinned_paths: set[str],
     pinned_turn_numbers: set[int],
+    turn_number_base: int = 0,
 ) -> None:
     target_type, target = resolve_agent_context_pin(
         tool_call.context_id,
         file_contexts,
         turns,
         set(agent_history_turn_numbers(turns)),
+        turn_number_base=turn_number_base,
     )
     if tool_call.action == "pin":
         if target_type == "file":
@@ -6261,7 +6318,7 @@ def apply_agent_context_control(
         if target_type == "file":
             file_expires_in_turns[str(target)] = tool_call.expires_in_turns
         else:
-            turn_index = int(target) - 1
+            turn_index = int(target)
             turns[turn_index] = replace(
                 turns[turn_index],
                 expires_in_turns=tool_call.expires_in_turns,
@@ -6384,6 +6441,17 @@ def validate_agent_context_summary(
     return content
 
 
+def saved_agent_turn_number_base(snapshot: dict[str, Any]) -> int:
+    value = snapshot.get("turn_number_base", 1)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in (0, 1)
+    ):
+        raise ValueError("saved agent turn number base must be 0 or 1")
+    return value
+
+
 def load_state_agent_context_summary(
     turn_dir: Path,
     default_expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT,
@@ -6409,10 +6477,12 @@ def load_state_agent_context_summary(
         "content", "removed_file_paths", "removed_turn_numbers",
         "active_context_checksum",
     }
-    if not isinstance(value, dict) or set(value) not in (
-        expected_fields, expected_fields | {"expires_in_turns"}
+    if not isinstance(value, dict) or not (
+        expected_fields <= set(value)
+        <= expected_fields | {"expires_in_turns", "turn_number_base"}
     ):
         raise ValueError(f"invalid agent context summary snapshot: {artifact_path}")
+    turn_number_base = saved_agent_turn_number_base(value)
     content = value["content"]
     if not isinstance(content, str):
         raise ValueError("saved agent context summary content must be a string")
@@ -6428,10 +6498,12 @@ def load_state_agent_context_summary(
         raise ValueError("saved agent context summary file paths must be strings")
     turn_numbers = value["removed_turn_numbers"]
     if not isinstance(turn_numbers, list) or any(
-        isinstance(number, bool) or not isinstance(number, int) or number < 1
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or number < turn_number_base
         for number in turn_numbers
     ):
-        raise ValueError("saved agent context summary turn numbers must be positive integers")
+        raise ValueError("saved agent context summary turn numbers must be non-negative integers")
     checksum = value["active_context_checksum"]
     if not isinstance(checksum, str) or (
         checksum and re.fullmatch(r"[0-9a-f]{64}", checksum) is None
@@ -6447,7 +6519,9 @@ def load_state_agent_context_summary(
     return AgentContextSummary(
         content=content,
         removed_file_paths=tuple(file_paths),
-        removed_turn_numbers=tuple(turn_numbers),
+        removed_turn_numbers=tuple(
+            number - turn_number_base for number in turn_numbers
+        ),
         active_context_checksum=checksum,
         expires_in_turns=expires_in_turns,
     )
@@ -6691,7 +6765,7 @@ def build_agent_turn_metadata(
     meta_task_list: list[dict[str, Any]],
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
-    for number, turn in enumerate(turns, start=1):
+    for number, turn in enumerate(turns):
         if turn.purge_in_turns is not None and turn.purge_in_turns <= 0:
             continue
         readfile_contexts: dict[str, int | None] | None = None
@@ -6717,6 +6791,7 @@ def build_agent_turn_metadata(
             "readfile_contexts": readfile_contexts,
         })
     return {
+        "turn_number_base": 0,
         "turn_range": (
             [entries[0]["number"], entries[-1]["number"]]
             if entries
@@ -6768,8 +6843,11 @@ def load_reused_agent_turn_metadata(
         "pinned_file_paths", "pinned_turn_numbers", "active_task",
         "active_context", "meta_task_list",
     }
-    if not isinstance(metadata, dict) or set(metadata) != expected_fields:
+    if not isinstance(metadata, dict) or set(metadata) not in (
+        expected_fields, expected_fields | {"turn_number_base"}
+    ):
         raise ValueError(invalid_metadata)
+    turn_number_base = saved_agent_turn_number_base(metadata)
     if (
         not is_integer(metadata["turn_count"])
         or not isinstance(metadata["turns"], list)
@@ -6800,8 +6878,8 @@ def load_reused_agent_turn_metadata(
         if not isinstance(entry, dict) or set(entry) != entry_fields:
             raise ValueError(invalid_metadata)
         if (
-            not is_integer(entry["number"], 1)
-            or entry["number"] > metadata["turn_count"]
+            not is_integer(entry["number"], turn_number_base)
+            or entry["number"] >= metadata["turn_count"] + turn_number_base
             or not is_integer(entry["state_turn"])
             or entry["state_turn"] > selected_turn
             or not is_integer(entry["tool_call_index"])
@@ -6830,16 +6908,26 @@ def load_reused_agent_turn_metadata(
     turn_range = metadata["turn_range"]
     if (
         not isinstance(turn_range, list)
-        or any(not is_integer(number, 1) for number in turn_range)
+        or any(not is_integer(number, turn_number_base) for number in turn_range)
         or turn_range != ([numbers[0], numbers[-1]] if numbers else [])
     ):
         raise ValueError(invalid_metadata)
     pinned_numbers = metadata["pinned_turn_numbers"]
     if not isinstance(pinned_numbers, list) or any(
-        not is_integer(number, 1) or number not in numbers
+        not is_integer(number, turn_number_base) or number not in numbers
         for number in pinned_numbers
     ):
         raise ValueError(invalid_metadata)
+    for entry in metadata["turns"]:
+        entry["number"] -= turn_number_base
+    metadata["turn_range"] = [
+        number - turn_number_base for number in metadata["turn_range"]
+    ]
+    metadata["pinned_turn_numbers"] = [
+        number - turn_number_base
+        for number in metadata["pinned_turn_numbers"]
+    ]
+    metadata["turn_number_base"] = 0
     task_list = limit_agent_meta_task_list(
         normalize_agent_meta_task_list(metadata["meta_task_list"])
     )
@@ -6906,7 +6994,7 @@ def load_reused_agent_turn_metadata(
                         )
                     restored_contexts.append((path, section))
             readfile_contexts = tuple(restored_contexts)
-        turns[entry["number"] - 1] = AgentTurn(
+        turns[entry["number"]] = AgentTurn(
             task=task,
             context=entry["context"],
             tool_call=tool_call,
@@ -7119,6 +7207,7 @@ def reused_agent_context_pins(
     turns: list[AgentTurn],
     file_expires_in_turns: dict[str, int] | None = None,
     initial_pinned_paths: set[str] | None = None,
+    turn_number_base: int = 0,
 ) -> tuple[set[str], set[int]]:
     if file_expires_in_turns is None:
         file_expires_in_turns = agent_file_context_expirations(
@@ -7151,6 +7240,7 @@ def reused_agent_context_pins(
                     file_expires_in_turns,
                     pinned_paths,
                     pinned_turn_numbers,
+                    turn_number_base=turn_number_base,
                 )
             except ValueError:
                 pass
@@ -7190,9 +7280,9 @@ def apply_agent_context_summary(
         file_expires_in_turns.pop(path, None)
     pinned_paths.difference_update(removed_paths)
     for turn_number in summary.removed_turn_numbers:
-        if not 1 <= turn_number <= len(turns):
+        if not 0 <= turn_number < len(turns):
             raise ValueError(f"summarized agent turn does not exist: turn:{turn_number}")
-        turn_index = turn_number - 1
+        turn_index = turn_number
         # Keep tombstones so context-control turn IDs remain stable.
         turns[turn_index] = replace(
             turns[turn_index],
@@ -7251,6 +7341,7 @@ def format_agent_token_estimate_context(
     current_token_estimate: int,
     token_limit: int,
     prior_token_estimates: list[tuple[int, int]] | None = None,
+    current_turn: int | None = None,
 ) -> str:
     token_estimates = (prior_token_estimates or [])[
         -AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS:
@@ -7259,7 +7350,8 @@ def format_agent_token_estimate_context(
         f"{turn} {token_estimate}"
         for turn, token_estimate in sorted(token_estimates, reverse=True)
     )
-    current_turn = token_estimates[-1][0] + 1 if token_estimates else 1
+    if current_turn is None:
+        current_turn = token_estimates[-1][0] + 1 if token_estimates else 0
     return (
         f"<current_token_estimate token_estimate='{current_token_estimate}' "
         f"token_limit='{token_limit}' turn='{current_turn}'/>\n"
@@ -7290,6 +7382,7 @@ def build_agent_context_window_prompt(
     context_summary: AgentContextSummary | None = None,
     advance_expirations: bool = True,
     refresh_summary: bool = False,
+    current_turn: int | None = None,
 ) -> tuple[str, int | None, bool]:
     if file_expires_in_turns is None:
         file_expires_in_turns = agent_file_context_expirations(
@@ -7305,7 +7398,7 @@ def build_agent_context_window_prompt(
             pinned_paths,
         )
     visible_turn_numbers = set(agent_history_turn_numbers(turns))
-    turn_numbers = list(range(1, len(turns) + 1))
+    turn_numbers = list(range(len(turns)))
     visible_file_indexes = set(range(len(file_contexts)))
     active_context_checksum = agent_context_checksum(active_context)
     visible_active_context = (
@@ -7346,6 +7439,7 @@ def build_agent_context_window_prompt(
             prior_token_estimates=prior_token_estimates,
             include_task=include_task,
             current_unix_time=current_unix_time,
+            current_turn=current_turn,
         )
         return (
             user_prompt,
@@ -7379,7 +7473,7 @@ def build_agent_context_window_prompt(
     removal_candidates = [
         (
             number in pinned_turn_numbers, 0,
-            turns[number - 1].expires_in_turns, number, "turn", number,
+            turns[number].expires_in_turns, number, "turn", number,
         )
         for number in visible_turn_numbers
     ] + [
@@ -7425,7 +7519,7 @@ def build_agent_context_window_prompt(
         visible_file_indexes
         or visible_active_context
         or any(
-            not turns[number - 1].tool_call.tool.startswith("meta_")
+            not turns[number].tool_call.tool.startswith("meta_")
             for number in visible_turn_numbers
         )
     )
@@ -7508,6 +7602,7 @@ def build_agent_followup_prompt(
     include_task: bool = True,
     current_unix_time: int | None = None,
     context_summary: AgentContextSummary | None = None,
+    current_turn: int | None = None,
 ) -> str:
     if current_unix_time is None:
         current_unix_time = int(time.time())
@@ -7525,6 +7620,7 @@ def build_agent_followup_prompt(
                 current_token_estimate,
                 token_limit,
                 prior_token_estimates,
+                current_turn=current_turn,
             )
         )
 
@@ -7733,6 +7829,11 @@ def request_agent_model(
     request_cost_log = request_cost_estimate_log(
         settings.token_cost, request_tokens
     )
+    current_turn = (
+        settings.state_turn
+        if record_state
+        else max(0, settings.state_turn - 1)
+    )
     turn_dir: Path | None = None
     if record_state:
         turn_dir = start_state_turn(
@@ -7761,7 +7862,7 @@ def request_agent_model(
         settings.state_turn += 1
     append_log(
         "<agent_request>\n"
-        f"<request_stats>\nrequest_characters={request_characters} "
+        f"<request_stats>\nturn={current_turn} request_characters={request_characters} "
         f"request_tokens_estimate={request_tokens}{request_cost_log}"
         "\n</request_stats>\n"
         f"<system_prompt>\n{system_prompt}\n</system_prompt>\n"
@@ -7770,32 +7871,39 @@ def request_agent_model(
     )
     if VERBOSE:
         print(
-            f"request_characters={request_characters} "
+            f"turn={current_turn} request_characters={request_characters} "
             f"request_tokens_estimate={request_tokens}{request_cost_log} "
             f"model={settings.model_settings.model} "
             f"reasoning={settings.model_settings.openai_reasoning} session_name={SESSION_NAME}",
             file=sys.stderr,
         )
-    request_timer = ModelRequestTimer()
     model_settings = settings.model_settings
 
     def request_response() -> tuple[
-        Any, dict[str, Any] | None, str, tuple[AgentToolCall, ...]
+        Any, dict[str, Any] | None, str, tuple[AgentToolCall, ...], float
     ]:
-        response_obj, usage = call_model(
-            model_settings,
-            system_prompt,
-            user_prompt,
-            response_format=("schema" if json_schema is not None else "text"),
-            json_schema=json_schema,
-            retry=0,
-            error_logger=append_log,
-            tools=tools,
-            tool_choice="required" if tools else None,
-            parallel_tool_calls=True if tools else None,
-            request_timer=request_timer,
-            reasoning_items=reasoning_items,
-        )
+        request_timer = ModelRequestTimer()
+        usage: dict[str, Any] | None = None
+        try:
+            response_obj, usage = call_model(
+                model_settings,
+                system_prompt,
+                user_prompt,
+                response_format=("schema" if json_schema is not None else "text"),
+                json_schema=json_schema,
+                retry=0,
+                error_logger=append_log,
+                tools=tools,
+                tool_choice="required" if tools else None,
+                parallel_tool_calls=True if tools else None,
+                request_timer=request_timer,
+                reasoning_items=reasoning_items,
+            )
+        finally:
+            elapsed = request_timer.elapsed()
+            settings.cumulative_stats.add(
+                request_timer.elapsed(total=True), usage
+            )
         parsed_tool_calls: tuple[AgentToolCall, ...] = ()
         if tools:
             parsed_tool_calls = tuple(
@@ -7838,10 +7946,12 @@ def request_agent_model(
                     json_schema,
                     model_settings.response_json_repair,
                 )
-        return response_obj, usage, response, parsed_tool_calls
+        return response_obj, usage, response, parsed_tool_calls, elapsed
 
     try:
-        response_obj, usage, response, parsed_tool_calls = execute_openai_request(
+        (
+            response_obj, usage, response, parsed_tool_calls, elapsed,
+        ) = execute_openai_request(
             request_response,
             retry=model_settings.retry,
             operation_name="Agent request",
@@ -7856,7 +7966,6 @@ def request_agent_model(
         if turn_dir is not None:
             complete_state_turn(turn_dir, "", f"ERROR: {exc}")
         raise
-    elapsed = request_timer.elapsed()
     if turn_dir is not None:
         complete_state_turn(
             turn_dir, reasoning, response, response_reasoning_items
@@ -7873,6 +7982,7 @@ def request_agent_model(
         response_text=response,
         usage=usage,
         response_cost=response_cost_line(settings.token_cost, usage),
+        turn=current_turn,
     )
     append_log(
         f"<agent_response_reasoning>\n{reasoning}\n</agent_response_reasoning>\n"
@@ -7884,7 +7994,6 @@ def request_agent_model(
     return AgentModelResult(
         response=response,
         reasoning=reasoning,
-        statsline=statsline,
         turn_dir=turn_dir,
         turn_unix_time=turn_unix_time,
         tool_calls=parsed_tool_calls,
@@ -8207,6 +8316,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             turns,
             file_expires_in_turns,
             initial_pinned_paths=set(settings.pinned_file_paths),
+            turn_number_base=settings.initial_turn_number_base,
         )
     else:
         metadata = settings.initial_turn_metadata
@@ -8314,6 +8424,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 context_summary=context_summary,
                 advance_expirations=advance_expirations and not refresh_summary,
                 refresh_summary=refresh_summary,
+                current_turn=settings.state_turn,
             )
             if active_context and (
                 agent_context_checksum(active_context) == context_summary.active_context_checksum
@@ -8324,7 +8435,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 file_expires_in_turns,
                 set(range(len(file_contexts))),
                 turns,
-                list(range(1, len(turns) + 1)),
+                list(range(len(turns))),
                 set(agent_history_turn_numbers(turns)),
             )
             request_system_prompt = full_system_prompt
@@ -8355,7 +8466,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 "response_agent_meta_task_list",
             )
             prior_token_estimates.append(
-                (int(result.turn_dir.name) + 1, result.request_tokens)
+                (int(result.turn_dir.name), result.request_tokens)
             )
             del prior_token_estimates[
                 :-AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS
@@ -8403,7 +8514,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                         expires_in_turns=settings.agent_context_expires[0],
                     ),
                 ],
-                int(result.turn_dir.name) + 1,
+                int(result.turn_dir.name),
             )
             advance_expirations = refresh_summary
             refresh_summary = False
@@ -8476,7 +8587,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 emit_agent_auto_tool_call(
                     settings,
                     tool_calls,
-                    int(model_result.turn_dir.name) + 1,
+                    int(model_result.turn_dir.name),
                     meta_task_list,
                 )
             except Exception as exc:
@@ -10873,7 +10984,7 @@ def disable_ask_conflicting_options(args: argparse.Namespace) -> None:
 # Main
 # -------------------------------------------------------------------
 
-def main() -> int:
+def run_main(cumulative_stats: CumulativeStats) -> int:
     json_schema = None
 
     global CONFIG_FILE
@@ -12462,6 +12573,12 @@ def main() -> int:
             )
             return 1
 
+    if (agent_mode or shell_mode) and not args.estimate_only:
+        cumulative_stats.enabled = True
+        cumulative_stats.token_cost = token_cost
+        cumulative_stats.log_path = log_path
+        cumulative_stats.log_enabled = log_enabled
+
     if plan_mode:
         plan_system_base = (
             agent_worker_system_prompt if agent_mode else system_prompt
@@ -12505,6 +12622,7 @@ def main() -> int:
         if plan_request_tokens > token_limit:
             print(f"ERROR: Estimated plan input token count ({plan_request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
             return 1
+        plan_turn_log = f"turn={state_turn} " if agent_mode else ""
         plan_state_turn_path = start_state_turn(
             state_session_dir,
             state_turn,
@@ -12516,15 +12634,16 @@ def main() -> int:
         state_turn += 1
         append_log(
             "<plan_request>\n"
-            f"<plan_request_stats>\nrequest_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n"
+            f"<plan_request_stats>\n{plan_turn_log}request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n"
             f"<system_prompt>\n{plan_full_system_prompt}\n</system_prompt>\n"
             f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n"
             "</plan_request>\n"
         )
         if VERBOSE:
-            print(f"request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} session_name={session_stem}", file=sys.stderr)
+            print(f"{plan_turn_log}request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} session_name={session_stem}", file=sys.stderr)
         plan_request_timer = ModelRequestTimer()
         plan_response_obj: Any = None
+        plan_usage: dict[str, Any] | None = None
         try:
             plan_response_obj, plan_usage = call_model(
                 model_settings,
@@ -12540,7 +12659,11 @@ def main() -> int:
             complete_state_turn(plan_state_turn_path, "", f"ERROR: {exc}")
             print(f"API error: {exc}", file=sys.stderr)
             return 1
-        plan_elapsed = plan_request_timer.elapsed()
+        finally:
+            plan_elapsed = plan_request_timer.elapsed()
+            cumulative_stats.add(
+                plan_request_timer.elapsed(total=True), plan_usage
+            )
         plan_reasoning = response_reasoning_text(plan_response_obj)
         reasoning_items = response_reasoning_encrypted_items(plan_response_obj)
         complete_state_turn(
@@ -12557,6 +12680,7 @@ def main() -> int:
             response_text=plan_result,
             usage=plan_usage,
             response_cost=plan_response_cost,
+            turn=int(plan_state_turn_path.name) if agent_mode else None,
         )
         append_log(
             f"<plan_response>\n{plan_result}\n</plan_response>\n"
@@ -12674,9 +12798,16 @@ def main() -> int:
                 if reused_agent_history is not None
                 else None
             ),
+            initial_turn_number_base=(
+                1
+                if reused_agent_history is not None
+                and reused_agent_history.turn_metadata is None
+                else 0
+            ),
             refresh_initial_file_contexts=(
                 args.files is not None or args.files_list is not None
             ),
+            cumulative_stats=cumulative_stats,
         )
         return run_agent_mode(agent_settings)
 
@@ -12776,6 +12907,7 @@ def main() -> int:
             )
             state_turn += 1
         stream_sink = None
+        usage: dict[str, Any] | None = None
         try:
             if stream and not print_reasoning:
                 def emit_stream_text(delta: str) -> None:
@@ -12819,7 +12951,9 @@ def main() -> int:
             if request_state_path is not None:
                 complete_state_turn(request_state_path, "", f"ERROR: {exc}")
             raise
-        elapsed = request_timer.elapsed()
+        finally:
+            elapsed = request_timer.elapsed()
+            cumulative_stats.add(request_timer.elapsed(total=True), usage)
         reasoning = response_reasoning_text(response_obj)
         reasoning_items = response_reasoning_encrypted_items(response_obj)
         if request_state_path is not None:
@@ -13471,6 +13605,14 @@ def main() -> int:
         print("</debug_response>", file=sys.stderr)
 
     return 0
+
+
+def main() -> int:
+    cumulative_stats = CumulativeStats()
+    try:
+        return run_main(cumulative_stats)
+    finally:
+        cumulative_stats.emit()
 
 
 # -------------------------------------------------------------------
