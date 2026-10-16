@@ -757,13 +757,13 @@ def last_completed_state_turn(
 
 STATE_SESSION_ARTIFACT = "request_files"
 STATE_META_TASK_LIST_ARTIFACT = "meta_task_list"
-STATE_META_RESUME_SESSION_ARTIFACT = "meta_resume_session"
-STATE_META_RESUME_SESSION_TURN_ARTIFACT = "meta_resume_session_turn"
+STATE_RESUME_SESSION_ARTIFACT = "resume_session"
+STATE_RESUME_SESSION_TURN_ARTIFACT = "resume_session_turn"
 STATE_SESSION_ARTIFACTS = (
     STATE_SESSION_ARTIFACT,
     STATE_META_TASK_LIST_ARTIFACT,
-    STATE_META_RESUME_SESSION_ARTIFACT,
-    STATE_META_RESUME_SESSION_TURN_ARTIFACT,
+    STATE_RESUME_SESSION_ARTIFACT,
+    STATE_RESUME_SESSION_TURN_ARTIFACT,
 )
 STATE_TURN_ARTIFACTS = (
     "request_system_prompt",
@@ -842,17 +842,17 @@ def state_session_chain(
         seen_paths.add(resolved_path)
         sessions.append((state_session_dir, maximum_turn))
         resume_session = read_optional_state_artifact(
-            state_session_dir / STATE_META_RESUME_SESSION_ARTIFACT
+            state_session_dir / STATE_RESUME_SESSION_ARTIFACT
         )
         if resume_session is None:
             return sessions
         resume_session_name = validate_session_name(resume_session)
         resume_turn_text = read_optional_state_artifact(
-            state_session_dir / STATE_META_RESUME_SESSION_TURN_ARTIFACT
+            state_session_dir / STATE_RESUME_SESSION_TURN_ARTIFACT
         )
         if resume_turn_text is not None:
             resume_turn = parse_session_turn(
-                resume_turn_text, STATE_META_RESUME_SESSION_TURN_ARTIFACT
+                resume_turn_text, STATE_RESUME_SESSION_TURN_ARTIFACT
             )
             maximum_turn = (
                 resume_turn
@@ -12470,7 +12470,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             if resume_session_name is not None:
                 write_state_artifact(
                     state_session_dir,
-                    STATE_META_RESUME_SESSION_ARTIFACT,
+                    STATE_RESUME_SESSION_ARTIFACT,
                     resume_session_name,
                 )
                 maximum_turn = (
@@ -12481,7 +12481,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 if maximum_turn >= 0:
                     write_state_artifact(
                         state_session_dir,
-                        STATE_META_RESUME_SESSION_TURN_ARTIFACT,
+                        STATE_RESUME_SESSION_TURN_ARTIFACT,
                         str(maximum_turn),
                     )
             state_turn = next_state_turn_index(state_session_dir)
