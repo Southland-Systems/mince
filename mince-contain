@@ -504,16 +504,34 @@ def resolve_contained_command(
 ) -> tuple[list[str], list[PathGrant]]:
     if not options.use_shell:
         command = ["mince", *mince_arguments]
+        agent_mode = False
+        shell_mode = False
+        mode_index: int | None = None
         for index, argument in enumerate(mince_arguments, start=1):
             if argument == "--":
                 break
-            if argument.partition("=")[0] in ("--agent", "--shell"):
-                options.private_devices = False
-                command[index:index] = [
-                    "--contain",
-                    *options.write_paths,
-                ]
-                break
+            option, separator, value = argument.partition("=")
+            if option == "--agent":
+                agent_mode = True
+            elif option == "--shell":
+                if not separator:
+                    value = (
+                        mince_arguments[index]
+                        if index < len(mince_arguments)
+                        and not mince_arguments[index].startswith("-")
+                        else "on"
+                    )
+                shell_mode = _on_off(value, option)
+            else:
+                continue
+            if mode_index is None:
+                mode_index = index
+        if mode_index is not None and (agent_mode or shell_mode):
+            options.private_devices = False
+            command[mode_index:mode_index] = [
+                "--contain",
+                *options.write_paths,
+            ]
         return command, runtime_path_grants(
             find_python(), invocation_directory
         )

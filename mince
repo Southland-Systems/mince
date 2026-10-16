@@ -218,7 +218,7 @@ DEFAULT_PROMPT_LIBRARY_REFERENCES: dict[str, str] = {
     "shell_system_prompt": "./mce_shell.md",
     "agent_system_prompt": "./mce_agent.md",
 }
-DEFAULT_AGENT_CONTEXT_EXPIRES = (28, 14, 54)
+DEFAULT_AGENT_CONTEXT_EXPIRES = (42, 28, 64)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-6-luna",
@@ -3622,7 +3622,7 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
         end_line = patch["end_line"]
         lines[start_line - 1 : end_line] = patch["content_line_array"]
     result = eol.join(lines)
-    if original_text.endswith(eol):
+    if lines and original_text.endswith(eol):
         result += eol
     return result
 
@@ -6087,12 +6087,19 @@ def build_agent_files_context(
     turn_numbers: list[int],
     visible_turn_numbers: set[int],
 ) -> str:
+    refreshed_paths = {
+        path
+        for turn_number, turn in zip(turn_numbers, turns)
+        if turn_number in visible_turn_numbers
+        for path, _ in (turn.readfile_contexts or ())
+    }
     initial_sections = [
         agent_file_context_section(
             file_contexts[index][1],
             file_expires_in_turns[file_contexts[index][0]],
         )
         for index in sorted(visible_file_indexes)
+        if file_contexts[index][0] not in refreshed_paths
     ]
     readfile_context = format_agent_readfile_contexts(
         turns,
@@ -8457,7 +8464,7 @@ def finish_agent_response(
 
 def run_agent_mode(settings: AgentRunSettings) -> int:
     turns: list[AgentTurn] = list(settings.initial_turns)
-    file_contexts = agent_context_file_sections(settings)
+    file_contexts = list(agent_context_file_sections(settings))
     file_expires_in_turns = agent_file_context_expirations(
         file_contexts, settings.agent_context_expires[0]
     )
@@ -8928,6 +8935,14 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             else:
                 continue
             if readfile_contexts is not None:
+                refreshed_paths = {path for path, _ in readfile_contexts}
+                file_contexts[:] = [
+                    context for context in file_contexts
+                    if context[0] not in refreshed_paths
+                ]
+                for path in refreshed_paths:
+                    file_expires_in_turns.pop(path, None)
+                pinned_paths.difference_update(refreshed_paths)
                 readfile_contexts_for_turn = (
                     (readfile_contexts_for_turn or ()) + readfile_contexts
                 )
