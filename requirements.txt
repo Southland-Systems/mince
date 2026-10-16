@@ -1,5 +1,4 @@
 openai>=3.24.0
-httpx>=0.28.1
 tiktoken>=0.7.0
 pyseccomp>=0.1.2
 json_repair>=0.63.5
