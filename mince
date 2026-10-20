@@ -199,7 +199,7 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "uses the default context expiry and triggers an automatic refresh. "
     "When `<agent_revision>` is present, replace the previous tool call with "
     "one that follows its user instruction. Always examine `<files>` for file content. "
-    "Always use `readfile` to access files, do not use `shell` commands. "
+    "Always use `readfile` to access text files, do not use `shell` commands. "
     "Always use `patch` to create and modify text files. "
     "Use `meta_notepad` when necessary and clear it when no longer necessary. "
  )
@@ -9267,9 +9267,10 @@ def call_openai(
         kwargs["text"] = {"format": json_schema}
     else:
         text_payload: dict[str, Any] = {"format": {"type": "text"}}
-        if response_verbosity and response_verbosity != "off":
-            text_payload["verbosity"] = response_verbosity
         kwargs["text"] = text_payload
+
+    if response_verbosity and response_verbosity != "off":
+        text_payload["verbosity"] = response_verbosity
 
     if stream and response_format != "text":
         raise ValueError("Streaming is only supported for text responses")
