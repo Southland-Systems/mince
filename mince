@@ -198,11 +198,10 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "and relevant file paths and their descriptions. Its expires_in_turns "
     "uses the default context expiry and triggers an automatic refresh. "
     "When `<agent_revision>` is present, replace the previous tool call with "
-    "one that follows its user instruction. Always examine `<files>` for file content. "
-    "Always use `readfile` to access text files, do not use `shell` commands. "
-    "Always use `patch` to create and modify text files. "
-    "Use `meta_notepad` when necessary and clear it when no longer necessary. "
- )
+    "one that follows its user instruction. Examine `<files>` for file content. "
+    "Use `readfile` to load text files, do not use `shell` commands. "
+    "Use `patch` to create and modify text files. "
+)
 DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
     "mce_system": DEFAULT_SYSTEM_PROMPT,
     "mce_linenum": DEFAULT_LINENUM_SYSTEM_PROMPT,
@@ -9259,18 +9258,17 @@ def call_openai(
     if explicit_prompt_cache:
         kwargs["prompt_cache_options"] = {"mode": "explicit"}
 
+    text_payload: dict[str, Any] = {"format": {"type": "text"}}
     if response_format == "json":
-        kwargs["text"] = {"format": {"type": "json_object"}}
+        text_payload["format"] = {"type": "json_object"}
     elif response_format == "schema":
         if not json_schema:
             raise ValueError("--response-format schema requires --schema-file")
-        kwargs["text"] = {"format": json_schema}
-    else:
-        text_payload: dict[str, Any] = {"format": {"type": "text"}}
-        kwargs["text"] = text_payload
+        text_payload["format"] = json_schema
 
     if response_verbosity and response_verbosity != "off":
         text_payload["verbosity"] = response_verbosity
+    kwargs["text"] = text_payload
 
     if stream and response_format != "text":
         raise ValueError("Streaming is only supported for text responses")
