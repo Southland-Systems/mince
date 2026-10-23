@@ -147,58 +147,86 @@ DEFAULT_SHELL_SYSTEM_PROMPT = (
 )
 DEFAULT_AGENT_SYSTEM_PROMPT = (
     "Run an agent session. Complete the requested task accurately and "
-    "efficiently. Examine the previous turn to prevent duplicate work. "
+    "efficiently. Examine the previous turns to prevent duplicate work. "
 )
 AGENT_TOOL_CALL_SYSTEM_PROMPT = (
-    "Use the provided controller tools. Every controller response must call at "
-    "least one tool and must not answer with plain text. Put the executable tool "
-    "call first. Additional calls may only use `meta_task_list`, `meta_notepad`, "
-    "or `meta_context_control`, and a `session` call must be the only call in "
-    "its response. The `<agent_tool_json_schemas>` context contains the JSON "
-    "schemas for the available controller tool calls. Available tools are "
-    "`patch`, `shell`, `readfile`, `meta_task_list`, `meta_notepad`, `agent`, "
-    "`session`, and `meta_context_control`. `patch` directly accepts the 'patch' JSON schema, "
-    "applies its file modification manifest, and automatically appends a "
-    "`readfile` companion call for every document in the manifest. Always use `patch` "
-    "when modifying files or creating new files. Combine `patch` calls for the same file. "
-    "`shell` directly accepts the `shell_commands` schema and generates commands for "
-    "review and execution. Every shell command requires a concise, non-empty "
-    "reason. Use a lines array only when the command needs standard input; its "
-    "entries are sent in order. `readfile` accepts one or more file paths and "
-    "makes their contents available as `<file>` sections in the main `<files>` "
-    "context with line numbers, paths, turn tracking, and expiry; use it to "
-    "inspect desired files that are not already in `<files>`. `meta_task_list` "
-    "applies an ordered batch of `add`, `change`, and `remove` operations to the "
-    "persistent task list. Add tasks using tasks, new tasks default to `todo` status. "
-    "Status change operations require a "
-    "task number and a status. Tasks have status values: `todo`, `done`, or `skip`. "
-    "Remove operations require an array of task integers. Change task content by "
-    "using remove and add task in a separate tool call. At most 25 tasks are retained. "
-    "`meta_notepad` replaces the entire persistent "
-    "notepad with its content string in the `<meta_notepad>` tag, "
-    "use an empty content string to clear it. The task list and notepad "
-    "never expire, and any expires_in_turns supplied to their tools is "
-    "ignored. `agent` starts the next controller turn with a non-empty task "
-    "and optional context. Use `agent` instead of a no-op continuation. Selected agent profiles are "
-    "exposed as `agent_<profile_name>`; use the applicable profile rather than "
-    "generic `agent` to delegate work to a worker. Selected profile response "
-    "formats and instructions are appended to this system prompt. `session` "
-    "uses action=end with a non-empty reason to complete the session. Every "
-    "controller tool other than `meta_task_list` or `meta_notepad` requires "
-    "expires_in_turns, which controls how many following controller turns "
-    "retain its history. "
-    "`meta_context_control` uses action=pin to retain a visible file path or "
-    "prior agent turn such as `turn:2`, or action=set_expires_in_turns to update "
-    "a specified context's expiry to the call's expires_in_turns value. "
-    "`<agent_history>` context is ordered newest to oldest. Unpinned turns expire "
-    "after their expires_in_turns. Pinning prevents expiry, but context may still be "
-    "removed to stay below the token limit, preferring older turns or turns "
-    "that expire sooner. `<agent_context_summary>` retains summarized context "
-    "and relevant file paths and their descriptions. Its expires_in_turns "
-    "uses the default context expiry and triggers an automatic refresh. "
-    "Examine `<files>` for file content. "
-    "Use `readfile` to read entire text files, do not use shell commands. "
-    "Use `patch` to create and modify text files. "
+    "Control the autonomous agent session through the provided tools. Complete "
+    "the task, verify actual outcomes, and avoid duplicate work. Default agent "
+    "mode executes calls without confirmation; keep actions safe and scoped, "
+    "and honor any review decisions or revision instructions.\n\n"
+    "Tool-call protocol:\n"
+    "- Return one or more native tool calls on every controller turn, with no "
+    "ordinary response text, code fences, or JSON that merely describes calls. "
+    "Follow the argument schemas in `<agent_tool_json_schemas>` exactly.\n"
+    "- Calls run sequentially in returned order. Batch work when possible. "
+    "Put patch and task/action calls first and context-retention "
+    "calls afterward; `meta_task_list` may be first. Use `session` "
+    "alone. A `meta_context_control` call may start a response only when it "
+    "uses `action=summary` and is the sole call.\n"
+    "- Supply `expires_in_turns` for every tool except `meta_task_list`, using "
+    "the schema's configured bounds and default. Another controller turn "
+    "follows automatically after tools finish.\n\n"
+    "File and shell work:\n"
+    "- Use `readfile` with `paths` to load file context in `<files>`. `<files>` "
+    "are automatically refreshed each turn. Inspect numbered `<file>` snapshots, their "
+    "turn/expiry metadata, and any errors. Do not use `shell` to read whole "
+    "files.\n"
+    "- Edit or create files with `patch`, never shell commands. Pass the "
+    "`line_replace_manifest` fields directly, plus `expires_in_turns`. Group "
+    "each file's patches in one `files` entry in one call. Use current, "
+    "non-overlapping, 1-based inclusive ranges; preserve source line endings "
+    "and strip displayed line-number prefixes from replacement lines.\n"
+    "- Expect a `readfile` companion immediately after each `patch` for its "
+    "document paths; do not run another `readfile` on the paths. "
+    "patches overwrite source files. "
+    "Check actual outcomes and `<written_paths>` before assuming files changed.\n"
+    "- Use `shell` to search, inspect the environment, and verify work with "
+    "safe, necessary commands. Pass the `shell_commands` fields directly, "
+    "plus `expires_in_turns`. Give every command a concise, non-empty `reason`. "
+    "Use `lines` only for standard input; entries are sent in order, joined "
+    "with newlines. Check exit statuses, stdout, and stderr before deciding "
+    "what to do next.\n\n"
+    "Task tracking:\n"
+    "- Apply an ordered `meta_task_list.operations` batch. For `add`, supply "
+    "`tasks` with `task` and explicit `status` fields (normally `todo`). For "
+    "`change`, supply `tasks` with `number` and `status`. For `remove`, supply "
+    "a `numbers` array. Use only `todo`, `done`, or `skip` statuses. Rewrite "
+    "task text by removing and adding; account for 1-based numbering and "
+    "renumbering after removals or pruning. Keep a small amount of focused tasks, "
+    "with a maximum of 25 tasks possible.\n\n"
+    "Continuation and delegation:\n"
+    "- Use generic `agent` only to replace the active task and context for "
+    "the next turn, not as a no-op or a worker. If its tool description selects "
+    "a default profile, use it as a worker instead.\n"
+    "- Delegate through an applicable available `agent_<profile_name>` tool. "
+    "For both `agent` and profile calls, provide a self-contained, non-empty "
+    "`task` and the required `context` and `reason` strings, empty if unused. "
+    "Inspect worker results: even `patch` and `shell` profiles only return "
+    "structured output. Submit proposed edits or commands through `patch` or "
+    "`shell` to execute them.\n\n"
+    "Context management:\n"
+    "- Read `<agent_history>` newest to oldest and distinguish actual outcomes "
+    "from attempted actions. Unpinned files and history turns expire after "
+    "their displayed `expires_in_turns`. Use the token estimates to manage "
+    "context before important details are dropped.\n"
+    "- Use `meta_context_control` with `action=pin` to retain an available "
+    "initial file path or prior `turn:N`; use `action=set_expires_in_turns` "
+    "to set its expiry to the call's value. Put the target in `context_id`. "
+    "For files loaded by `readfile` or patch companions, target the owning "
+    "turn shown in `<file>`. Use displayed history turn indexes, not request "
+    "numbers. Pins prevent expiry, not removal under token pressure.\n"
+    "- Use `<agent_context_summary>` as compressed context, not live file "
+    "contents. It uses the configured default expiry and refreshes "
+    "automatically. To replace it and compact context, call "
+    "`meta_context_control` alone with `action=summary`, `context_id=all`, "
+    "and non-empty Markdown in `reason`. Merge the previous summary; preserve "
+    "constraints, decisions, actual outcomes, blockers, next steps, and "
+    "relevant file paths and descriptions. Exclude the persistent task list.\n\n"
+    "Session completion:\n"
+    "- When complete or blocked from further safe progress, call `session` "
+    "alone with `action=end` and a non-empty `reason` reporting results, "
+    "verification, and remaining limitations. Do not claim success for "
+    "rejected, saved-only, or failed actions."
 )
 DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
     "mce_system": DEFAULT_SYSTEM_PROMPT,
@@ -216,7 +244,7 @@ DEFAULT_PROMPT_LIBRARY_REFERENCES: dict[str, str] = {
     "shell_system_prompt": "./mce_shell.md",
     "agent_system_prompt": "./mce_agent.md",
 }
-DEFAULT_AGENT_CONTEXT_EXPIRES = (42, 28, 64)
+DEFAULT_AGENT_CONTEXT_EXPIRES = (24, 12, 48)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-6-luna",
@@ -639,6 +667,10 @@ PROMPT_TYPE_ALIASES: dict[str, str] = {
     "agent": "agent_system_prompt",
 }
 PROMPT_CONFIG_KEYS = tuple(dict.fromkeys(PROMPT_TYPE_ALIASES.values()))
+PROMPT_LIBRARY_ALIASES: dict[str, str] = {
+    alias: Path(DEFAULT_PROMPT_LIBRARY_REFERENCES[config_key]).stem
+    for alias, config_key in PROMPT_TYPE_ALIASES.items()
+}
 
 
 def prompt_type_key(value: str) -> str:
@@ -1330,7 +1362,9 @@ def write_state_meta_task_list(
     )
 
 def prompt_file_path(name: str) -> Path:
-    return APP_DIR / "prompts" / f"{validate_prompt_name(name)}.md"
+    name = validate_prompt_name(name)
+    name = PROMPT_LIBRARY_ALIASES.get(name, name)
+    return APP_DIR / "prompts" / f"{name}.md"
 
 
 def ensure_default_prompt_library_entries() -> None:
@@ -1384,7 +1418,7 @@ def parse_prompt_file_definitions(value: Any) -> tuple[list[str], str] | None:
         return None
 
     prompt = value.strip()
-    if not prompt.startswith(("/", "./")):
+    if not prompt.startswith(("/", "./", "@")):
         return None
 
     match = re.match(r"^(\S+)(?:\s+(.*))?$", prompt, re.DOTALL)
@@ -1394,7 +1428,7 @@ def parse_prompt_file_definitions(value: Any) -> tuple[list[str], str] | None:
     definitions = match.group(1).split("|")
     if not definitions or any(
         not definition
-        or not definition.startswith(("/", "./"))
+        or not definition.startswith(("/", "./", "@"))
         for definition in definitions
     ):
         return None
@@ -1403,6 +1437,8 @@ def parse_prompt_file_definitions(value: Any) -> tuple[list[str], str] | None:
 
 def configured_prompt_file_path(value: str) -> Path:
     candidate = value.strip()
+    if candidate.startswith("@"):
+        return prompt_file_path(candidate[1:])
     if candidate.startswith("./"):
         filename = candidate[2:]
         if (
@@ -1421,7 +1457,7 @@ def prompt_path_matches(value: str, prompt_path: Path) -> bool:
     candidate = value.strip()
     if candidate == str(prompt_path):
         return True
-    if not candidate.startswith(("/", "./")):
+    if not candidate.startswith(("/", "./", "@")):
         return False
     try:
         return (
@@ -1803,15 +1839,15 @@ def agent_tool_call_system_prompt(
     profile_lines: list[str] = []
     for profile in profiles:
         profile_line = (
-            f"- `{agent_profile_tool_name(profile.name)}` uses response format "
-            f"`{profile.profile_type}`."
+            f"- Use `{agent_profile_tool_name(profile.name)}` to delegate work "
+            f"(response format: `{profile.profile_type}`)."
         )
         if profile.description.strip():
             profile_line += f" {profile.description.strip()}"
         profile_lines.append(profile_line)
     return (
         AGENT_TOOL_CALL_SYSTEM_PROMPT.rstrip()
-        + "\nSelected agent profiles and their instructions:\n"
+        + "\n\nSelected worker profile tools:\n"
         + "\n".join(profile_lines)
     )
 
@@ -2027,7 +2063,7 @@ def agent_tool_schemas(
             }
         if (
             expires_schema is not None
-            and schema["name"] not in AGENT_PERSISTENT_META_TOOLS
+            and schema["name"] != AGENT_META_TASK_LIST_TOOL
         ):
             schema = {
                 **schema,
@@ -2404,8 +2440,9 @@ def init_config_interactive() -> None:
         f"Config file: {CONFIG_FILE}\n"
         f"Use DEFAULT to reset any value. "
         f"Use - or \"\" to blank text values.\n"
-        f"System prompt file include syntax:\n"
-        f"./prompt_name.md|/path/file|./prompt.md additional text\n\n"
+        f"System prompt file and library include syntax:\n"
+        f"@system|./prompt_name.md|/path/file additional text\n"
+        f"@system refers to ./mce_system.md.\n\n"
     )
 
     prompt_config_value(config, "model", "Model")
@@ -3483,7 +3520,7 @@ class PatchRange:
 
 def validate_patch_ranges(
     patches: list[dict[str, Any]],
-    total_lines: int,
+    total_lines: int | None = None,
 ) -> list[PatchRange]:
     ranges: list[PatchRange] = []
 
@@ -3536,25 +3573,33 @@ def validate_patch_ranges(
 
     return ranges
 
+
+def validate_patch_contents(patches: list[dict[str, Any]]) -> None:
+    for patch in patches:
+        content_lines = patch.get("content_line_array")
+        if not isinstance(content_lines, list) or any(
+            not isinstance(line, str) for line in content_lines
+        ):
+            raise ValueError(
+                f"{patch['patch_id']}: content_line_array must be an array of strings"
+            )
+        if any("\r" in line or "\n" in line for line in content_lines):
+            raise ValueError(
+                f"{patch['patch_id']}: content lines must not contain line endings"
+            )
+
+
 def apply_combined_patch_manifest(
     original_texts: dict[str, str],
     manifest: dict[str, Any],
 ) -> dict[str, str]:
     updated_texts: dict[str, str] = {}
-    seen_paths: set[str] = set()
 
-    for file_entry in manifest.get("files", []):
-        path = str(patch_manifest_document_path(file_entry))
-        if path in seen_paths:
-            raise ValueError(f"patch contains duplicate document path: {path}")
-        seen_paths.add(path)
-        if path not in original_texts:
-            original = ""
-        else:
-            original = original_texts[path]
-
+    for path, file_entry in patch_manifest_documents(manifest):
+        path_text = str(path)
+        original = original_texts.get(path_text, "")
         updated = apply_file_patch_manifest(original, file_entry)
-        updated_texts[path] = updated
+        updated_texts[path_text] = updated
 
     for path, text in original_texts.items():
         if path not in updated_texts:
@@ -3597,18 +3642,7 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
             )
 
     validate_patch_ranges(patches, total_lines)
-    for patch in patches:
-        content_lines = patch.get("content_line_array")
-        if not isinstance(content_lines, list) or any(
-            not isinstance(line, str) for line in content_lines
-        ):
-            raise ValueError(
-                f"{patch['patch_id']}: content_line_array must be an array of strings"
-            )
-        if any("\r" in line or "\n" in line for line in content_lines):
-            raise ValueError(
-                f"{patch['patch_id']}: content lines must not contain line endings"
-            )
+    validate_patch_contents(patches)
 
     # Apply patches in reverse order so earlier line numbers stay valid
     patches = sorted(
@@ -3632,6 +3666,20 @@ def patch_manifest_document_path(file_entry: dict[str, Any]) -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
+
+
+def patch_manifest_documents(
+    manifest: dict[str, Any],
+) -> list[tuple[Path, dict[str, Any]]]:
+    documents: list[tuple[Path, dict[str, Any]]] = []
+    seen_paths: set[Path] = set()
+    for file_entry in manifest.get("files", []):
+        path = patch_manifest_document_path(file_entry)
+        if path in seen_paths:
+            raise ValueError(f"patch contains duplicate document path: {path}")
+        seen_paths.add(path)
+        documents.append((path, file_entry))
+    return documents
 
 
 def resolve_patch_suffix(
@@ -3735,11 +3783,8 @@ def load_patch_original_texts(
     manifest: dict[str, Any],
  ) -> dict[str, str]:
     original_texts: dict[str, str] = {}
-    for file_entry in manifest["files"]:
-        path = patch_manifest_document_path(file_entry)
+    for path, _ in patch_manifest_documents(manifest):
         path_text = str(path)
-        if path_text in original_texts:
-            raise ValueError(f"patch contains duplicate document path: {path}")
         if not path.exists():
             continue
         if not path.is_file():
@@ -4322,10 +4367,10 @@ def expand_prompt_names(value: str, enabled: bool = False) -> str:
         def replace(match: re.Match[str]) -> str:
             display_name = match.group(1).strip()
             try:
-                name = validate_prompt_name(display_name)
+                prompt_path = prompt_file_path(display_name)
+                name = prompt_path.stem
                 if name in active_names:
                     raise ValueError("recursive prompt expansion")
-                prompt_path = prompt_file_path(name)
                 if not prompt_path.is_file():
                     raise FileNotFoundError(
                         f"prompt library entry does not exist: {prompt_path}"
@@ -4804,14 +4849,9 @@ AGENT_PATCH_TOOL = "patch"
 AGENT_SHELL_TOOL = "shell"
 AGENT_READFILE_TOOL = "readfile"
 AGENT_META_TASK_LIST_TOOL = "meta_task_list"
-AGENT_META_NOTEPAD_TOOL = "meta_notepad"
 AGENT_AGENT_TOOL = "agent"
 AGENT_SESSION_TOOL = "session"
 AGENT_META_CONTEXT_CONTROL_TOOL = "meta_context_control"
-AGENT_PERSISTENT_META_TOOLS = (
-    AGENT_META_TASK_LIST_TOOL,
-    AGENT_META_NOTEPAD_TOOL,
-)
 
 
 def agent_tool_argument_schema(
@@ -4852,14 +4892,6 @@ AGENT_READFILE_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     },
     "required": ["paths"],
 }
-AGENT_META_NOTEPAD_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "content": {"type": "string"},
-    },
-    "required": ["content"],
-}
 AGENT_SESSION_CALL_ARGUMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -4893,7 +4925,6 @@ AGENT_TOOL_ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
         AGENT_READFILE_CALL_ARGUMENT_SCHEMA
     ),
     AGENT_META_TASK_LIST_TOOL: META_TASK_LIST_SCHEMA["schema"],
-    AGENT_META_NOTEPAD_TOOL: AGENT_META_NOTEPAD_CALL_ARGUMENT_SCHEMA,
     AGENT_AGENT_TOOL: AGENT_AGENT_CALL_ARGUMENT_SCHEMA,
     AGENT_SESSION_TOOL: agent_tool_argument_schema(
         AGENT_SESSION_CALL_ARGUMENT_SCHEMA
@@ -4907,7 +4938,6 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     AGENT_SHELL_TOOL: "Reviewed shell command execution.",
     AGENT_READFILE_TOOL: "File context loading into `<files>` tag.",
     AGENT_META_TASK_LIST_TOOL: "Persistent task list management into `<meta_task_list>` tag.",
-    AGENT_META_NOTEPAD_TOOL: "Persistent notepad replacement; empty content clears it.",
     AGENT_AGENT_TOOL: "Agent controller continuation.",
     AGENT_SESSION_TOOL: "Agent session completion.",
     AGENT_META_CONTEXT_CONTROL_TOOL: "Agent context retention management.",
@@ -4926,7 +4956,7 @@ AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 AGENT_CONTEXT_SUMMARY_TOKEN_RESERVE = 2048
 AGENT_CONTEXT_SUMMARY_MAX_TOKENS = 8196
-AGENT_CONTEXT_COMPACTION_TOKEN_FRACTION = 0.6
+AGENT_CONTEXT_COMPACTION_TOKEN_FRACTION = 0.7
 AGENT_SUMMARY_INSTRUCTIONS = (
     "Create a thorough summary using the visible file and turn context and "
     "active agent context so the controller can continue its task. "
@@ -4938,10 +4968,9 @@ AGENT_SUMMARY_INSTRUCTIONS = (
     "pending revisions, and next steps. Include relevant files with their "
     "exact paths and concise descriptions of their responsibilities, important "
     "symbols, and relevant changes. Suggest a solution for detected error loops "
-    "or other continuous problem states. Do not include `meta_task_list` items "
-    "or `meta_notepad` content in the summary; they are retained separately. "
+    "or other continuous problem states. Do not summarize the `<meta_task_list>`. "
     "Consider the task context when writing the summary. "
-    "Consider that this summary will be available over many turns. "
+    "Consider that the summary will be available over many turns. "
     "Return only the Markdown summary."
 )
 
@@ -4966,7 +4995,7 @@ class AgentToolCall:
         )
         if self.arguments is not None:
             value = {"tool": tool_name, **self.arguments}
-            if self.tool in AGENT_PERSISTENT_META_TOOLS:
+            if self.tool == AGENT_META_TASK_LIST_TOOL:
                 value.pop("expires_in_turns", None)
             else:
                 value["expires_in_turns"] = self.expires_in_turns
@@ -5081,7 +5110,6 @@ class AgentRunSettings:
     pinned_file_paths: tuple[str, ...] = ()
     initial_turns: tuple[AgentTurn, ...] = ()
     initial_meta_task_list: tuple[dict[str, Any], ...] = ()
-    initial_meta_notepad: str = ""
     initial_active_context: str = ""
     agent_hook_context_scripts: tuple[str, ...] = ()
     context_summary: AgentContextSummary | None = None
@@ -5357,7 +5385,7 @@ def _parse_agent_tool_arguments_value(
         )
     if (
         isinstance(value, dict)
-        and tool not in AGENT_PERSISTENT_META_TOOLS
+        and tool != AGENT_META_TASK_LIST_TOOL
         and "expires_in_turns" not in value
     ):
         value = {**value, "expires_in_turns": expires_schema["default"]}
@@ -5402,21 +5430,6 @@ def _parse_agent_tool_arguments_value(
             tool=tool,
             expires_in_turns=expires_in_turns,
             arguments={"commands": value["commands"]},
-        )
-
-    if tool == AGENT_META_NOTEPAD_TOOL:
-        if set(value) - {"expires_in_turns"} != {"content"}:
-            raise ValueError(
-                "agent meta_notepad arguments must contain only content"
-            )
-        content = value["content"]
-        if not isinstance(content, str):
-            raise ValueError(
-                "agent meta_notepad content must be a string"
-            )
-        return AgentToolCall(
-            tool=tool,
-            arguments={"content": content},
         )
 
     if tool == AGENT_META_TASK_LIST_TOOL:
@@ -5629,21 +5642,13 @@ def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
             raise ValueError(
                 f"agent patch files entry {index} requires a non-empty patches array"
             )
+        validate_patch_ranges(patches)
         for patch_index, patch in enumerate(patches, start=1):
             label = f"agent patch files entry {index} patch {patch_index}"
             for field in ("block_id", "summary_message"):
-                if not isinstance(patch[field], str) or not patch[field].strip():
+                field_value = patch.get(field)
+                if not isinstance(field_value, str) or not field_value.strip():
                     raise ValueError(f"{label} requires a non-empty {field}")
-        total_lines = max(
-            (
-                patch["end_line"]
-                for patch in patches
-                if isinstance(patch["end_line"], int)
-                and not isinstance(patch["end_line"], bool)
-            ),
-            default=0,
-        )
-        validate_patch_ranges(patches, total_lines)
         paths.append(path.strip())
     return paths
 
@@ -5658,6 +5663,10 @@ def append_agent_patch_readfile_tool_calls(
             continue
         try:
             paths = agent_patch_readfile_paths(tool_call)
+            manifest = tool_call.arguments
+            if manifest is not None:
+                for _, file_entry in patch_manifest_documents(manifest):
+                    validate_patch_contents(file_entry["patches"])
         except ValueError as exc:
             raise AgentControllerResponseError(
                 f"agent tool call {index}: {exc}"
@@ -5801,7 +5810,6 @@ def response_agent_tool_calls(
         except AgentControllerResponseError as exc:
             raise AgentControllerResponseError(
                 f"Failed to parse agent {tool} arguments: {exc}\n"
-                f"Response: {pretty_json(arguments)}"
             ) from exc
         if tool_call is not None:
             tool_calls.append(tool_call)
@@ -5962,11 +5970,6 @@ def format_agent_tool_call_for_output(
                 f"{format_agent_meta_task_operations(operations, meta_task_list)}"
             )
     if (
-        tool_call.tool == AGENT_META_NOTEPAD_TOOL
-        and tool_call.arguments is not None
-    ):
-        return f"Tool: {tool_name}\nReplace notepad:\n{call['content']}"
-    if (
         tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL
         and tool_call.action == "summary"
     ):
@@ -6119,17 +6122,12 @@ def record_agent_tool_history(
 
 
 def agent_history_tool_content(turn: AgentTurn) -> str:
-    if turn.tool_call.tool in AGENT_PERSISTENT_META_TOOLS:
-        label = (
-            "Task list"
-            if turn.tool_call.tool == AGENT_META_TASK_LIST_TOOL
-            else "Notepad"
-        )
+    if turn.tool_call.tool == AGENT_META_TASK_LIST_TOOL:
         if turn.output.startswith("ERROR:"):
             return turn.output
         if not turn.output:
-            return f"{label} update was not executed."
-        return f"{label} loaded into `<{turn.tool_call.tool}>` tag."
+            return "Task list update was not executed."
+        return "Task list loaded into `<meta_task_list>` tag."
     if turn.tool_call.tool.startswith("meta_"):
         return ""
     if (
@@ -6535,7 +6533,6 @@ class ReusedAgentHistory:
     meta_task_list: tuple[dict[str, Any], ...] = ()
     context_summary: AgentContextSummary | None = None
     turn_metadata: dict[str, Any] | None = None
-    meta_notepad: str = ""
 
 
 def agent_file_context_attributes(section: str) -> dict[str, str] | None:
@@ -6966,7 +6963,6 @@ def build_agent_turn_metadata(
     active_task: str,
     active_context: str,
     meta_task_list: list[dict[str, Any]],
-    meta_notepad: str = "",
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for number, turn in enumerate(turns):
@@ -7009,7 +7005,6 @@ def build_agent_turn_metadata(
         "active_task": active_task,
         "active_context": active_context,
         "meta_task_list": [task.copy() for task in meta_task_list],
-        "meta_notepad": meta_notepad,
     }
 
 
@@ -7043,6 +7038,8 @@ def load_reused_agent_turn_metadata(
             and value >= minimum
         )
 
+    if isinstance(metadata, dict):
+        metadata.pop("meta_notepad", None)
     expected_fields = {
         "turn_range", "turn_count", "turns", "file_expires_in_turns",
         "pinned_file_paths", "pinned_turn_numbers", "active_task",
@@ -7050,7 +7047,7 @@ def load_reused_agent_turn_metadata(
     }
     if not isinstance(metadata, dict) or not (
         expected_fields <= set(metadata)
-        <= expected_fields | {"turn_number_base", "meta_notepad"}
+        <= expected_fields | {"turn_number_base"}
     ):
         raise ValueError(invalid_metadata)
     turn_number_base = saved_agent_turn_number_base(metadata)
@@ -7059,7 +7056,6 @@ def load_reused_agent_turn_metadata(
         or not isinstance(metadata["turns"], list)
         or not isinstance(metadata["active_task"], str)
         or not isinstance(metadata["active_context"], str)
-        or not isinstance(metadata.get("meta_notepad", ""), str)
     ):
         raise ValueError(invalid_metadata)
     file_expirations = metadata["file_expires_in_turns"]
@@ -7171,9 +7167,15 @@ def load_reused_agent_turn_metadata(
             )
         task, tool_calls, tool_outputs = sources[source_turn]
         call_index = entry["tool_call_index"]
-        if call_index >= len(tool_calls) or tool_calls[call_index] is None:
+        if call_index >= len(tool_calls):
             raise ValueError(invalid_metadata)
         tool_call = tool_calls[call_index]
+        if tool_call is None:
+            metadata["pinned_turn_numbers"] = [
+                number for number in metadata["pinned_turn_numbers"]
+                if number != entry["number"]
+            ]
+            continue
         contexts = entry["readfile_contexts"]
         readfile_contexts: tuple[tuple[str, str], ...] | None = None
         if contexts is not None:
@@ -7219,7 +7221,6 @@ def load_reused_agent_turn_metadata(
         active_task=metadata["active_task"],
         active_context=metadata["active_context"],
         meta_task_list=tuple(task_list),
-        meta_notepad=metadata.get("meta_notepad", ""),
         context_summary=load_state_agent_context_summary(
             selected_turn_dir, expires_schema["default"]
         ),
@@ -7253,7 +7254,6 @@ def load_reused_session_agent_history(
     active_task = ""
     active_context = ""
     task_list: list[dict[str, Any]] = []
-    meta_notepad = ""
     context_summary: AgentContextSummary | None = None
     has_summary_turn = False
 
@@ -7390,13 +7390,6 @@ def load_reused_session_agent_history(
                         f"invalid saved meta_task_list output: {turn_dir} ({exc})"
                     ) from exc
             if (
-                tool_call.tool == AGENT_META_NOTEPAD_TOOL
-                and tool_output
-                and not tool_output.startswith("ERROR:")
-                and isinstance(tool_call.arguments, dict)
-            ):
-                meta_notepad = tool_call.arguments["content"]
-            if (
                 tool_call.tool == AGENT_AGENT_TOOL
                 and not tool_call.profile_name
             ):
@@ -7415,7 +7408,6 @@ def load_reused_session_agent_history(
         active_task=active_task,
         active_context=active_context,
         meta_task_list=tuple(task_list),
-        meta_notepad=meta_notepad,
         context_summary=context_summary,
     )
 
@@ -7657,7 +7649,6 @@ def build_agent_context_window_prompt(
     controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
     meta_task_list: list[dict[str, Any]] | None = None,
-    meta_notepad: str = "",
     prior_token_estimates: list[tuple[int, int]] | None = None,
     include_task: bool = True,
     context_summary: AgentContextSummary | None = None,
@@ -7715,7 +7706,6 @@ def build_agent_context_window_prompt(
             controller_tools=controller_tools,
             hook_contents=hook_contents,
             meta_task_list=meta_task_list,
-            meta_notepad=meta_notepad,
             current_token_estimate=current_token_estimate,
             token_limit=token_limit,
             prior_token_estimates=prior_token_estimates,
@@ -7882,7 +7872,6 @@ def build_agent_followup_prompt(
     current_unix_time: int | None = None,
     context_summary: AgentContextSummary | None = None,
     current_turn: int | None = None,
-    meta_notepad: str = "",
 ) -> str:
     if current_unix_time is None:
         current_unix_time = int(time.time())
@@ -7900,7 +7889,6 @@ def build_agent_followup_prompt(
         "<meta_task_list>\n"
         f"{format_agent_meta_task_list(meta_task_list)}\n"
         "</meta_task_list>",
-        f"<meta_notepad>\n{meta_notepad}\n</meta_notepad>",
     ]
     if current_token_estimate is not None and token_limit is not None:
         instruction_parts.append(
@@ -8654,7 +8642,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             list(settings.initial_meta_task_list),
         )
     )
-    meta_notepad = settings.initial_meta_notepad
     write_state_meta_task_list(settings.state_session_dir, meta_task_list)
     controller_tools = agent_tool_schemas(
         settings.agent_profiles,
@@ -8674,7 +8661,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             active_task,
             active_context,
             meta_task_list,
-            meta_notepad=meta_notepad,
         )
 
     def save_turn_metadata(turn_dir: Path) -> None:
@@ -8718,7 +8704,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 controller_tools=controller_tools,
                 hook_contents=hook_contents,
                 meta_task_list=meta_task_list,
-                meta_notepad=meta_notepad,
                 prior_token_estimates=prior_token_estimates,
                 include_task=not settings.system_prompt_with_task,
                 context_summary=context_summary,
@@ -8910,13 +8895,21 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     "response_agent_meta_task_list",
                 )
                 if executed_tool_calls:
+                    tool_output_text = format_agent_tool_outputs(
+                        executed_tool_calls,
+                        tool_outputs,
+                    )
                     write_state_artifact(
                         model_result.turn_dir,
                         "response_agent_tool_output",
-                        format_agent_tool_outputs(
-                            executed_tool_calls,
-                            tool_outputs,
-                        ),
+                        tool_output_text,
+                    )
+                    append_session_log(
+                        settings.log_path,
+                        "<agent_tool_output>\n"
+                        f"{tool_output_text}\n"
+                        "</agent_tool_output>\n",
+                        settings.log_enabled,
                     )
                 write_state_reasoning_items(
                     model_result.turn_dir,
@@ -9018,16 +9011,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     tool_output = execution.output
                     if execution.meta_task_list is not None:
                         meta_task_list = list(execution.meta_task_list)
-            elif tool_call.tool == AGENT_META_NOTEPAD_TOOL:
-                arguments = tool_call.arguments
-                if (
-                    not isinstance(arguments, dict)
-                    or not isinstance(arguments.get("content"), str)
-                ):
-                    tool_output = "ERROR: Notepad tool requires string content."
-                else:
-                    meta_notepad = arguments["content"]
-                    tool_output = "Notepad replaced in `<meta_notepad>` tag."
             elif tool_call.tool == AGENT_PATCH_TOOL:
                 manifest = tool_call.arguments
                 if manifest is None:
@@ -9085,6 +9068,8 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                     )
             else:
                 continue
+            if tool_output.startswith("ERROR:"):
+                print(tool_output, file=sys.stderr)
             if readfile_contexts is not None:
                 refreshed_paths = {path for path, _ in readfile_contexts}
                 file_contexts[:] = [
@@ -13171,11 +13156,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 reused_agent_history.meta_task_list
                 if reused_agent_history is not None
                 else ()
-            ),
-            initial_meta_notepad=(
-                reused_agent_history.meta_notepad
-                if reused_agent_history is not None
-                else ""
             ),
             initial_active_context=reused_agent_active_context,
             agent_hook_context_scripts=tuple(
