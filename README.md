@@ -4,10 +4,10 @@
 
 mce is a command-line assistant for engineering workflows that use local files as model context. It connects to OpenAI-compatible Responses API endpoints and supports focused analysis, precise edits, and reviewable automation.
 
-- **Targeted file changes:** supports precise, single-change editing through line-based, multi-file UTF-8 patch manifests. Patch application checks ranges and LF/CRLF line endings, produces unified diffs, and supports review and iterative revisions.
-- **Flexible patch workflows:** writes suffixed copies by default, supports approved in-place changes, and optionally commits changes on dedicated Git branches that can later be squash-merged or removed.
-- **Lightweight agent interface:** provides reviewed or automatic multi-turn tool calls for patches, shell commands, file reads, schema-based workers, persistent task lists, and context retention. The compact controller targets baseline context overhead below 5,000 tokens; files, history, and profile schemas increase total request size.
-- **Reviewed shell execution:** attaches a reason to every command, supports revisions and follow-up turns, and enforces per-command timeouts.  Shell processes are restricted to `AF_UNIX` socket creation unless networking is explicitly enabled.
+- **Targeted file changes:** generates line-based, multi-file UTF-8 patch manifests for existing or new files, with optional file context. Patch application checks ranges and LF/CRLF line endings, produces unified diffs, and supports review and iterative revisions.
+- **Flexible patch workflows:** standalone patch mode writes suffixed copies by default, supports approved in-place changes, and optionally commits changes on dedicated Git branches that can later be squash-merged or removed.
+- **Multi-turn agent workflows:** executes native controller tool calls automatically by default; use `--agent-review` for confirmation. Tools cover patches, shell commands, file reads, schema-based workers, persistent task lists, context retention, and Markdown context summaries.
+- **Reviewed shell execution:** attaches a reason to every command and supports revisions, follow-up turns, and configurable per-command timeouts (disabled by default). Shell processes are restricted to `AF_UNIX` socket creation unless networking is explicitly enabled.
 - **Filesystem containment with `mcec`:** runs the assistant or `$SHELL` in a transient systemd user service on Linux. The host filesystem is read-only by default, with writable private temporary directories, `~/.local/state/mince`, and explicitly granted paths. Host networking is enabled by default, and most of the invoking environment is forwarded.
 - **Cost-conscious operation:** supports provider service tiers such as `flex`, input-token limits, token and cost estimates, and configurable retries. Explicit prompt caching is disabled by default; this does not disable provider-managed automatic caching.
 - **Provider customization:** configures API endpoints, credentials, proxies, organization and project metadata, sampling, and reasoning. The `safety_identifier` configuration setting and `extra_body` request parameters support additional provider-specific controls.
@@ -20,8 +20,9 @@ mce is a command-line assistant for engineering workflows that use local files a
 
 ## Requirements 📦
 
-- `python` 3.10 or newer and the `pip` package manager
-- `systemd-run` for `mcec`
+- Python 3.10 or newer and the `pip` package manager
+- Linux and `pyseccomp` for uncontained shell commands with the default socket restrictions
+- Linux, `systemd-run`, and a running systemd user manager for `mcec` and contained shell commands
 - `make` from GNU Make or compatible for a managed installation
 - Network access to your chosen OpenAI-compatible endpoint
 - An API key for the endpoint
@@ -69,7 +70,7 @@ python mince-test
 mce --init
 ```
 
-This creates `~/.local/state/mince/config.json`.
+This creates `~/.local/state/mince/config.json` and any missing built-in prompt-library files under `~/.local/state/mince/prompts`. Use `mce --print-default-config` to inspect the built-in defaults or `mce --get-config` to inspect the selected profile's effective settings.
 
 ## Basic Usage 💡
 
@@ -123,7 +124,7 @@ mce -t "Add single-user locking to the provided script. Only output the whole sc
   -f taskedit.py -o taskedit-new.py
 ```
 
-Validate structured output against the included example JSON Schema:
+Request structured output using the included example JSON Schema:
 
 ```bash
 mce --task "Provide the file name and line count as JSON" \
@@ -158,13 +159,13 @@ mce --patch --patch-review --patch-branch -f README.md \
 mce -M Updated README with improved language.
 ```
 
-Apply a suffixed patch from a --patch-review declined session at turn two:
+Apply a suffixed copy of a saved patch after declining review (turn `1` is the second saved turn):
 
 ```bash
-mce -S .patched --patch-file-apply mince-1785553265-lfaUfaDq 1
+mce -S .patched --patch-file-apply SESSION 1
 ```
 
-Plan mode asks the model to create prompt for the next step using the supplied context:
+Plan mode asks the model to create a prompt for the next step using the supplied context:
 
 ```bash
 mce --plan \
@@ -182,16 +183,18 @@ mce -p task --shell \
 Run a task in automatic agent mode with `mcec`:
 
 ```bash
-mcec --contain-write-path . -p task --agent  --agent-auto \
+mcec --contain-write-path . -p task --agent \
   --task 'Determine the globally installed software development tools and write using "patch" as Markdown format to filename `sdk.md`.'
 ```
 
 Create or extend a text-based chess game:
 
 ```bash
-mcec --contain-write-path . -p ollama --agent --agent-auto --shell-networking \
+mcec --contain-write-path . -p ollama --agent --shell-networking \
   --task 'Create or continue a text-based chess game using the python.chess module in .venv. Create or update support scripts as needed.'
 ```
+
+Agent tool calls execute without confirmation by default. Add `--agent-review` to review calls and changes. Automatic agent patches overwrite source paths unless `--patch-suffix` is explicitly supplied; a configured suffix alone is ignored. Reviewed agent patches follow the usual `--patch-review` and suffix settings.
 
 Create a dedicated 'ask' profile from the default profile:
 
@@ -260,14 +263,14 @@ Copy a configuration option from another profile:
 mce --profile aws_grok --set-config-from base_url aws
 ```
 
-Use a `flex` service tier, add explicit prompt caching for maximum cost savings:
+Request the `flex` service tier and explicit prompt caching when the endpoint supports them:
 
 ```bash
 mce --service-tier flex --explicit-prompt-cache on \
   --task "Identify one actionable reliability issue" --files src/main.py
 ```
 
-Service-tier and caching support depend on the endpoint. Explicit caching is `on` thus disabling cache on the API.
+Service-tier availability, caching behavior, and pricing are provider-specific. Explicit caching defaults to `off`; `on` sends `prompt_cache_options.mode=explicit`. `off` omits that option and does not disable provider-managed automatic caching.
 
 Configure an API safety identifier in the selected configuration profile:
 
@@ -288,11 +291,25 @@ Run a reviewed agent session with a named patch worker and configurable context 
 mce --agent-profile-type code_patch patch
 mce --agent-profile-description code_patch 'Generate minimal, focused patches.'
 mce --agent-tool-list --agent-profile code_patch
-mce --agent --agent-profile code_patch --agent-context-expires 12 6 24 \
+mce --agent --agent-review --patch-review --agent-profile code_patch \
+  --agent-context-expires 24 12 48 \
   --task "Review the module and fix one clearly identified defect" --files src/main.py
 ```
 
-`--agent-context-expires` sets `DEFAULT [MIN] [MAX]` in controller turns. Files supplied through `--files` are pinned rather than expired.
+Selected profiles expose `agent_NAME` worker tools. Even `patch` and `shell` workers return structured proposals only; the controller must submit them through `patch` or `shell` to apply edits or execute commands.
+
+Use a stored worker profile for the generic `agent` tool instead of controller continuation:
+
+```bash
+mce --agent --agent-profile-default code_patch \
+  --task "Fix one clearly identified defect" --files src/main.py
+```
+
+`--agent-profile-default` changes only the generic `agent` tool; it does not replace the controller. Additional named worker tools can still be selected with `--agent-profile`.
+
+`--agent-context-expires` sets `DEFAULT [MIN] [MAX]` in controller turns; the built-in values are `24 12 48`. Omitted bounds use their built-in values, and `MIN <= DEFAULT <= MAX` is required. Initial context supplied through `--files` is pinned against expiry; `--files-list` and configured files are not automatically pinned. Pins do not prevent removal under token pressure.
+
+`readfile` loads numbered file snapshots, and each `patch` call automatically adds a companion `readfile` for its document paths. The controller can pin or extend retention through `meta_context_control`, targeting an initial file path or a displayed history `turn:N`. Files loaded by `readfile` or patch companions are retained through their owning history turn. Markdown context summaries refresh automatically using the configured default expiry; summaries are not live file contents.
 
 Provide fresh context from an existing, trusted executable before each agent controller request:
 
@@ -301,7 +318,7 @@ mce --agent --agent-hook-context ./project-status.sh \
   --task "Assess the project's current status" --files README.md
 ```
 
-Hook scripts run directly, without tool-call review. Only standard output from successful executions is included, in `<additional_context>` blocks.
+Hook scripts run directly, without tool-call review or the shell tool's timeout and socket restrictions. Only standard output from successful executions is included, in `<additional_context>` blocks. Use trusted executables; when invoked through `mcec`, hooks still run inside the wrapper's sandbox.
 
 Inspect the expanded agent system prompt or restore its built-in library entry:
 
@@ -310,11 +327,28 @@ mce --get-config-detail agent_system_prompt
 mce --prompt-reset-default agent
 ```
 
+### Saved state and resumption
+
 Inspect artifacts from the first saved session turn, replacing `SESSION` with the printed session name:
 
 ```bash
 mce --state-print-json SESSION 0 request_task response
 ```
+
+Validated patch manifests and diffs are stored per turn as `response_schema_patch` and `response_diff_patch` under `~/.local/state/mince/state/SESSION/TURN/`, regardless of the `log` setting. Successful writes also record `response_schema_patch_applied`; shell execution output is retained as `response_shell_output`.
+
+Resume a saved task or agent session in a new session:
+
+```bash
+mce --resume-session SESSION
+mce --agent --resume-session SESSION
+mce --patch --resume-session SESSION 1 \
+  --task "Revise the previous patch without changing the public API"
+```
+
+Resumption creates a new session linked to the selected completed turn (latest by default), follows earlier resume links, and continues inherited turn numbering. Context paths and SHA-256 checksums come from saved state; verification is enabled unless `--resume-session-skip-verify` is supplied. Use that override only when file changes are intentional. Patch resumption requires a new `--task`; agent resumption restores saved history, tasks, summaries, and retention metadata. Keep referenced source sessions when cleaning up state.
+
+With `--shell --resume-session SESSION --noninteractive`, saved command turns can execute automatically. Existing `response_shell_output` is reused instead of rerunning those commands, while a saved `session_end` response exits without execution.
 
 ## Local model servers 🌐
 
@@ -328,9 +362,10 @@ mce --base-url http://localhost:11434/v1 \
 
 ## Security and Containment 🔐
 
-- Use `mcec` as a drop-in replacement for `mce` to restrict filesystem writes through a systemd sandbox; state and private temporary directories remain writable by default
-- Supply `--shell-networking` to enable network access during agent and shell operations
-- `mcec --contain-help` provides extensive options to customize the sandbox environment
+- Agent mode executes tools without confirmation by default. Use `--agent-review` for review and grant only the paths needed for the task.
+- Use `mcec` as a drop-in replacement for `mce` to restrict filesystem writes through a systemd sandbox. State and private temporary directories remain writable by default; the working directory is not automatically writable.
+- Shell commands cannot create non-`AF_UNIX` sockets unless `--shell-networking` is enabled. This setting does not restrict API calls or hook scripts. `--shell-timeout SECONDS` limits each shell command independently of the API timeout; `0` disables the limit.
+- `mcec --contain-help` describes sandbox settings. The default sandbox limits writes rather than hiding all host files or credentials; host networking and most of the invoking environment remain available. See the `mcec` argument reference for the separate scope of inner shell services.
 
 
 ## Tested Providers ⚒️
@@ -364,33 +399,34 @@ Options shown with `[BOOL]` accept `on`/`off`, `true`/`false`, `yes`/`no`, or `1
 | `-h`, `--help` | Show the help message and exit. |
 | `-a TEXT`, `--ask TEXT` | Prompt without file context; use `-` for standard input or `e` to edit with `$EDITOR`. |
 | `--ask-file FILE...` | Read and combine ask prompts from one or more files; may be repeated. |
-| `-t TEXT`, `--task TEXT` | Supply a contextual task as one argument; use `-` for standard input or `e` to edit. Shell and agent tasks may omit file context. |
+| `-t TEXT`, `--task TEXT` | Supply a contextual task as one argument; use `-` for standard input or `e` to edit. Patch, shell, and agent tasks may omit file context. |
 | `--task-file FILE...` | Read and combine task prompts from one or more files; may be repeated. |
-| `--plan [BOOL]` | Generate a next-step prompt from the task and context for review or editing before using it as the task. |
-| `--agent` | Run a reviewed, multi-turn agent session using controller tool calls. |
-| `--agent-auto` | Automatically confirm agent tool calls and display each before execution. Agent patches overwrite source files unless `--patch-suffix` is supplied. Requires `--agent`. |
-| `--agent-context-expires DEFAULT [MIN] [MAX]` | Set agent context expiry in controller turns; defaults to `12 6 24`. Values must satisfy `MIN <= DEFAULT <= MAX`. Requires `--agent`. |
-| `--agent-hook-context SCRIPT...` | Execute scripts before each controller request and include successful stdout in `<additional_context>` blocks. Scripts run directly without tool-call review. Requires `--agent`. |
+| `--plan [BOOL]` | Generate a next-step prompt from the task and context for review or editing before using it as the task. With `--noninteractive`, save the plan and stop. |
+| `--agent` | Run a multi-turn agent session using native controller tool calls. Calls execute automatically and are displayed before execution; patches overwrite source paths unless `--patch-suffix` is explicitly supplied. Conflicting standalone patch and shell options are ignored. |
+| `--agent-review` | Review agent tool calls and changes before execution. Requires `--agent`; accepted patches follow the usual patch-review and suffix settings. |
+| `--agent-context-expires DEFAULT [MIN] [MAX]` | Set agent context expiry in controller turns; built-in defaults are `24 12 48`. Omitted bounds retain their built-in values. Values must satisfy `MIN <= DEFAULT <= MAX`. Requires `--agent`. |
+| `--agent-hook-context SCRIPT...` | Execute scripts before each controller turn and include successful stdout in `<additional_context>` blocks. Scripts run directly without tool-call review. Requires `--agent`. |
 | `--agent-profile NAME[,NAME...]` | Load stored profiles as `agent_NAME` controller tools; accepts comma-separated names and may be repeated. Use with `--agent` or `--agent-tool-list`. |
-| `--agent-tool-list` | List built-in tool names and descriptions, plus any selected `--agent-profile` tools, without running a session. |
+| `--agent-profile-default NAME` | Replace the generic `agent` continuation tool with the selected schema-constrained worker profile. Use with `--agent` or `--agent-tool-list`. |
+| `--agent-tool-list` | List built-in and selected profile tool names and descriptions, including any `--agent-profile-default` replacement, without running a session. |
 | `-f FILE...`, `--files FILE...` | Include files as context; use `-` for standard input. In agent mode, context supplied here is pinned. |
 | `--files-list FILE...` | Read context paths from one or more list files; blank lines and lines beginning with `#` are ignored. May be repeated. |
 | `-p NAME`, `--profile NAME` | Select an existing configuration profile. |
 | `-o FILE`, `--output-file FILE` | Write response output to the given file, overwriting it if it exists. |
 | `--shell [BOOL]` | Generate, review, and execute shell-command manifests for the task, with follow-up turns as needed. |
-| `--shell-networking [BOOL]` | Allow shell commands, including agent shell tools, to create sockets using address families other than `AF_UNIX`. Defaults to `off`; requires shell or agent mode. |
-| `--patch [BOOL]` | Generate a line-based, multi-file patch. Changed files use suffixed output unless review or branch settings select in-place writes. Requires readable context files; standard input is not supported. |
+| `--shell-timeout SECONDS` | Set the per-command timeout for standalone and agent shell execution. Defaults to `0` (disabled); must be a non-negative integer. Independent of `--llm-timeout`. |
+| `--shell-networking [BOOL]` | Allow shell commands, including agent shell tools, to create sockets using address families other than `AF_UNIX`. Defaults to `off`; requires shell or agent mode. Does not control API requests. |
+| `--patch [BOOL]` | Generate a line-based, multi-file patch for existing or new files, with optional context. Include existing files to edit as context; standard input is not supported. Changed files use suffixed output unless review or branch settings select in-place writes. |
 | `--patch-branch [BOOL\|NAME]` | Use an `mce`-prefixed Git branch and commit patch changes; defaults to `mcebranch` and overrides suffix settings. Also selects the branch for `--patch-merge` or `--patch-file-apply`. |
 | `-D [NAME]`, `--patch-branch-remove [NAME]` | Delete a patch branch, including unmerged commits; defaults to `mcebranch`. |
 | `-M TEXT...`, `--patch-merge TEXT...` | Squash-merge the selected patch branch, commit with the supplied message, and delete the branch after success. Select a custom branch with `--patch-branch`. |
 | `--patch-review [BOOL]` | Review diffs before writing. Approved changes use original paths unless a suffix override is active; patch generation supports revisions and navigation between patch turns. |
 | `-S SUFFIX`, `--patch-suffix SUFFIX` | Override the suffix for patched files; the built-in default is `.mcepatched`. |
-| `--patch-save [BOOL]` | Save generated unified diffs and JSON patch manifests under `~/.local/state/mince/patches`; defaults to `on`. |
 | `--patch-file-apply SESSION_OR_PATH [TURN]` | Apply a saved session patch, optionally from a specific turn, or a JSON patch manifest file. Honors review, suffix, and branch settings; makes no API request. `TURN` requires a session name. |
 | `--patch-file-print SESSION_OR_PATH [TURN]` | Print a unified diff against current files from a saved session patch or JSON manifest, without an API request. `TURN` requires a session name. |
-| `--noninteractive` | Disable prompts and force quiet mode and local logging. Task results, generated patches, and fresh shell/agent proposals are saved without review. `--agent-auto`, resumed shell sessions, and `--patch-file-apply` can still execute commands or modify files. |
-| `--reuse-session SESSION_NAME [TURN]` | Reuse context paths and task state from a completed turn, latest by default. Supports shell, patch, agent, and tree workflows; agents restore tool history and task lists, and tree mode resumes unfinished work. Patch revision requires `--task`. |
-| `--reuse-session-skip-verify` | Skip SHA-256 verification of reused context files; use when file changes are intentional. |
+| `--noninteractive` | Disable prompts, force quiet mode and local logging, and print the session name. Task/plan output, generated patches, and fresh shell proposals are saved. `--agent` still executes tools unless `--agent-review` is set; resumed shell sessions and `--patch-file-apply` can also execute commands or write files. |
+| `--resume-session SESSION_NAME [TURN]` | Start a new, linked session from a completed turn, latest by default; restore context paths and task state, following earlier resume links. Supports shell, patch, agent, and tree workflows. Patch revision requires `--task`; agents restore saved history, task lists, and context metadata. |
+| `--resume-session-skip-verify` | Skip SHA-256 verification of resumed context files; use when file changes are intentional. |
 | `--tree-files PATH...` | Recursively process the specified files or directories in tree mode. |
 | `--tree-files-list FILE...` | Read tree-mode file or directory roots from one or more list files; may be repeated. |
 | `--tree-task TEXT...` | Set the tree-mode task directly; use `-` for standard input or `e` to edit. |
@@ -432,8 +468,8 @@ Options shown with `[BOOL]` accept `on`/`off`, `true`/`false`, `yes`/`no`, or `1
 | `--token-cost INPUT:OUTPUT` | Set input and output costs per million tokens, or use `off` to disable estimates. A model override disables configured costs unless this option is also supplied. |
 | `--estimate-only` | Print the estimated input-token count for a regular request or plan without making an API request. Not supported for tree or direct agent sessions. |
 | `--max-output-tokens LIMIT` | Set the maximum output tokens the model may use; the built-in default is `65534`. |
-| `--llm-timeout SECONDS` | Set the API request and per-shell-command timeout in seconds; the built-in default is `300`. |
-| `--retry COUNT` | Set additional retries for transient API failures and invalid agent responses; defaults to `2`. Must be a non-negative integer. |
+| `--llm-timeout SECONDS` | Set the API request timeout in seconds; the built-in default is `300`. Shell command timeouts are configured separately with `--shell-timeout`. |
+| `--retry COUNT` | Set additional retries for transient API failures; agent requests also retry invalid responses and other non-permanent errors. Defaults to `3`; must be a non-negative integer. |
 | `--no-line-numbers [BOOL]` | Omit line-number prefixes when enabled. Patch and agent modes always number file context. |
 | `--print-reasoning [BOOL]` | Include available reasoning output in `<think>` tags. |
 | `--print-default-config` | Print the built-in default configuration as JSON. |
@@ -473,11 +509,17 @@ Options shown with `[BOOL]` accept `on`/`off`, `true`/`false`, `yes`/`no`, or `1
 | `--agent-profile-print-json [NAME...]` | Print stored agent-profile documents as JSON keyed by name; prints all when names are omitted. |
 | `--agent-profile-list` | List stored agent profile names and descriptions. |
 | `--log-view SESSION` | Display a saved local log session. |
-| `--patch-view SESSION` | Display a saved unified-diff patch session. |
+| `--patch-view SESSION` | Display the latest saved unified diff in session state, or a legacy patch file when no state session exists. |
 | `--tree-view SESSION` | Display a saved combined Markdown tree report. |
 | `--state-print-json [SESSION [TURN] [TYPE...]]` | Print selected saved artifacts as a JSON object. With no arguments, list artifact types; with a session, default to its latest completed turn. |
 | `--shell-session-print-json SESSION [TURN]` | Print a saved shell-session response as JSON, optionally for a specific turn. |
 | `--remove-expired-data [KEEP_DAYS]` | Delete logs, patches, tree output, and state data older than `KEEP_DAYS`; defaults to `60`. |
+
+Compatibility options:
+
+- `--agent-auto` is deprecated and still requires `--agent`; automatic execution is now the default. Use `--agent-review` to request confirmation.
+- `--reuse-session` and `--tree-reuse-session` are deprecated aliases for `--resume-session`; `--reuse-session-skip-verify` is a deprecated alias for `--resume-session-skip-verify`.
+- `--patch-save` is deprecated and has no effect. Validated patch manifests and diffs are saved in session state; no `patch_save` setting is needed.
 
 Environment variable reference.
 
@@ -494,7 +536,7 @@ Environment variable reference.
 mcec [CONTAINMENT_OPTIONS...] [--] [MCE_ARGS...]
 ```
 
-Containment options are consumed by the wrapper; other arguments are passed unchanged to the assistant. Use `--` to stop wrapper option parsing, `mcec --contain-help` for containment help, or `mce --help` for assistant help. With `--contain-use-shell`, assistant arguments are ignored. Invoking `mcec` without arguments prints help guidance without starting a service.
+Containment options are consumed by the wrapper; other arguments are forwarded to the assistant. Explicit `--agent` or enabled `--shell` flags also trigger the inner shell-containment setup described below. Use `--` to stop wrapper option parsing, `mcec --contain-help` for containment help, or `mce --help` for assistant help. With `--contain-use-shell`, assistant arguments are ignored. Invoking `mcec` without arguments prints help guidance without starting a service.
 
 Options taking one value accept `--option VALUE` or `--option=VALUE`. Bind options require separate `SOURCE DESTINATION` arguments. Read/write grants and bind sources must be existing regular files or directories. Relative grant and bind paths are resolved against the contained working directory; grant an existing parent directory when the assistant needs to create a new file.
 
@@ -509,7 +551,7 @@ Options taking one value accept `--option VALUE` or `--option=VALUE`. Bind optio
 | `--contain-state MODE` | Use `persistent` (default), `ephemeral`, or `read-only` state at `~/.local/state/mince`. Ephemeral state is a writable tmpfs without saved configuration or sessions; read-only mode requires an existing state directory. |
 | `--contain-private-tmp MODE` | Enable (`on`, default) or disable (`off`) private writable `/tmp` and `/var/tmp`. |
 | `--contain-no-private-tmp` | Disable private temporary directories; equivalent to `--contain-private-tmp off`. |
-| `--contain-network MODE` | Use `host` networking (default) or `none`. The latter uses a private network namespace and restricts socket creation to `AF_UNIX`. API calls normally require host networking. |
+| `--contain-network MODE` | Set networking for the outer service to `host` (default) or `none`. The latter uses a private network namespace and restricts socket creation to `AF_UNIX`; API calls normally require host networking. Separately launched shell services have their own networking settings. |
 | `--contain-timeout SECONDS` | Stop the transient service after a positive integer number of seconds. |
 | `--contain-allow-namespaces` | Allow the contained process to create namespaces. Disabled by default because this may weaken filesystem containment. |
 | `--contain-use-shell` | Run `$SHELL` instead of the assistant for sandbox testing. `SHELL` must identify an executable; assistant arguments are ignored. |
@@ -517,7 +559,13 @@ Options taking one value accept `--option VALUE` or `--option=VALUE`. Bind optio
 | `--contain-help` | Show containment help and exit. |
 | `--` | Stop wrapper option parsing and pass all remaining arguments to the assistant unchanged. |
 
-Containment primarily limits filesystem writes; it is not complete isolation. Host networking and most environment variables, including API credentials, remain available by default. `--shell-networking` controls the assistant's shell socket restriction and cannot override `--contain-network none`.
+Containment primarily limits filesystem writes; it is not complete isolation. Host networking and most environment variables, including API credentials, remain available by default. The wrapper's `--contain-network` applies to the outer service, while `--shell-networking` controls the assistant's shell socket restrictions.
+
+When the forwarded command line explicitly enables `--agent` or `--shell`, the wrapper adds the assistant's internal `--contain` option with the `--contain-write-path`/`-W` grants. The outer service uses `PrivateDevices=no` in this case; shell commands are launched in separate systemd user services with their own filesystem, socket, and per-command timeout restrictions. Modes enabled only through configuration are not detected by this wrapper logic.
+
+Only write-path grants are forwarded as inner writable paths; writable bind destinations and the default state-directory grant are not added automatically. The inner services do not inherit the outer service's custom bind mounts, home/state visibility, or network namespace. Their networking is governed by `--shell-networking`, so `--contain-network none` alone is not an inner-shell network guarantee.
+
+Inspect `--contain-dry-run` output to see the generated service command and injected assistant arguments. `--contain-use-shell` is useful for testing the outer sandbox only.
 
 ## Make targets 🚀
 
@@ -614,7 +662,7 @@ If token costs are set in the configuration and `--model` is specified, `--token
 
 **Agent using incorrect tool calls**
 
-Ensure the default agent system prompt does not contain tool call instructions, use `--prompt-reset-default agent` to reset the agent system prompt.
+Agent controllers require native function/tool calls from a compatible Responses API endpoint. Ordinary response text or JSON that merely describes calls is rejected. The tool-call protocol is added automatically; keep custom `agent_system_prompt` content focused on task guidance. Use `mce --prompt-reset-default agent` to restore the built-in library entry if older instructions conflict.
 
 **Command line arguments may clash**
 

@@ -796,6 +796,7 @@ STATE_SESSION_ARTIFACTS = (
     STATE_RESUME_SESSION_TURN_ARTIFACT,
 )
 STATE_TURN_ARTIFACTS = (
+    "request",
     "request_system_prompt",
     "request_task",
     "request_agent_turn_metadata",
@@ -1264,6 +1265,8 @@ def start_state_turn(
     task: str,
     file_paths: list[Path],
     skip_missing_files: bool = False,
+    user_prompt: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
  ) -> Path:
     turn_dir = state_session_dir / str(turn)
     turn_dir.mkdir(parents=True, exist_ok=True)
@@ -1273,6 +1276,12 @@ def start_state_turn(
     )
     for filename, content in state_files:
         write_state_artifact(turn_dir, filename, content)
+    if user_prompt is not None:
+        write_state_artifact(
+            turn_dir,
+            "request",
+            format_request_text(system_prompt, user_prompt),
+        )
     request_files_path = state_session_dir / "request_files"
     if not request_files_path.exists():
         request_file_lines: list[str] = []
@@ -4007,6 +4016,28 @@ def token_encoding_for_model(model: str) -> Any:
     except Exception:
         return tiktoken.get_encoding("o200k_base")
 
+
+def format_context_entry(
+    name: str,
+    content: str,
+    model: str = "",
+    attributes: str = "",
+) -> str:
+    token_count = len(token_encoding_for_model(model).encode(content))
+    return (
+        f"<{name}{attributes} token_count='{token_count}'>\n"
+        f"{content}</{name}>"
+    )
+
+
+def format_request_text(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+    return request_text
+
+
 def estimate_request_tokens(
     model: str,
     system_prompt: str,
@@ -4014,18 +4045,9 @@ def estimate_request_tokens(
     tools: list[dict[str, Any]] | None = None,
 ) -> int:
     encoding = token_encoding_for_model(model)
-
-    request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
-    if tools:
-        request_text += (
-            "\n\nTOOLS:\n"
-            + json.dumps(
-                tools,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-    return len(encoding.encode(request_text))
+    return len(
+        encoding.encode(format_request_text(system_prompt, user_prompt))
+    )
 
 def truncate_text_to_tokens(text: str, model: str, max_tokens: int) -> str:
     if max_tokens <= 0 or not text:
@@ -4590,12 +4612,17 @@ def build_context_sections(
                 error_attribute += (
                     f" expires_in_turns='{missing_file_expires_in_turns}'"
                 )
-            return (
-                f"<file{last_refreshed_time_attribute}{last_modified_time_attribute}{error_attribute} path='{context_path}' encoding='utf-8' "
-                f"line_ending='{content_line_ending}' "
-                f"total_lines='{content_total_lines}'>\n"
-                f"{numbered_content}{context_ending}</file>"
-            ).strip()
+            return format_context_entry(
+                "file",
+                f"{numbered_content}{context_ending}",
+                model=model,
+                attributes=(
+                    f"{last_refreshed_time_attribute}{last_modified_time_attribute}"
+                    f"{error_attribute} path='{context_path}' encoding='utf-8' "
+                    f"line_ending='{content_line_ending}' "
+                    f"total_lines='{content_total_lines}'"
+                ),
+            )
 
         section = build_section()
         if encoding is not None and token_limit is not None:
@@ -4621,6 +4648,7 @@ def build_context(
     max_file_size_kb: int,
     add_line_numbers: bool = True,
     stdin_content: str | None = None,
+    model: str = "",
 ) -> str:
     return "\n".join(
         section
@@ -4629,6 +4657,7 @@ def build_context(
             max_file_size_kb=max_file_size_kb,
             add_line_numbers=add_line_numbers,
             stdin_content=stdin_content,
+            model=model,
         )
     )
 
@@ -6144,6 +6173,7 @@ def agent_file_context_section(
     section: str,
     expires_in_turns: int,
     turn: int = AGENT_INITIAL_FILE_CONTEXT_TURN,
+    model: str = "",
 ) -> str:
     attributes = agent_file_context_attributes(section)
     if attributes is None:
@@ -6151,20 +6181,24 @@ def agent_file_context_section(
     attribute_text = " ".join(
         f"{name}='{value}'"
         for name, value in attributes.items()
-        if name not in ("turn", "expires_in_turns")
+        if name not in ("turn", "expires_in_turns", "token_count")
     )
-    return (
-        f"<file turn='{turn}' expires_in_turns='{expires_in_turns}' "
-        f"{attribute_text}>\n"
-        + section.split("\n", 1)[1]
+    return format_context_entry(
+        "file",
+        section.split("\n", 1)[1].removesuffix("</file>"),
+        model=model,
+        attributes=(
+            f" turn='{turn}' expires_in_turns='{expires_in_turns}' "
+            f"{attribute_text}"
+        ),
     )
-
 
 
 def format_agent_readfile_contexts(
     turns: list[AgentTurn],
     turn_numbers: list[int],
     visible_turn_numbers: set[int],
+    model: str = "",
 ) -> str:
     sections: list[str] = []
     for turn_number, turn in zip(turn_numbers, turns):
@@ -6180,6 +6214,7 @@ def format_agent_readfile_contexts(
                     section,
                     file_expires_in_turns[path],
                     turn_number,
+                    model=model,
                 )
             )
     return "\n".join(sections)
@@ -6192,6 +6227,7 @@ def build_agent_files_context(
     turns: list[AgentTurn],
     turn_numbers: list[int],
     visible_turn_numbers: set[int],
+    model: str = "",
 ) -> str:
     refreshed_paths = {
         path
@@ -6203,6 +6239,7 @@ def build_agent_files_context(
         agent_file_context_section(
             file_contexts[index][1],
             file_expires_in_turns[file_contexts[index][0]],
+            model=model,
         )
         for index in sorted(visible_file_indexes)
         if file_contexts[index][0] not in refreshed_paths
@@ -6211,6 +6248,7 @@ def build_agent_files_context(
         turns,
         turn_numbers,
         visible_turn_numbers,
+        model=model,
     )
     return "\n".join(
         value for value in (*initial_sections, readfile_context) if value
@@ -6355,6 +6393,7 @@ def format_agent_history(
     turn_numbers: list[int] | None = None,
     pinned_turn_numbers: set[int] | None = None,
     visible_turn_numbers: set[int] | None = None,
+    model: str = "",
  ) -> str:
     if turn_numbers is None:
         turn_numbers = list(range(len(turns)))
@@ -6390,17 +6429,23 @@ def format_agent_history(
         pinned_attribute = (
             " pinned" if turn_number in pinned_turn_numbers else ""
         )
-        tool_call_content = (
-            turn.tool_call.tool
-            if purge_in_turns is not None or turn.tool_call.tool.startswith("meta_")
-            else format_agent_tool_call(turn.tool_call)
-        )
+        if purge_in_turns is not None or turn.tool_call.tool.startswith("meta_"):
+            tool_call_content = turn.tool_call.tool
+        elif turn.tool_call.tool == AGENT_PATCH_TOOL:
+            tool_call_content = format_agent_tool_call_for_output(turn.tool_call)
+        else:
+            tool_call_content = format_agent_tool_call(turn.tool_call)
         blocks.append(
-            f"<agent_turn{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' "
-            f"expires_in_turns='{turn.expires_in_turns}'{purge_attribute}>\n"
-            f"<tool_call>\n{tool_call_content}\n</tool_call>\n"
-            f"<tool_content>\n{tool_content}\n</tool_content>\n"
-            "</agent_turn>"
+            format_context_entry(
+                "agent_turn",
+                f"<tool_call>\n{tool_call_content}\n</tool_call>\n"
+                f"<tool_content>\n{tool_content}\n</tool_content>\n",
+                model=model,
+                attributes=(
+                    f"{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' "
+                    f"expires_in_turns='{turn.expires_in_turns}'{purge_attribute}"
+                ),
+            )
         )
     return "\n\n".join(blocks)
 
@@ -7462,13 +7507,17 @@ def agent_context_checksum(context: str) -> str:
     return hashlib.sha256(context.encode("utf-8")).hexdigest() if context else ""
 
 
-def format_agent_context_summary(summary: AgentContextSummary | None) -> str:
+def format_agent_context_summary(
+    summary: AgentContextSummary | None,
+    model: str = "",
+) -> str:
     if summary is None or not summary.content:
         return ""
-    return (
-        f"<agent_context_summary expires_in_turns='{summary.expires_in_turns}'>\n"
-        f"{summary.content}\n"
-        "</agent_context_summary>"
+    return format_context_entry(
+        "agent_context_summary",
+        f"{summary.content}\n",
+        model=model,
+        attributes=f" expires_in_turns='{summary.expires_in_turns}'",
     )
 
 
@@ -7574,10 +7623,10 @@ def update_agent_context_summary(
             context = "\n".join(
                 value for value in (
                     format_agent_history(
-                        [turn], [index], pinned_turn_numbers
+                        [turn], [index], pinned_turn_numbers, model=model
                     ),
                     format_agent_readfile_contexts(
-                        [turn], [index], {index}
+                        [turn], [index], {index}, model=model
                     ),
                 ) if value
             )
@@ -7585,11 +7634,13 @@ def update_agent_context_summary(
         elif kind == "file":
             path, section = file_contexts[index]
             context = agent_file_context_section(
-                section, file_expires_in_turns[path]
+                section, file_expires_in_turns[path], model=model
             )
             removed_file_paths.add(path)
         else:
-            context = f"<agent_context>\n{active_context}\n</agent_context>"
+            context = format_context_entry(
+                "agent_context", f"{active_context}\n", model=model
+            )
             summary.active_context_checksum = agent_context_checksum(active_context)
             active_context = ""
         remaining_tokens -= len(encoding.encode(context))
@@ -7692,6 +7743,7 @@ def build_agent_context_window_prompt(
             turns,
             turn_numbers,
             visible_turn_numbers,
+            model=model,
         )
         user_prompt = build_agent_followup_prompt(
             task=task,
@@ -7712,6 +7764,7 @@ def build_agent_context_window_prompt(
             include_task=include_task,
             current_unix_time=current_unix_time,
             current_turn=current_turn,
+            model=model,
         )
         return (
             user_prompt,
@@ -7872,6 +7925,7 @@ def build_agent_followup_prompt(
     current_unix_time: int | None = None,
     context_summary: AgentContextSummary | None = None,
     current_turn: int | None = None,
+    model: str = "",
 ) -> str:
     if current_unix_time is None:
         current_unix_time = int(time.time())
@@ -7881,14 +7935,16 @@ def build_agent_followup_prompt(
     )
     instruction_parts = [
         *schema_instructions,
-        "The `<meta_task_list>` data uses `TASK_NUMBER [TASK_STATUS] TASK` "
+        "The `<meta_task_list>` uses `TASK_NUMBER. [TASK_STATUS] TASK` "
         "for each task, or `No tasks.` when empty.",
+        format_context_entry(
+            "meta_task_list",
+            f"{format_agent_meta_task_list(meta_task_list)}\n",
+            model=model,
+        ),
     ]
     additional_parts: list[str] = [
         format_agent_tool_schema_context(schemas),
-        "<meta_task_list>\n"
-        f"{format_agent_meta_task_list(meta_task_list)}\n"
-        "</meta_task_list>",
     ]
     if current_token_estimate is not None and token_limit is not None:
         instruction_parts.append(
@@ -7906,22 +7962,27 @@ def build_agent_followup_prompt(
 
     for hook_content in hook_contents:
         additional_parts.append(
-            f"<additional_context>\n{hook_content}</additional_context>"
+            format_context_entry(
+                "additional_context", hook_content, model=model
+            )
         )
 
-    summary_context = format_agent_context_summary(context_summary)
+    summary_context = format_agent_context_summary(context_summary, model=model)
     if summary_context:
         instruction_parts.append(summary_context)
 
     if active_context:
         additional_parts.append(
-            f"<agent_context>\n{active_context}\n</agent_context>"
+            format_context_entry(
+                "agent_context", f"{active_context}\n", model=model
+            )
         )
     history = format_agent_history(
         turns,
         turn_numbers,
         pinned_turn_numbers,
         visible_turn_numbers,
+        model=model,
     )
 
     if history:
@@ -8125,6 +8186,8 @@ def request_agent_model(
             task,
             settings.file_paths,
             skip_missing_files=True,
+            user_prompt=user_prompt,
+            tools=tools,
         )
         if (tools or summary_token_budget is not None) and settings.context_summary is not None:
             write_state_artifact(
@@ -8326,7 +8389,11 @@ def run_agent_profile_tool(
             settings.system_prompt_with_task,
         )
         worker_context = (
-            f"<agent_context>\n{context}\n</agent_context>"
+            format_context_entry(
+                "agent_context",
+                f"{context}\n",
+                model=settings.model_settings.model,
+            )
             if context
             else ""
         )
@@ -8338,7 +8405,8 @@ def run_agent_profile_tool(
             include_task=not settings.system_prompt_with_task,
             additional_prompt=worker_context,
             additional_instructions=format_agent_context_summary(
-                settings.context_summary
+                settings.context_summary,
+                model=settings.model_settings.model,
             ),
             current_unix_time=int(time.time()),
         )
@@ -8722,6 +8790,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 turns,
                 list(range(len(turns))),
                 set(agent_history_turn_numbers(turns)),
+                model=settings.model_settings.model,
             )
             request_system_prompt = full_system_prompt
             if summary_token_budget is not None:
@@ -9798,6 +9867,7 @@ def run_tree_mode(
     def start_tree_state_turn(
         system_prompt: str,
         task: str,
+        user_prompt: str,
     ) -> Path:
         nonlocal next_state_turn
         with state_turn_lock:
@@ -9809,6 +9879,7 @@ def run_tree_mode(
             system_prompt,
             task,
             file_paths=file_paths,
+            user_prompt=user_prompt,
         )
 
     state_db_path = str(tree_session_dir / f"{tree_session_stem}.dbm")
@@ -9932,6 +10003,7 @@ def run_tree_mode(
                 file_paths=[file_path],
                 max_file_size_kb=max_file_size_kb,
                 add_line_numbers=add_line_numbers,
+                model=model,
             )
             selected_task = tree_prompt_for_path(
                 file_path, tree_task_prompts, task
@@ -9967,6 +10039,7 @@ def run_tree_mode(
             state_turn_path = start_tree_state_turn(
                 system_prompt=full_system_prompt,
                 task=selected_task,
+                user_prompt=user_prompt,
             )
             if request_tokens > token_limit:
                 raise ValueError(
@@ -12870,6 +12943,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 missing_file_expires_in_turns=(
                     agent_context_expires[1] if agent_mode else None
                 ),
+                model=model,
             )
             context = "\n".join(
                 section for _, section in context_sections
@@ -13003,6 +13077,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             task,
             file_paths=file_paths,
             skip_missing_files=agent_mode,
+            user_prompt=plan_user_prompt,
         )
         state_turn += 1
         append_log(
@@ -13278,6 +13353,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 request_system_prompt,
                 task,
                 file_paths=file_paths,
+                user_prompt=request_user_prompt,
             )
             state_turn += 1
         stream_sink = None
@@ -13362,6 +13438,15 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 file_paths=file_paths,
             )
             state_turn += 1
+            reused_request = read_optional_state_artifact(
+                reused_shell_turn.turn_dir / "request"
+            )
+            if reused_request is not None:
+                write_state_artifact(
+                    state_turn_path,
+                    "request",
+                    reused_request,
+                )
             complete_state_turn(
                 state_turn_path, reasoning, result, reasoning_items
             )
