@@ -66,6 +66,7 @@ class WrapperOptions:
     private_devices: bool = True
     network_mode: str = "host"
     runtime_seconds: int | None = None
+    trace_file: str | None = None
     allow_namespaces: bool = False
     use_shell: bool = False
     dry_run: bool = False
@@ -115,6 +116,10 @@ def print_usage() -> None:
         "  --contain-timeout SECONDS\n"
         "      Stop the transient service after a positive number of "
         "seconds.\n"
+        "  --contain-trace FILE\n"
+        "      Trace the contained command and its children to FILE with "
+        "strace. Relative paths use the working directory; the parent must "
+        "exist. Existing files are overwritten.\n"
         "  --contain-allow-namespaces\n"
         "      Permit the contained process to create namespaces. This may "
         "weaken filesystem containment and is disabled by default.\n"
@@ -341,6 +346,16 @@ def parse_wrapper_arguments(
             index = next_index
             continue
 
+        matched, value, next_index = _option_value(
+            argument, "--contain-trace", arguments, index
+        )
+        if matched:
+            options.trace_file = _require_nonempty(
+                "--contain-trace", value
+            )
+            index = next_index
+            continue
+
         if argument.startswith("--contain-"):
             raise ValueError(f"unknown containment option: {argument}")
         mince_arguments.append(argument)
@@ -427,6 +442,32 @@ def resolve_binding(
     )
 
 
+def resolve_trace_file(
+    value: str,
+    base_directory: Path,
+) -> PathGrant:
+    destination = absolute_path(value, base_directory)
+    if destination.exists() or destination.is_symlink():
+        grant = resolve_existing_grant(
+            str(destination), base_directory, "trace file"
+        )
+        if not grant.source.is_file():
+            raise ValueError(
+                f"trace file must be a regular file: {value}"
+            )
+        return grant
+
+    parent_grant = resolve_existing_grant(
+        str(destination.parent), base_directory, "trace file parent"
+    )
+    if not parent_grant.source.is_dir():
+        raise ValueError(
+            f"trace file parent is not a directory: {destination.parent}"
+        )
+    return PathGrant(
+        source=parent_grant.source / destination.name,
+        destination=destination,
+    )
 
 
 def find_python() -> Path:
@@ -750,6 +791,35 @@ def main() -> int:
             options, mince_arguments, invocation_directory
         )
 
+        trace_grant: PathGrant | None = None
+        if options.trace_file is not None:
+            strace_command = shutil.which("strace")
+            if strace_command is None:
+                raise ValueError("strace was not found on PATH")
+            strace_grant = resolve_existing_grant(
+                strace_command, invocation_directory, "strace"
+            )
+            runtime_grants.append(strace_grant)
+            trace_grant = resolve_trace_file(
+                options.trace_file, working_directory
+            )
+            command_arguments = [
+                str(strace_grant.destination),
+                "-f",
+                "-ttt",
+                "-T",
+                "-s",
+                "0",
+                "-v",
+                "-yy",
+                "-e",
+                "trace=all",
+                "-o",
+                str(trace_grant.destination),
+                "--",
+                *command_arguments,
+            ]
+
         read_grants = [
             resolve_existing_grant(
                 value, working_directory, "read-only path"
@@ -923,6 +993,10 @@ def main() -> int:
             else:
                 add_read_only_path(state_destination)
 
+        if trace_grant is not None:
+            add_binding(trace_grant)
+            add_writable_path(trace_grant.destination)
+
         command = build_systemd_command(
             systemd_run=systemd_run,
             working_directory=working_directory,
@@ -936,6 +1010,8 @@ def main() -> int:
         if options.dry_run:
             print(shlex.join(command))
             return 0
+        if trace_grant is not None and not trace_grant.source.exists():
+            trace_grant.source.touch(mode=0o600, exist_ok=False)
         os.execvpe(systemd_run, command, os.environ)
     except (OSError, ValueError) as exc:
         print(f"mince-contain: {exc}", file=sys.stderr)
