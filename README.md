@@ -309,7 +309,6 @@ mce --agent --agent-profile-default code_patch \
 
 `--agent-context-expires` sets `DEFAULT [MIN] [MAX]` in controller turns; the built-in values are `24 12 48`. Omitted bounds use their built-in values, and `MIN <= DEFAULT <= MAX` is required. Initial context supplied through `--files` is pinned against expiry; `--files-list` and configured files are not automatically pinned. Pins do not prevent removal under token pressure.
 
-`readfile` loads numbered file snapshots, and each `patch` call automatically adds a companion `readfile` for its document paths. The controller can pin or extend retention through `meta_context_control`, targeting an initial file path or a displayed history `turn:N`. Files loaded by `readfile` or patch companions are retained through their owning history turn. Markdown context summaries refresh automatically using the configured default expiry; summaries are not live file contents.
 
 Provide fresh context from an existing, trusted executable before each agent controller request:
 
