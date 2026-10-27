@@ -13,6 +13,7 @@ import errno
 import socket
 import hashlib
 import argparse
+import getpass
 import json
 import math
 import sys
@@ -148,6 +149,11 @@ DEFAULT_SHELL_SYSTEM_PROMPT = (
 DEFAULT_AGENT_SYSTEM_PROMPT = (
     "Run an agent session. Complete the requested task accurately and "
     "efficiently. Examine the previous turns to prevent duplicate work. "
+)
+AGENT_TASK_PRIORITY_SYSTEM_PROMPT = (
+    "The `<meta_task_list>` defines the current work priorities. Prefer its "
+    "active tasks over the broad `<user_supplied_instructions>` when choosing "
+    "the next action. Use the broad instructions as overall session guidance."
 )
 AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "Control the autonomous agent session through the provided tools. Complete "
@@ -294,6 +300,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "extra_body": "",
     "log": "on",
     "api_log": "on",
+}
+
+CONFIG_BOOLEAN_KEYS = (
+    "explicit_prompt_cache", "system_prompt_with_task", "line_numbers",
+    "prompt_expansion", "plan", "shell", "shell_trace", "shell_networking",
+    "patch", "patch_review", "quiet", "print_reasoning",
+    "response_json_repair", "stream", "log", "api_log",
+)
+CONFIG_VALUE_CHOICES: dict[str, tuple[str, ...]] = {
+    "service_tier": ("off", "auto", "default", "flex", "scale", "priority"),
+    "reasoning": (
+        "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    ),
+    "reasoning_mode": ("standard", "pro"),
+    "response_format": ("text", "json", "schema"),
+    "response_verbosity": ("low", "medium", "high", "off"),
 }
 
 INHERIT_PROFILE_CONFIG_KEY = "_inherit_profile"
@@ -569,11 +591,6 @@ def _merged_config_from_path(
                 )
             config.update(_merged_config_from_path(parent_path, active_paths))
         config.update(raw)
-        for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
-            if deprecated not in raw:
-                continue
-            elif replacement not in raw:
-                config[replacement] = raw[deprecated]
         return config
     finally:
         active_paths.remove(resolved_path)
@@ -595,22 +612,52 @@ def inherited_config_names(config_path: Path) -> set[str]:
         return set()
 
     overridden_names = set(document)
-    for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
-        if deprecated in document and replacement is not None:
-            overridden_names.add(replacement)
     parent_config = merged_config(get_profile_path(parent_name))
     return set(parent_config) - overridden_names
 
-def migrate_deprecated_config(config: dict[str, Any]) -> bool:
-    changed = False
+def migrate_deprecated_config(config: dict[str, Any]) -> None:
     for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
         if deprecated not in config:
             continue
         if replacement is not None and replacement not in config:
             config[replacement] = config[deprecated]
         del config[deprecated]
-        changed = True
-    return changed
+
+
+def normalize_config_document(
+    config: dict[str, Any],
+    path: Path,
+    *,
+    repair_invalid: bool = False,
+) -> dict[str, Any]:
+    normalized_config = config.copy()
+    migrate_deprecated_config(normalized_config)
+    parent_name = _inherit_profile_name(normalized_config, path)
+    fallback = (
+        "inherited value"
+        if parent_name is not None
+        else "built-in default"
+    )
+    for name, default in DEFAULT_CONFIG.items():
+        value = normalized_config.get(name)
+        if value is not None:
+            try:
+                parse_config_value(name, value)
+            except ValueError as exc:
+                if not repair_invalid:
+                    raise
+                print(
+                    f"WARNING: Invalid configuration value in {path}: {exc}; "
+                    f"using the {fallback}.",
+                    file=sys.stderr,
+                )
+            else:
+                continue
+        if parent_name is None:
+            normalized_config[name] = default
+        else:
+            normalized_config.pop(name, None)
+    return normalized_config
 
 
 def ensure_config_exists() -> None:
@@ -628,8 +675,16 @@ def load_config() -> dict[str, Any]:
 def _prune_inherited_config(
     config: dict[str, Any],
     parent_name: str,
+    config_path: Path,
  ) -> dict[str, Any]:
-    parent_config = merged_config(get_profile_path(parent_name))
+    parent_path = get_profile_path(parent_name)
+    if not parent_path.exists():
+        raise ValueError(
+            f"inherited profile '{parent_name}' does not exist"
+        )
+    parent_config = _merged_config_from_path(
+        parent_path, {config_path.resolve()}
+    )
     pruned: dict[str, Any] = {
         INHERIT_PROFILE_CONFIG_KEY: parent_name
     }
@@ -641,23 +696,26 @@ def _prune_inherited_config(
     return pruned
 
 
-def save_config(config: dict[str, Any]) -> None:
-    migrated_config = config.copy()
-    migrate_deprecated_config(migrated_config)
-
-    raw_document = read_config_document(CONFIG_FILE, missing_ok=True)
-    parent_name = _inherit_profile_name(raw_document, CONFIG_FILE)
-    if parent_name is not None:
-        migrated_config[INHERIT_PROFILE_CONFIG_KEY] = parent_name
-        output_config = _prune_inherited_config(
-            migrated_config, parent_name
-        )
+def save_config(
+    config: dict[str, Any],
+    config_path: Path | None = None,
+) -> None:
+    path = CONFIG_FILE if config_path is None else config_path
+    raw_document = read_config_document(path, missing_ok=True)
+    parent_name = _inherit_profile_name(
+        raw_document if path.exists() else config, path
+    )
+    output_config = config.copy()
+    if parent_name is None:
+        output_config.pop(INHERIT_PROFILE_CONFIG_KEY, None)
     else:
-        migrated_config.pop(INHERIT_PROFILE_CONFIG_KEY, None)
-        output_config = DEFAULT_CONFIG.copy()
-        output_config.update(migrated_config)
-
-    write_json_document(CONFIG_FILE, output_config)
+        output_config[INHERIT_PROFILE_CONFIG_KEY] = parent_name
+    output_config = normalize_config_document(output_config, path)
+    if parent_name is not None:
+        output_config = _prune_inherited_config(
+            output_config, parent_name, path
+        )
+    write_json_document(path, output_config)
 
 PROMPT_TYPE_ALIASES: dict[str, str] = {
     "system": "system_prompt",
@@ -1320,7 +1378,7 @@ def start_state_turn(
         write_state_artifact(
             turn_dir,
             "request",
-            format_request_text(system_prompt, user_prompt, tools),
+            format_request_text(system_prompt, user_prompt),
         )
     request_files_path = state_session_dir / "request_files"
     if not request_files_path.exists():
@@ -1451,7 +1509,18 @@ def read_config_document(path: Path, missing_ok: bool = False) -> dict[str, Any]
     raw = read_json_document(path, "configuration file")
     if not isinstance(raw, dict):
         raise ValueError(f"configuration file {path} must contain a JSON object")
-    return raw
+    normalized_config = normalize_config_document(
+        raw, path, repair_invalid=True
+    )
+    if normalized_config != raw:
+        try:
+            write_json_document(path, normalized_config)
+        except OSError as exc:
+            print(
+                f"WARNING: Failed to update configuration file {path}: {exc}",
+                file=sys.stderr,
+            )
+    return normalized_config
 
 
 def write_json_document(path: Path, document: dict[str, Any]) -> None:
@@ -1690,7 +1759,7 @@ def handle_prompt_assign(
                 config[config_key] = "|".join(references)
                 if prompt_text:
                     config[config_key] += f" {prompt_text}"
-        write_json_document(profile_path, config)
+        save_config(config, profile_path)
     except Exception as exc:
         print(f"ERROR: Failed to assign prompt: {exc}", file=sys.stderr)
         return 1
@@ -1721,7 +1790,7 @@ def handle_prompt_unassign(
         )
         changed = unassign_prompt_from_config(config, prompt_path, keys)
         if changed:
-            write_json_document(profile_path, config)
+            save_config(config, profile_path)
     except Exception as exc:
         print(f"ERROR: Failed to unassign prompt: {exc}", file=sys.stderr)
         return 1
@@ -1751,7 +1820,7 @@ def handle_prompt_remove(name: str) -> int:
                 if unassign_prompt_from_config(
                     config, prompt_path, PROMPT_CONFIG_KEYS
                 ):
-                    write_json_document(config_path, config)
+                    save_config(config, config_path)
 
             if prompt_path.exists():
                 prompt_path.unlink()
@@ -2100,6 +2169,8 @@ def agent_tool_schemas(
     expires_schema: dict[str, Any] | None = None,
     default_profile: AgentProfile | None = None,
  ) -> list[dict[str, Any]]:
+    if default_profile is not None:
+        agent_profile_response_schema(default_profile)
     schemas: list[dict[str, Any]] = []
     for schema in AGENT_TOOL_SCHEMAS:
         if (
@@ -2123,6 +2194,7 @@ def agent_tool_schemas(
         schemas.append(schema)
     tool_names = {schema["name"] for schema in schemas}
     for profile in profiles:
+        agent_profile_response_schema(profile)
         schema = agent_agent_tool_schema(profile, expires_schema)
         if schema["name"] in tool_names:
             raise ValueError(
@@ -2352,35 +2424,38 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
             f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
         )
     if raw_value == "DEFAULT":
-        return name, get_default_config_value(canonical_name)
-
-    if canonical_name == "patch_branch":
-        return name, parse_patch_branch_value(raw_value)
-    if canonical_name == "agent_context_expires":
-        return name, normalize_agent_context_expires(raw_value)
-    if canonical_name == "retry":
-        return name, parse_retry_count(raw_value)
-    expected = (
-        DEFAULT_CONFIG[canonical_name]
-        if canonical_name in DEFAULT_CONFIG
-        else config.get(name)
-    )
-    if isinstance(expected, int) and not isinstance(expected, bool):
-        try:
-            return name, int(raw_value)
-        except ValueError as exc:
-            raise ValueError(f"{name} must be an integer") from exc
-    if isinstance(expected, float):
-        try:
-            return name, float(raw_value)
-        except ValueError as exc:
-            raise ValueError(f"{name} must be a number") from exc
-    if isinstance(expected, bool):
-        try:
-            return name, parse_bool(raw_value)
-        except argparse.ArgumentTypeError as exc:
-            raise ValueError(f"{name} must be a boolean") from exc
-    return name, raw_value
+        parsed_value = get_default_config_value(canonical_name)
+    elif canonical_name == "patch_branch":
+        parsed_value = parse_patch_branch_value(raw_value)
+    elif canonical_name == "agent_context_expires":
+        parsed_value = normalize_agent_context_expires(raw_value)
+    elif canonical_name == "retry":
+        parsed_value = parse_retry_count(raw_value)
+    else:
+        expected = (
+            DEFAULT_CONFIG[canonical_name]
+            if canonical_name in DEFAULT_CONFIG
+            else config.get(name)
+        )
+        if isinstance(expected, int) and not isinstance(expected, bool):
+            try:
+                parsed_value = int(raw_value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+        elif isinstance(expected, float):
+            try:
+                parsed_value = float(raw_value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a number") from exc
+        elif isinstance(expected, bool):
+            try:
+                parsed_value = parse_bool(raw_value)
+            except argparse.ArgumentTypeError as exc:
+                raise ValueError(f"{name} must be a boolean") from exc
+        else:
+            parsed_value = raw_value
+    parse_config_value(canonical_name, parsed_value)
+    return name, parsed_value
 
 
 def format_config_value(value: Any) -> str:
@@ -2444,7 +2519,6 @@ def prompt_config_value(
     config: dict[str, Any],
     key: str,
     label: str,
-    cast: type | None = None,
     mask: bool = False,
 ) -> None:
     current = config.get(key)
@@ -2470,20 +2544,17 @@ def prompt_config_value(
                     config[key] = inherited_config[key]
                 else:
                     config.pop(key, None)
-        elif value == "-" and key in PROMPT_CONFIG_KEYS:
-            config[key] = ""
         else:
-            config[key] = cast(value) if cast else value
+            raw_value = "" if value in ("-", '""') else value
+            _, config[key] = parse_config_assignment(
+                f"{key}={raw_value}", config
+            )
     except Exception:
         print(f"WARNING: Invalid value for {key}; keeping existing value.")
 
 
 def init_config_interactive() -> None:
     config = load_config()
-    config_document = read_config_document(CONFIG_FILE)
-    if migrate_deprecated_config(config_document):
-        write_json_document(CONFIG_FILE, config_document)
-        config = load_config()
 
     print(
         f"Config file: {CONFIG_FILE}\n"
@@ -2511,19 +2582,20 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
     prompt_config_value(config, "shell_system_prompt", "System prompt for shell command mode")
     prompt_config_value(config, "agent_system_prompt", "System prompt for agent mode")
-    prompt_config_value(config, "agent_context_expires", "Agent context expiry (DEFAULT [MIN] [MAX])", normalize_agent_context_expires)
+    prompt_config_value(config, "agent_context_expires", "Agent context expiry (DEFAULT [MIN] [MAX])")
     prompt_config_value(config, "plan", "Plan mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "shell", "Shell mode (off, on)")
     prompt_config_value(config, "shell_trace", "Trace shell commands with strace (off, on)")
     prompt_config_value(config, "shell_networking", "Allow networking for shell commands (off, on)")
-    prompt_config_value(config, "shell_timeout", "Shell command timeout in seconds (0 to disable)", int)
+    prompt_config_value(config, "shell_timeout", "Shell command timeout in seconds (0 to disable)")
     prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
-    prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)", parse_patch_branch_value)
+    prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)")
     prompt_config_value(config, "patch_suffix", "Suffix for patched files")
     prompt_config_value(config, "prompt_expansion", "Expand ^^promptname^^ references found in prompts (off, on)")
     prompt_config_value(config, "temperature", "Temperature (0.0-2.0 or off)")
     prompt_config_value(config, "top_p", "Top P (0.0-1.0 or off)")
+    prompt_config_value(config, "response_format", "Response format (text, json, schema)")
     prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
     prompt_config_value(config, "response_json_repair", "Repair JSON responses (off, on)")
     prompt_config_value(config, "stream", "Streaming text responses (off, on)")
@@ -2531,13 +2603,13 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
     prompt_config_value(config, "print_reasoning", "Include reasoning output in <think> tags (off, on)")
     prompt_config_value(config, "extra_body", "Custom model parameters (key=value pairs separated by commas)")
-    prompt_config_value(config, "token_limit", "Input token limit", int)
-    prompt_config_value(config, "max_output_tokens", "Max output tokens", int)
+    prompt_config_value(config, "token_limit", "Input token limit")
+    prompt_config_value(config, "max_output_tokens", "Max output tokens")
     prompt_config_value(config, "token_cost", "Token cost per million tokens (input:output, off)")
-    prompt_config_value(config, "max_file_size_kb", "Max file size KB", int)
+    prompt_config_value(config, "max_file_size_kb", "Max file size KB")
     prompt_config_value(config, "line_numbers", "Context file line numbers [recommended on] (off, on)")
-    prompt_config_value(config, "llm_timeout", "API timeout in seconds", int)
-    prompt_config_value(config, "retry", "Additional transient API retries", parse_retry_count)
+    prompt_config_value(config, "llm_timeout", "API timeout in seconds")
+    prompt_config_value(config, "retry", "Additional transient API retries")
     prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs (off, on)")
     prompt_config_value(config, "api_log", "Store logs within the OpenAI-compatible API (off, on)")
     prompt_config_value(config, "quiet", "Quiet mode (off, on)")
@@ -2572,11 +2644,9 @@ def handle_inherit_profile(current_name: str, new_name: str) -> int:
                 f"destination profile '{new_name}' already exists"
             )
 
-        # Validate the source profile and its inheritance chain.
-        merged_config(source_path)
-        write_json_document(
-            destination_path,
+        save_config(
             {INHERIT_PROFILE_CONFIG_KEY: current_name},
+            destination_path,
         )
     except Exception as exc:
         print(f"ERROR: Failed to inherit profile: {exc}", file=sys.stderr)
@@ -4118,14 +4188,8 @@ def format_context_entry(
 def format_request_text(
     system_prompt: str,
     user_prompt: str,
-    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
-    if tools:
-        request_text += (
-            "\n\nTOOLS:\n"
-            + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
-        )
     return request_text
 
 
@@ -4137,7 +4201,7 @@ def estimate_request_tokens(
 ) -> int:
     encoding = token_encoding_for_model(model)
     return len(
-        encoding.encode(format_request_text(system_prompt, user_prompt, tools))
+        encoding.encode(format_request_text(system_prompt, user_prompt))
     )
 
 def truncate_text_to_tokens(text: str, model: str, max_tokens: int) -> str:
@@ -4375,10 +4439,146 @@ def parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError("expected a boolean value (true/false)")
 
 
-def parse_optional_float(value: Any) -> float | None:
-    if isinstance(value, str):
-        return None if value.lower() == "off" else float(value)
+def parse_config_value(name: str, value: Any) -> Any:
+    if name not in DEFAULT_CONFIG:
+        return value
+    default = DEFAULT_CONFIG[name]
+    try:
+        if isinstance(value, str):
+            value.encode("utf-8")
+        if name in CONFIG_BOOLEAN_KEYS or isinstance(default, bool):
+            if not isinstance(value, bool):
+                if not isinstance(value, str):
+                    raise ValueError("must be a boolean")
+                value = parse_bool(value)
+        elif name == "patch_branch":
+            value = resolve_patch_branch_setting(value)
+        elif name == "agent_context_expires":
+            value = parse_agent_context_expires(value)
+        elif name in ("temperature", "top_p"):
+            value = parse_optional_float(value)
+            maximum = 2.0 if name == "temperature" else 1.0
+            if value is not None and not 0 <= value <= maximum:
+                raise ValueError(
+                    f"must be between 0 and {maximum} or off"
+                )
+        elif name == "token_cost":
+            value = parse_token_cost(value)
+        elif name == "files":
+            value = parse_config_files(value)
+            if any("\x00" in path for path in value):
+                raise ValueError("paths cannot contain a null byte")
+        elif name == "extra_body":
+            if value is None:
+                value = ""
+            if isinstance(value, str):
+                value = parse_extra_body(value)
+            if not isinstance(value, dict):
+                raise ValueError(
+                    "must be a JSON object or key=value string"
+                )
+            json.dumps(
+                value, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+        elif isinstance(default, int):
+            try:
+                value = parse_retry_count(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "must be a non-negative integer"
+                ) from exc
+            if (
+                name in ("token_limit", "max_output_tokens", "llm_timeout")
+                and value == 0
+            ):
+                raise ValueError("must be a positive integer")
+        else:
+            if value is None:
+                if name in PROMPT_CONFIG_KEYS:
+                    value = default
+                elif name == "reasoning":
+                    value = "off"
+                elif name in (
+                    "api_key", "proxy_server", "meta_organization",
+                    "meta_project", "safety_identifier", "patch_suffix",
+                ):
+                    value = ""
+            if not isinstance(value, str):
+                raise ValueError("must be a string")
+            choices = CONFIG_VALUE_CHOICES.get(name)
+            if choices is not None:
+                value = value.strip().lower()
+                if value not in choices:
+                    raise ValueError(
+                        "must be one of " + ", ".join(choices)
+                    )
+            if name in (
+                "model", "base_url", "proxy_server",
+                "meta_organization", "meta_project",
+            ):
+                value = value.strip()
+            if name in ("model", "base_url") and not value:
+                raise ValueError("cannot be empty")
+            if name == "patch_suffix":
+                if "\x00" in value:
+                    raise ValueError("cannot contain a null byte")
+                append_suffix_to_path(Path("file"), value)
+    except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+        raise ValueError(f"{name}: {exc}") from exc
     return value
+
+
+def resolve_runtime_config(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    resolved_config = config.copy()
+    for name, default in DEFAULT_CONFIG.items():
+        override = (
+            getattr(args, name, None)
+            if name not in ("api_key", "files", "line_numbers", "api_log")
+            else None
+        )
+        resolved_config[name] = resolve_config_option(
+            override, config, name, default
+        )
+    if args.no_line_numbers is not None:
+        resolved_config["line_numbers"] = not args.no_line_numbers
+    resolved_config["api_log"] = resolve_config_option(
+        args.no_api_log, config, "api_log", DEFAULT_CONFIG["api_log"]
+    )
+    if args.model is not None and args.token_cost is None:
+        resolved_config["token_cost"] = "off"
+    if (
+        args.apikey
+        or args.apikey_from_fd is not None
+        or os.getenv("OPENAI_API_KEY")
+    ):
+        resolved_config["api_key"] = ""
+    if args.files is not None or args.files_list is not None:
+        resolved_config["files"] = ""
+
+    for name in DEFAULT_CONFIG:
+        resolved_config[name] = parse_config_value(
+            name, resolved_config[name]
+        )
+    return resolved_config
+
+
+def parse_optional_float(value: Any) -> float | None:
+    if value is None or (
+        isinstance(value, str) and value.strip().lower() == "off"
+    ):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("expected a finite number or 'off'")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("expected a finite number or 'off'") from exc
+    if not math.isfinite(number):
+        raise ValueError("expected a finite number or 'off'")
+    return number
 
 
 def coerce_int(value: Any, default: int) -> int:
@@ -5276,16 +5476,12 @@ def parse_agent_context_expires(value: Any) -> tuple[int, int, int]:
         raise ValueError(
             "agent_context_expires requires DEFAULT [MIN] [MAX]"
         )
-    numbers: list[int] = []
-    for part in parts:
-        if isinstance(part, bool) or not (
-            isinstance(part, int)
-            or isinstance(part, str) and re.fullmatch(r"[0-9]+", part)
-        ):
-            raise ValueError(
-                "agent_context_expires values must be non-negative integers"
-            )
-        numbers.append(int(part))
+    try:
+        numbers = [parse_retry_count(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError(
+            "agent_context_expires values must be non-negative integers"
+        ) from exc
     default = numbers[0]
     minimum = (
         numbers[1] if len(numbers) > 1 else DEFAULT_AGENT_CONTEXT_EXPIRES[1]
@@ -8222,11 +8418,14 @@ def build_agent_followup_prompts(
         additional_instructions=instructions,
         system_prompt_with_task=system_prompt_with_task,
         current_unix_time=current_unix_time,
-        instruction_prefix=format_context_entry(
-            "meta_task_list",
-            f"{format_agent_meta_task_list(meta_task_list)}\n",
-            model=model,
-            include_token_count=False,
+        instruction_prefix=join_prompt_sections(
+            AGENT_TASK_PRIORITY_SYSTEM_PROMPT if not summary_request else "",
+            format_context_entry(
+                "meta_task_list",
+                f"{format_agent_meta_task_list(meta_task_list)}\n",
+                model=model,
+                include_token_count=False,
+            ),
         ),
     )
 
@@ -8887,6 +9086,11 @@ def finish_agent_response(
 
 
 def run_agent_mode(settings: AgentRunSettings) -> int:
+    controller_tools = agent_tool_schemas(
+        settings.agent_profiles,
+        agent_expires_in_turns_schema(settings.agent_context_expires),
+        default_profile=settings.agent_profile_default,
+    )
     turns: list[AgentTurn] = list(settings.initial_turns)
     file_contexts = list(agent_context_file_sections(settings))
     file_expires_in_turns = agent_file_context_expirations(
@@ -8941,11 +9145,6 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         )
     )
     write_state_meta_task_list(settings.state_session_dir, meta_task_list)
-    controller_tools = agent_tool_schemas(
-        settings.agent_profiles,
-        agent_expires_in_turns_schema(settings.agent_context_expires),
-        default_profile=settings.agent_profile_default,
-    )
     prior_token_estimates: list[tuple[int, int]] = []
     pending_revision_instruction = ""
     reasoning_items = settings.initial_reasoning_items
@@ -9473,14 +9672,32 @@ def execute_openai_request(
             return response
 
 
-def resolve_api_key(config: dict[str, Any]) -> str:
-    env_key = os.getenv("OPENAI_API_KEY")
-    if env_key:
-        return env_key
-    key = str(config.get("api_key", "")).strip()
+def resolve_api_key(
+    config: dict[str, Any],
+    prompt: bool = False,
+    from_fd: int | None = None,
+) -> str:
+    try:
+        if prompt:
+            key = getpass.getpass("API key: ").strip()
+        elif from_fd is not None:
+            with os.fdopen(
+                from_fd, "r", encoding="utf-8", closefd=False
+            ) as key_file:
+                key = key_file.read().strip()
+        else:
+            key = os.getenv("OPENAI_API_KEY") or str(
+                config.get("api_key", "")
+            ).strip()
+    except (EOFError, OSError, OverflowError, ValueError) as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        raise ValueError(f"cannot read API key ({detail})") from exc
     if key:
         return key
-    raise SystemExit("No API key found. Set it up in the config file with --init or with 'export OPENAI_API_KEY=key'.")
+    raise ValueError(
+        "No API key found. Use --apikey or --apikey-from-fd FD, "
+        "configure it with --init, or set OPENAI_API_KEY."
+    )
 
 
 def create_openai_client(
@@ -11028,6 +11245,23 @@ def parse_args() -> argparse.Namespace:
         help="List available models",
     )
 
+    api_key_group = parser.add_mutually_exclusive_group()
+    api_key_group.add_argument(
+        "--apikey",
+        action="store_true",
+        help="Prompt for the API key (overrides OPENAI_API_KEY and config)",
+    )
+
+    api_key_group.add_argument(
+        "--apikey-from-fd",
+        metavar="FD",
+        type=int,
+        help=(
+            "Read the API key from file descriptor FD "
+            "(overrides OPENAI_API_KEY and config)"
+        ),
+    )
+
     parser.add_argument(
         "--base-url",
         dest="base_url",
@@ -11091,21 +11325,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--service-tier",
         dest="service_tier",
-        choices=("off", "auto", "default", "flex", "scale", "priority"),
+        choices=CONFIG_VALUE_CHOICES["service_tier"],
         help="Service tier",
     )
 
     parser.add_argument(
         "--openai-service-tier",
         dest="service_tier",
-        choices=("off", "auto", "default", "flex", "scale", "priority"),
+        choices=CONFIG_VALUE_CHOICES["service_tier"],
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
 
     parser.add_argument(
         "--response-format",
-        choices=("text", "json", "schema"),
+        choices=CONFIG_VALUE_CHOICES["response_format"],
         default=None,
         help="LLM response format in text, JSON or JSON-Schema",
     )
@@ -11148,7 +11382,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--response-verbosity",
-        choices=("low", "medium", "high", "off"),
+        choices=CONFIG_VALUE_CHOICES["response_verbosity"],
         default=None,
         help="Verbosity level for text responses (default: off)",
     )
@@ -11170,21 +11404,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reasoning",
         dest="reasoning",
-        choices=("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        choices=CONFIG_VALUE_CHOICES["reasoning"],
         help="Reasoning effort level (off to disable)",
     )
 
     parser.add_argument(
         "--openai-reasoning",
         dest="reasoning",
-        choices=("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        choices=CONFIG_VALUE_CHOICES["reasoning"],
         help=argparse.SUPPRESS,
         default=argparse.SUPPRESS,
     )
 
     parser.add_argument(
         "--reasoning-mode",
-        choices=("standard", "pro"),
+        choices=CONFIG_VALUE_CHOICES["reasoning_mode"],
         type=str,
         help="Reasoning mode (standard or pro)",
     )
@@ -11609,6 +11843,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.apikey_from_fd is not None and args.apikey_from_fd < 0:
+        parser.error("--apikey-from-fd requires a non-negative file descriptor")
     if args.agent_review and not args.agent:
         parser.error("--agent-review requires --agent")
     if args.agent_auto and not args.agent:
@@ -11725,6 +11961,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 file=sys.stderr,
             )
             return 1
+    CONFIG_FILE = get_profile_path(args.profile or "config")
+
     if args.noninteractive:
         args.log = True
         args.quiet = True
@@ -12084,7 +12322,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             print(f"ERROR: Destination profile '{new_name}' already exists.", file=sys.stderr)
             return 1
         try:
-            dst_path.write_text(src_path.read_text(encoding="utf-8"), encoding="utf-8")
+            save_config(read_config_document(src_path), dst_path)
         except Exception as exc:
             print(f"ERROR: Failed to copy profile: {exc}", file=sys.stderr)
             return 1
@@ -12111,7 +12349,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         print(f"Profile '{name}' removed.")
         return 0
 
-    CONFIG_FILE = get_profile_path(base_profile)
     if args.patch_file_print is not None:
         return handle_patch_file_print(
             args.patch_file_print,
@@ -12138,9 +12375,10 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
                 )
             source_profile = validate_prompt_profile_name(source_profile)
-            source_config = read_config_document(
-                get_profile_path(source_profile)
-            )
+            source_path = get_profile_path(source_profile)
+            source_config = read_config_document(source_path)
+            if INHERIT_PROFILE_CONFIG_KEY in source_config:
+                source_config = merged_config(source_path)
             if name in source_config:
                 value = source_config[name]
             else:
@@ -12220,11 +12458,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 replacement = DEPRECATED_CONFIG_KEYS.get(name)
                 if replacement is not None:
                     raw_config[replacement] = value
-            migrate_deprecated_config(raw_config)
-            raw_config = _prune_inherited_config(
-                raw_config, inherited_parent
-            )
-            write_json_document(CONFIG_FILE, raw_config)
+            save_config(raw_config)
         else:
             for name, value, _ in updates:
                 config[name] = value
@@ -12296,6 +12530,46 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             print(f"ERROR: Unable to read config file: {exc}", file=sys.stderr)
             return 1
         return 0
+
+    profile_config = load_config()
+    try:
+        config = resolve_runtime_config(profile_config, args)
+    except ValueError as exc:
+        print(
+            f"ERROR: Invalid configuration profile '{base_profile}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    selected_agent_profiles: tuple[AgentProfile, ...] = ()
+    default_agent_profile: AgentProfile | None = None
+    if (
+        args.agent_profiles is not None
+        or args.agent_profile_default is not None
+    ):
+        if not args.agent:
+            option_name = (
+                "--agent-profile"
+                if args.agent_profiles is not None
+                else "--agent-profile-default"
+            )
+            print(f"ERROR: {option_name} requires --agent", file=sys.stderr)
+            return 1
+        try:
+            selected_agent_profiles = tuple(
+                load_agent_profiles(args.agent_profiles)
+            )
+            if args.agent_profile_default is not None:
+                default_agent_profile = read_agent_profile(
+                    args.agent_profile_default
+                )
+            agent_tool_schemas(
+                selected_agent_profiles,
+                default_profile=default_agent_profile,
+            )
+        except ValueError as exc:
+            print(f"ERROR: Failed to load agent profiles: {exc}", file=sys.stderr)
+            return 1
 
     tree_mode = (
         args.tree_files is not None or args.tree_files_list is not None
@@ -12378,27 +12652,10 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             print(tree_file_path)
         return 0
 
-    config = load_config()
-    patch_mode = resolve_bool_option(
-        args.patch,
-        config,
-        'patch',
-    )
-    shell_mode = resolve_bool_option(
-        args.shell,
-        config,
-        'shell',
-    )
-    shell_trace = resolve_bool_option(
-        args.shell_trace,
-        config,
-        'shell_trace',
-    )
-    shell_networking = resolve_bool_option(
-        args.shell_networking,
-        config,
-        'shell_networking',
-    )
+    patch_mode = config["patch"]
+    shell_mode = config["shell"]
+    shell_trace = config["shell_trace"]
+    shell_networking = config["shell_networking"]
     try:
         contain = (
             tuple(path.expanduser().resolve() for path in args.contain)
@@ -12413,20 +12670,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if args.agent_context_expires is not None and not agent_mode:
         print("ERROR: --agent-context-expires requires --agent", file=sys.stderr)
         return 1
-    agent_context_expires = DEFAULT_AGENT_CONTEXT_EXPIRES
-    if agent_mode:
-        try:
-            agent_context_expires = parse_agent_context_expires(
-                resolve_config_option(
-                    args.agent_context_expires,
-                    config,
-                    "agent_context_expires",
-                    DEFAULT_CONFIG["agent_context_expires"],
-                )
-            )
-        except ValueError as exc:
-            print(f"ERROR: Invalid agent context expiry: {exc}", file=sys.stderr)
-            return 1
+    agent_context_expires = (
+        config["agent_context_expires"]
+        if agent_mode
+        else DEFAULT_AGENT_CONTEXT_EXPIRES
+    )
     if (
         not tree_mode
         and not ask_mode
@@ -12435,72 +12683,28 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         and args.resume_session is None
     ):
         if args.files is None and args.files_list is None:
-            file_names = parse_config_files(
-                config.get("files", DEFAULT_CONFIG["files"])
-            )
+            file_names = config["files"]
         if not file_names and not (patch_mode or shell_mode or agent_mode):
             print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
             return 1
 
-    prompt_expansion_enabled = resolve_bool_option(
-        args.prompt_expansion,
-        config,
-        'prompt_expansion',
-    )
+    prompt_expansion_enabled = config["prompt_expansion"]
     task = expand_prompt_names(task, prompt_expansion_enabled)
     tree_task_prompts = expand_tree_prompt_values(
         tree_task_prompts, prompt_expansion_enabled
     )
-    system_prompt_with_task = resolve_bool_option(
-        args.system_prompt_with_task,
-        config,
-        'system_prompt_with_task',
-    )
-    add_line_numbers = (
-        not args.no_line_numbers
-        if args.no_line_numbers is not None
-        else resolve_bool_option(None, config, 'line_numbers', True)
-    )
+    system_prompt_with_task = config["system_prompt_with_task"]
+    add_line_numbers = config["line_numbers"]
 
-    quiet_enabled = resolve_bool_option(
-        args.quiet,
-        config,
-        'quiet',
-    )
-
-    if quiet_enabled:
+    if config["quiet"]:
         VERBOSE = 0
 
-    try:
-        patch_branch_setting = resolve_patch_branch_setting(
-            resolve_config_option(
-                args.patch_branch, config, 'patch_branch',
-                DEFAULT_CONFIG['patch_branch'],
-            )
-        )
-    except ValueError as exc:
-        print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
-        return 1
+    patch_branch_setting = config["patch_branch"]
 
     patch_branch_mode = patch_branch_setting is not None
-    patch_review = (
-        not args.noninteractive
-        and resolve_bool_option(
-            args.patch_review,
-            config,
-            'patch_review',
-        )
-    )
-    plan_mode = resolve_bool_option(
-        args.plan,
-        config,
-        'plan',
-    )
-    print_reasoning = resolve_bool_option(
-        args.print_reasoning,
-        config,
-        'print_reasoning',
-    )
+    patch_review = not args.noninteractive and config["patch_review"]
+    plan_mode = config["plan"]
+    print_reasoning = config["print_reasoning"]
     patch_suffix, suffix_provided = resolve_patch_suffix(
         config, args.patch_suffix
     )
@@ -12551,31 +12755,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if args.agent_hook_context is not None and not agent_mode:
         print("ERROR: --agent-hook-context requires --agent", file=sys.stderr)
         return 1
-    selected_agent_profiles: tuple[AgentProfile, ...] = ()
-    default_agent_profile: AgentProfile | None = None
-    if (
-        args.agent_profiles is not None
-        or args.agent_profile_default is not None
-    ):
-        if not agent_mode:
-            option_name = (
-                "--agent-profile"
-                if args.agent_profiles is not None
-                else "--agent-profile-default"
-            )
-            print(f"ERROR: {option_name} requires --agent", file=sys.stderr)
-            return 1
-        try:
-            selected_agent_profiles = tuple(
-                load_agent_profiles(args.agent_profiles)
-            )
-            if args.agent_profile_default is not None:
-                default_agent_profile = read_agent_profile(
-                    args.agent_profile_default
-                )
-        except ValueError as exc:
-            print(f"ERROR: Failed to load agent profiles: {exc}", file=sys.stderr)
-            return 1
     if agent_mode and (args.ask or args.ask_file):
         print("ERROR: --agent only supports --task or --task-file", file=sys.stderr)
         return 1
@@ -12629,50 +12808,24 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         except (OSError, ValueError) as exc:
             print(f'ERROR: {exc}', file=sys.stderr)
             return 1
-    llm_timeout = resolve_config_option(
-        args.llm_timeout, config, "llm_timeout", 300
-    )
-    try:
-        shell_timeout = int(
-            resolve_config_option(
-                args.shell_timeout, config, "shell_timeout",
-                DEFAULT_CONFIG["shell_timeout"],
-            )
-        )
-        if shell_timeout < 0:
-            raise ValueError("shell timeout must be non-negative")
-    except (TypeError, ValueError) as exc:
-        print(f"ERROR: Invalid shell timeout: {exc}", file=sys.stderr)
-        return 1
-    try:
-        retry = parse_retry_count(
-            resolve_config_option(
-                args.retry, config, "retry", DEFAULT_CONFIG["retry"]
-            )
-        )
-    except ValueError as exc:
-        print(f"ERROR: Invalid retry value: {exc}", file=sys.stderr)
-        return 1
+    llm_timeout = config["llm_timeout"]
+    shell_timeout = config["shell_timeout"]
+    retry = config["retry"]
 
-    model = str(args.model or config.get("model")).strip()
-    openai_base_url = str(args.base_url or config.get("base_url")).strip()
-    openai_proxy = str(
-        resolve_config_option(
-            args.proxy_server, config, "proxy_server", ""
-        ) or ""
-    ).strip()
-    openai_organization = str(args.meta_organization or config.get("meta_organization", "")).strip()
-    openai_project = str(args.meta_project or config.get("meta_project", "")).strip()
-    safety_identifier = config.get('safety_identifier', None)
-    api_log = resolve_bool_option(
-        args.no_api_log,
-        config,
-        'api_log',
-        True,
-    )
+    model = config["model"]
+    openai_base_url = config["base_url"]
+    openai_proxy = config["proxy_server"]
+    openai_organization = config["meta_organization"]
+    openai_project = config["meta_project"]
+    safety_identifier = config["safety_identifier"]
+    api_log = config["api_log"]
 
     if args.list_models:
-        api_key = resolve_api_key(config)
+        api_key = resolve_api_key(
+            config,
+            prompt=args.apikey,
+            from_fd=args.apikey_from_fd,
+        )
         with create_openai_client(
             api_key=api_key,
             openai_base_url=openai_base_url,
@@ -12723,74 +12876,21 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     )
     plan_system_prompt = resolve_prompt_option('plan_system_prompt')
 
-    try:
-        temperature = parse_optional_float(
-            resolve_config_option(args.temperature, config, "temperature", "off")
-        )
-    except ValueError:
-        print("ERROR: Invalid temperature value.", file=sys.stderr)
-        return 1
-
-    try:
-        top_p = parse_optional_float(
-            resolve_config_option(args.top_p, config, "top_p", "off")
-        )
-    except ValueError:
-        print("ERROR: Invalid top-p value.", file=sys.stderr)
-        return 1
-
-    token_limit = resolve_config_option(
-        args.token_limit, config, "token_limit", 65534
-    )
-
-    max_output_tokens = resolve_config_option(
-        args.max_output_tokens, config, "max_output_tokens", 65534
-    )
-
-    openai_reasoning = resolve_config_option(
-        args.reasoning, config, "reasoning", "medium"
-    )
-    if str(openai_reasoning).strip().lower() == "off":
+    temperature = config["temperature"]
+    top_p = config["top_p"]
+    token_limit = config["token_limit"]
+    max_output_tokens = config["max_output_tokens"]
+    openai_reasoning = config["reasoning"]
+    if openai_reasoning == "off":
         print_reasoning = False
 
-    reasoning_mode = resolve_config_option(
-        args.reasoning_mode, config, "reasoning_mode", "standard"
-    )
-    reasoning_mode = str(reasoning_mode).strip().lower()
-    if reasoning_mode not in ("standard", "pro"):
-        print("ERROR: Invalid reasoning mode; choose 'standard' or 'pro'.", file=sys.stderr)
-        return 1
-
-    extra_body_raw = resolve_config_option(
-        args.extra_body, config, "extra_body"
-    )
-    if isinstance(extra_body_raw, dict):
-        extra_body = extra_body_raw
-    else:
-        extra_body = parse_extra_body(str(extra_body_raw or ""))
-
-    openai_service_tier = str(args.service_tier or config.get("service_tier", "off")).strip()
-    response_format: str = args.response_format or str(config.get("response_format", "text"))
-    response_json_repair = resolve_bool_option(
-        args.response_json_repair,
-        config,
-        "response_json_repair",
-    )
-    if args.model is not None and args.token_cost is None:
-        token_cost_raw = "off"
-    else:
-        token_cost_raw = resolve_config_option(
-            args.token_cost, config, "token_cost", "off"
-        )
-    try:
-        token_cost = parse_token_cost(token_cost_raw)
-    except ValueError as exc:
-        print(f"ERROR: Invalid token cost: {exc}", file=sys.stderr)
-        return 1
-
-    response_verbosity: str = resolve_config_option(
-        args.response_verbosity, config, "response_verbosity", "off"
-    ).lower()
+    reasoning_mode = config["reasoning_mode"]
+    extra_body = config["extra_body"]
+    openai_service_tier = config["service_tier"]
+    response_format: str = config["response_format"]
+    response_json_repair = config["response_json_repair"]
+    token_cost = config["token_cost"]
+    response_verbosity: str = config["response_verbosity"]
 
     agent_worker_system_prompt = system_prompt
     if patch_mode:
@@ -12811,23 +12911,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             agent_tool_call_system_prompt(selected_agent_profiles),
         )
         add_line_numbers = True
-    if response_format not in ("text", "json", "schema"):
-        print(
-            "ERROR: Invalid response format; choose text, json, or schema.",
-            file=sys.stderr,
-        )
-        return 1
-    stream_enabled = resolve_bool_option(
-        args.stream,
-        config,
-        'stream',
-    )
-
-    explicit_prompt_cache = resolve_bool_option(
-        args.explicit_prompt_cache,
-        config,
-        "explicit_prompt_cache",
-    )
+    stream_enabled = config["stream"]
+    explicit_prompt_cache = config["explicit_prompt_cache"]
     suppress_response_output = args.noninteractive and not ask_mode
     if stream_enabled and (
         response_format != 'text' or suppress_response_output
@@ -12852,7 +12937,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if args.estimate_only and not tree_mode:
         api_key = ""
     else:
-        api_key = resolve_api_key(config)
+        api_key = resolve_api_key(
+            config,
+            prompt=args.apikey,
+            from_fd=args.apikey_from_fd,
+        )
 
     model_settings = ModelSettings(
         model=model,
@@ -12877,9 +12966,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         response_json_repair=response_json_repair,
     )
 
-    log_enabled = tree_mode or resolve_bool_option(
-        args.log, config, "log", True
-    )
+    log_enabled = tree_mode or config["log"]
     log_path = None
     session_timestamp = int(time.time())
     session_rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
@@ -13063,7 +13150,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         log_path = LOG_DIR / f"{session_stem}.txt"
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"<start_time>{time.ctime(session_timestamp)} [{session_timestamp}]</start_time>\n")
-            f.write(format_log_settings(config, args))
+            f.write(format_log_settings(profile_config, args))
 
     def append_log(text: str) -> None:
         append_session_log(log_path, text, log_enabled)
@@ -13204,7 +13291,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         except Exception as exc:
             print(f"ERROR: Failed to create tree output/state directory {tree_session_dir}: {exc}", file=sys.stderr)
             return 1
-        max_file_size_kb = coerce_int(config.get("max_file_size_kb", 512), 512)
+        max_file_size_kb = config["max_file_size_kb"]
         return run_tree_mode(
             file_paths=tree_file_paths,
             relative_paths=tree_relative_paths,
@@ -13248,7 +13335,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         user_prompt = ask_prompt
     else:
         file_paths = resolve_context_file_paths(file_names)
-        max_file_size_kb=coerce_int(config.get("max_file_size_kb", 512), 512)
+        max_file_size_kb = config["max_file_size_kb"]
         try:
             stdin_content = (
                 sys.stdin.read() if "-" in file_names else None
