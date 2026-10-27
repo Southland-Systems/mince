@@ -272,6 +272,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "line_numbers": "on",
     "prompt_expansion": "off",
     "plan": "off",
+    "agent": "off",
     "shell": "off",
     "shell_trace": "off",
     "shell_networking": "off",
@@ -304,8 +305,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 CONFIG_BOOLEAN_KEYS = (
     "explicit_prompt_cache", "system_prompt_with_task", "line_numbers",
-    "prompt_expansion", "plan", "shell", "shell_trace", "shell_networking",
-    "patch", "patch_review", "quiet", "print_reasoning",
+    "prompt_expansion", "plan", "agent", "shell", "shell_trace",
+    "shell_networking", "patch", "patch_review", "quiet", "print_reasoning",
     "response_json_repair", "stream", "log", "api_log",
 )
 CONFIG_VALUE_CHOICES: dict[str, tuple[str, ...]] = {
@@ -319,6 +320,70 @@ CONFIG_VALUE_CHOICES: dict[str, tuple[str, ...]] = {
 }
 
 INHERIT_PROFILE_CONFIG_KEY = "_inherit_profile"
+
+BUILTIN_CONFIG_PROFILES: dict[str, dict[str, Any]] = {
+    f"mce_{name}": {
+        INHERIT_PROFILE_CONFIG_KEY: "config",
+        **settings,
+    }
+    for name, settings in {
+        "ask": {
+            "system_prompt": "",
+            "system_prompt_with_task": "off",
+            "line_numbers": "off",
+            "stream": "on",
+            "quiet": "on",
+            "prompt_expansion": "on",
+        },
+        "task": {
+            "stream": "on",
+            "quiet": "on",
+            "prompt_expansion": "on",
+        },
+        "tree": {
+            "system_prompt_with_task": "on",
+            "prompt_expansion": "on",
+        },
+        "patch": {
+            "system_prompt_with_task": "on",
+            "patch": "on",
+            "patch_review": "on",
+            "llm_timeout": 1800,
+            "prompt_expansion": "on",
+        },
+        "planpatch": {
+            "system_prompt_with_task": "on",
+            "plan": "on",
+            "patch": "on",
+            "patch_review": "on",
+            "llm_timeout": 1800,
+            "prompt_expansion": "on",
+        },
+        "shell": {
+            "system_prompt_with_task": "on",
+            "shell": "on",
+            "shell_timeout": 300,
+            "prompt_expansion": "on",
+        },
+        "plantask": {
+            "plan": "on",
+            "stream": "on",
+            "quiet": "on",
+            "prompt_expansion": "on",
+        },
+        "agent": {
+            "system_prompt_with_task": "on",
+            "agent": "on",
+            "shell_timeout": 300,
+            "llm_timeout": 1800,
+            "prompt_expansion": "on",
+        },
+    }.items()
+}
+BUILTIN_CONFIG_PROFILE_ALIASES: dict[str, str] = {
+    name.removeprefix("mce_"): name
+    for name in BUILTIN_CONFIG_PROFILES
+}
 
 DEPRECATED_CONFIG_KEYS: dict[str, str | None] = {
     "openai_base_url": "base_url",
@@ -548,6 +613,38 @@ META_TASK_LIST_SCHEMA: dict[str, Any] = {
 # Config
 # -------------------------------------------------------------------
 
+def configuration_profile_name(path: Path) -> str | None:
+    if path.suffix == ".json" and path.parent.resolve() == APP_DIR.resolve():
+        return path.stem
+    return None
+
+
+def builtin_config_document(path: Path) -> dict[str, Any] | None:
+    name = configuration_profile_name(path)
+    if name is None:
+        return None
+    document = BUILTIN_CONFIG_PROFILES.get(name)
+    if document is not None:
+        return document.copy()
+    if not path.exists():
+        if name == "config":
+            return DEFAULT_CONFIG.copy()
+        parent_name = BUILTIN_CONFIG_PROFILE_ALIASES.get(name)
+        if parent_name is not None:
+            return {INHERIT_PROFILE_CONFIG_KEY: parent_name}
+    return None
+
+
+def config_document_exists(path: Path) -> bool:
+    return builtin_config_document(path) is not None or path.is_file()
+
+
+def ensure_writable_config_path(path: Path) -> None:
+    name = configuration_profile_name(path)
+    if name is not None and name.startswith("mce_"):
+        raise ValueError(f"internal profile '{name}' is read-only")
+
+
 def _validate_inherit_profile_name(value: Any) -> str:
     if not isinstance(value, str) or not value.strip() or not value.strip().isidentifier():
         raise ValueError(f"invalid inherited profile name: {value!r}")
@@ -575,7 +672,7 @@ def _merged_config_from_path(
     path: Path,
     active_paths: set[Path],
  ) -> dict[str, Any]:
-    resolved_path = path.resolve()
+    resolved_path = path.parent.resolve() / path.name
     if resolved_path in active_paths:
         raise ValueError(f"configuration inheritance cycle detected at {path}")
     active_paths.add(resolved_path)
@@ -585,7 +682,7 @@ def _merged_config_from_path(
         parent_name = _inherit_profile_name(raw, path)
         if parent_name is not None:
             parent_path = get_profile_path(parent_name)
-            if not parent_path.exists():
+            if not config_document_exists(parent_path):
                 raise ValueError(
                     f"inherited profile '{parent_name}' does not exist"
                 )
@@ -664,7 +761,9 @@ def ensure_config_exists() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     ensure_default_prompt_library_entries()
 
-    if not CONFIG_FILE.exists():
+    if not DEFAULT_CONFIG_FILE.exists():
+        save_config(DEFAULT_CONFIG.copy(), DEFAULT_CONFIG_FILE)
+    if not config_document_exists(CONFIG_FILE):
         save_config(DEFAULT_CONFIG.copy())
 
 def load_config() -> dict[str, Any]:
@@ -678,12 +777,12 @@ def _prune_inherited_config(
     config_path: Path,
  ) -> dict[str, Any]:
     parent_path = get_profile_path(parent_name)
-    if not parent_path.exists():
+    if not config_document_exists(parent_path):
         raise ValueError(
             f"inherited profile '{parent_name}' does not exist"
         )
     parent_config = _merged_config_from_path(
-        parent_path, {config_path.resolve()}
+        parent_path, {config_path.parent.resolve() / config_path.name}
     )
     pruned: dict[str, Any] = {
         INHERIT_PROFILE_CONFIG_KEY: parent_name
@@ -701,6 +800,7 @@ def save_config(
     config_path: Path | None = None,
 ) -> None:
     path = CONFIG_FILE if config_path is None else config_path
+    ensure_writable_config_path(path)
     raw_document = read_config_document(path, missing_ok=True)
     parent_name = _inherit_profile_name(
         raw_document if path.exists() else config, path
@@ -1502,6 +1602,9 @@ def read_json_document(path: Path, label: str) -> Any:
 
 
 def read_config_document(path: Path, missing_ok: bool = False) -> dict[str, Any]:
+    builtin_document = builtin_config_document(path)
+    if builtin_document is not None:
+        return builtin_document
     if not path.exists():
         if missing_ok:
             return {}
@@ -1724,6 +1827,7 @@ def handle_prompt_assign(
         profile = validate_prompt_profile_name(profile)
         config_key = prompt_type_key(prompt_type)
         profile_path = get_profile_path(profile)
+        ensure_writable_config_path(profile_path)
         config = read_config_document(profile_path, missing_ok=True)
         prompt_reference = f"./{prompt_path.name}"
         existing = config.get(config_key)
@@ -1782,6 +1886,7 @@ def handle_prompt_unassign(
         prompt_path = prompt_file_path(name)
         profile = validate_prompt_profile_name(profile)
         profile_path = get_profile_path(profile)
+        ensure_writable_config_path(profile_path)
         config = read_config_document(profile_path)
         keys = (
             (prompt_type_key(values[1]),)
@@ -2554,6 +2659,7 @@ def prompt_config_value(
 
 
 def init_config_interactive() -> None:
+    ensure_writable_config_path(CONFIG_FILE)
     config = load_config()
 
     print(
@@ -2584,6 +2690,7 @@ def init_config_interactive() -> None:
     prompt_config_value(config, "agent_system_prompt", "System prompt for agent mode")
     prompt_config_value(config, "agent_context_expires", "Agent context expiry (DEFAULT [MIN] [MAX])")
     prompt_config_value(config, "plan", "Plan mode (off, on)")
+    prompt_config_value(config, "agent", "Agent mode (off, on)")
     prompt_config_value(config, "patch", "Patch files (off, on)")
     prompt_config_value(config, "shell", "Shell mode (off, on)")
     prompt_config_value(config, "shell_trace", "Trace shell commands with strace (off, on)")
@@ -2624,18 +2731,24 @@ def get_profile_path(name: str) -> Path:
     return APP_DIR / f"{name}.json"
 
 
-def handle_inherit_profile(current_name: str, new_name: str) -> int:
+def handle_copy_profile(
+    current_name: str,
+    new_name: str,
+    inherit: bool = False,
+) -> int:
+    action = "inherit" if inherit else "copy"
     try:
         current_name = validate_prompt_profile_name(current_name)
         new_name = validate_prompt_profile_name(new_name)
         if new_name == "config":
-            raise ValueError("cannot create a child profile named 'config'")
+            raise ValueError("cannot create a profile named 'config'")
         if current_name == new_name:
-            raise ValueError("a profile cannot inherit itself")
+            raise ValueError("source and destination profiles must differ")
 
         source_path = get_profile_path(current_name)
         destination_path = get_profile_path(new_name)
-        if not source_path.exists():
+        ensure_writable_config_path(destination_path)
+        if not config_document_exists(source_path):
             raise ValueError(
                 f"source profile '{current_name}' does not exist"
             )
@@ -2644,27 +2757,59 @@ def handle_inherit_profile(current_name: str, new_name: str) -> int:
                 f"destination profile '{new_name}' already exists"
             )
 
-        save_config(
-            {INHERIT_PROFILE_CONFIG_KEY: current_name},
-            destination_path,
+        config = (
+            {INHERIT_PROFILE_CONFIG_KEY: current_name}
+            if inherit
+            else read_config_document(source_path)
         )
+        save_config(config, destination_path)
     except Exception as exc:
-        print(f"ERROR: Failed to inherit profile: {exc}", file=sys.stderr)
+        print(f"ERROR: Failed to {action} profile: {exc}", file=sys.stderr)
         return 1
-    print(f"Profile '{new_name}' inherited from '{current_name}'.")
+    if inherit:
+        print(f"Profile '{new_name}' inherited from '{current_name}'.")
+    else:
+        print(f"Profile '{current_name}' copied to '{new_name}'.")
+    return 0
+
+
+def handle_remove_profile(name: str) -> int:
+    try:
+        name = validate_prompt_profile_name(name)
+        if name == "config":
+            raise ValueError("cannot remove the default 'config' profile")
+        path = get_profile_path(name)
+        ensure_writable_config_path(path)
+        if not path.exists():
+            if name in BUILTIN_CONFIG_PROFILE_ALIASES:
+                raise ValueError(
+                    f"profile '{name}' has no user override to remove"
+                )
+            raise ValueError(f"profile '{name}' does not exist")
+        path.unlink()
+    except Exception as exc:
+        print(f"ERROR: Failed to remove profile: {exc}", file=sys.stderr)
+        return 1
+    if name in BUILTIN_CONFIG_PROFILE_ALIASES:
+        print(
+            f"Profile '{name}' override removed; "
+            f"using '{BUILTIN_CONFIG_PROFILE_ALIASES[name]}'."
+        )
+    else:
+        print(f"Profile '{name}' removed.")
     return 0
 
 
 def configuration_profile_names() -> list[str]:
     ensure_config_exists()
-    profile_names = sorted(
+    profile_names = {
         path.stem
         for path in APP_DIR.glob("*.json")
         if path.is_file()
-    )
-    return ["config"] + [
-        name for name in profile_names if name != "config"
-    ]
+    }
+    profile_names.update(BUILTIN_CONFIG_PROFILES)
+    return ["config"] + sorted(profile_names - {"config"})
+
 
 def handle_show_profiles(
     profile_names: list[str] | None = None,
@@ -2679,7 +2824,7 @@ def handle_show_profiles(
                     raise ValueError(
                         f"invalid profile name '{profile_name}'"
                     )
-                if profile_name not in available_profiles:
+                if not config_document_exists(get_profile_path(profile_name)):
                     raise ValueError(
                         f"profile '{profile_name}' does not exist"
                     )
@@ -10824,7 +10969,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--agent",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
+        type=parse_bool,
+        metavar="BOOL",
         help=(
             "Run a multi-turn AI agent tool-call session, automatically "
             "confirming and outputting each call before execution; patches "
@@ -10837,7 +10986,7 @@ def parse_args() -> argparse.Namespace:
     agent_confirmation_group.add_argument(
         "--agent-review",
         action="store_true",
-        help="Review agent tool calls and changes before execution (requires --agent)",
+        help="Review agent tool calls and changes before execution (requires agent mode)",
     )
 
     agent_confirmation_group.add_argument(
@@ -10906,7 +11055,10 @@ def parse_args() -> argparse.Namespace:
         "-p",
         "--profile",
         metavar="NAME",
-        help="Select configuration profile",
+        help=(
+            "Select a configuration profile (built-in overwritable profiles: ask, task, tree, "
+            "patch, planpatch, shell, plantask, agent)"
+        ),
     )
 
     parser.add_argument(
@@ -11515,7 +11667,7 @@ def parse_args() -> argparse.Namespace:
     config_print_group.add_argument(
         "--print-current-config",
         action="store_true",
-        help="Print the stored configuration file (creates it if missing)",
+        help="Print the current profile document as JSON",
     )
 
     config_print_group.add_argument(
@@ -11614,7 +11766,7 @@ def parse_args() -> argparse.Namespace:
     profile_action_group.add_argument(
         "--remove-profile",
         metavar="NAME",
-        help="Remove a configuration profile",
+        help="Remove a user configuration profile or restore a built-in alias",
     )
 
     profile_action_group.add_argument(
@@ -11845,10 +11997,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.apikey_from_fd is not None and args.apikey_from_fd < 0:
         parser.error("--apikey-from-fd requires a non-negative file descriptor")
-    if args.agent_review and not args.agent:
-        parser.error("--agent-review requires --agent")
-    if args.agent_auto and not args.agent:
-        parser.error("--agent-auto requires --agent")
     if args.agent_auto:
         print(
             "WARNING: --agent-auto is deprecated; use --agent instead.",
@@ -11955,7 +12103,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         if not args.profile.isidentifier():
             print(f"ERROR: Invalid profile name '{args.profile}'.", file=sys.stderr)
             return 1
-        if not get_profile_path(args.profile).is_file():
+        if not config_document_exists(get_profile_path(args.profile)):
             print(
                 f"ERROR: Profile '{args.profile}' does not exist.",
                 file=sys.stderr,
@@ -12225,8 +12373,18 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if args.debug:
         DEBUG = 1
 
-    if args.init:
-        init_config_interactive()
+    if args.init or args.init_profile is not None:
+        try:
+            if args.init_profile is not None:
+                new_name = validate_prompt_profile_name(args.init_profile)
+                CONFIG_FILE = get_profile_path(new_name)
+            init_config_interactive()
+        except ValueError as exc:
+            print(
+                f"ERROR: Failed to initialize configuration: {exc}",
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     base_profile = args.profile or "config"
@@ -12293,61 +12451,16 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             json_output=True,
         )
 
-    if args.init_profile:
-        new_name = args.init_profile
-        if not new_name.isidentifier():
-            print(f"ERROR: Invalid profile name '{new_name}'.", file=sys.stderr)
-            return 1
-        CONFIG_FILE = get_profile_path(new_name)
-        init_config_interactive()
-        return 0
-
     if args.inherit_profile:
-        return handle_inherit_profile(base_profile, args.inherit_profile)
+        return handle_copy_profile(
+            base_profile, args.inherit_profile, inherit=True
+        )
 
     if args.copy_profile:
-        new_name = args.copy_profile
-        if new_name == "config":
-            print("ERROR: Cannot copy to profile name 'config'.", file=sys.stderr)
-            return 1
-        if not new_name.isidentifier():
-            print(f"ERROR: Invalid profile name '{new_name}'.", file=sys.stderr)
-            return 1
-        src_path = get_profile_path(base_profile)
-        dst_path = get_profile_path(new_name)
-        if not src_path.exists():
-            print(f"ERROR: Source profile '{base_profile}' does not exist.", file=sys.stderr)
-            return 1
-        if dst_path.exists():
-            print(f"ERROR: Destination profile '{new_name}' already exists.", file=sys.stderr)
-            return 1
-        try:
-            save_config(read_config_document(src_path), dst_path)
-        except Exception as exc:
-            print(f"ERROR: Failed to copy profile: {exc}", file=sys.stderr)
-            return 1
-        print(f"Profile '{base_profile}' copied to '{new_name}'.")
-        return 0
+        return handle_copy_profile(base_profile, args.copy_profile)
 
     if args.remove_profile:
-        name = args.remove_profile
-        if name == "config":
-            print("ERROR: Cannot remove the default 'config' profile.", file=sys.stderr)
-            return 1
-        if not name.isidentifier():
-            print(f"ERROR: Invalid profile name '{name}'.", file=sys.stderr)
-            return 1
-        path = get_profile_path(name)
-        if not path.exists():
-            print(f"ERROR: Profile '{name}' does not exist.", file=sys.stderr)
-            return 1
-        try:
-            path.unlink()
-        except Exception as exc:
-            print(f"ERROR: Failed to remove profile: {exc}", file=sys.stderr)
-            return 1
-        print(f"Profile '{name}' removed.")
-        return 0
+        return handle_remove_profile(args.remove_profile)
 
     if args.patch_file_print is not None:
         return handle_patch_file_print(
@@ -12407,6 +12520,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if args.set_config:
         config = load_config()
         try:
+            ensure_writable_config_path(CONFIG_FILE)
             raw_config = read_config_document(CONFIG_FILE, missing_ok=True)
             inherited_parent = _inherit_profile_name(raw_config, CONFIG_FILE)
             updates: list[tuple[str, Any, bool]] = []
@@ -12532,6 +12646,16 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         return 0
 
     profile_config = load_config()
+    if args.agent is None:
+        args.agent = resolve_bool_option(None, profile_config, "agent")
+        if args.agent:
+            disable_patch_shell_conflicting_options(args)
+    if args.agent_review and not args.agent:
+        print("ERROR: --agent-review requires agent mode", file=sys.stderr)
+        return 1
+    if args.agent_auto and not args.agent:
+        print("ERROR: --agent-auto requires agent mode", file=sys.stderr)
+        return 1
     try:
         config = resolve_runtime_config(profile_config, args)
     except ValueError as exc:
@@ -12665,7 +12789,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: Invalid containment path: {exc}", file=sys.stderr)
         return 1
-    agent_mode = args.agent
+    agent_mode = config["agent"]
     agent_auto = agent_mode and not args.agent_review
     if args.agent_context_expires is not None and not agent_mode:
         print("ERROR: --agent-context-expires requires --agent", file=sys.stderr)
