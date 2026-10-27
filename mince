@@ -261,12 +261,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "service_tier": "off",
     "explicit_prompt_cache": "off",
     "safety_identifier": "",
-    "system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["system_prompt"],
-    "linenum_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["linenum_system_prompt"],
-    "patch_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["patch_system_prompt"],
-    "plan_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["plan_system_prompt"],
-    "shell_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["shell_system_prompt"],
-    "agent_system_prompt": DEFAULT_PROMPT_LIBRARY_REFERENCES["agent_system_prompt"],
+    "system_prompt": "@system",
+    "linenum_system_prompt": "@linenum",
+    "patch_system_prompt": "@patch",
+    "plan_system_prompt": "@plan",
+    "shell_system_prompt": "@shell",
+    "agent_system_prompt": "@agent",
     "agent_context_expires": " ".join(str(value) for value in DEFAULT_AGENT_CONTEXT_EXPIRES),
     "system_prompt_with_task": "on",
     "line_numbers": "on",
@@ -2740,7 +2740,7 @@ def handle_copy_profile(
     try:
         current_name = validate_prompt_profile_name(current_name)
         new_name = validate_prompt_profile_name(new_name)
-        if new_name == "config":
+        if new_name == "config" and inherit:
             raise ValueError("cannot create a profile named 'config'")
         if current_name == new_name:
             raise ValueError("source and destination profiles must differ")
@@ -2752,17 +2752,22 @@ def handle_copy_profile(
             raise ValueError(
                 f"source profile '{current_name}' does not exist"
             )
-        if destination_path.exists():
+        if destination_path.exists() and new_name != "config":
             raise ValueError(
                 f"destination profile '{new_name}' already exists"
             )
 
-        config = (
-            {INHERIT_PROFILE_CONFIG_KEY: current_name}
-            if inherit
-            else read_config_document(source_path)
-        )
-        save_config(config, destination_path)
+        if new_name == "config":
+            config = _merged_config_from_path(source_path, set())
+            config.pop(INHERIT_PROFILE_CONFIG_KEY, None)
+            write_json_document(destination_path, config)
+        else:
+            config = (
+                {INHERIT_PROFILE_CONFIG_KEY: current_name}
+                if inherit
+                else read_config_document(source_path)
+            )
+            save_config(config, destination_path)
     except Exception as exc:
         print(f"ERROR: Failed to {action} profile: {exc}", file=sys.stderr)
         return 1
@@ -4786,10 +4791,7 @@ def edit_text(text: str, suffix: str = ".txt") -> str:
 
 def read_prompt_argument(value: str | list[str]) -> str:
     if isinstance(value, list):
-        if len(value) == 1:
-            value = value[0]
-        else:
-            value = " ".join(value)
+        value = " ".join(value)
     if value == "e":
         edited_text = edit_text("").strip()
         if not edited_text:
@@ -10920,7 +10922,7 @@ def run_tree_mode(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MinCE: minimal AI assistant"
+        description="mce: Minimal Context Engine"
     )
 
     mode_group = parser.add_mutually_exclusive_group()
@@ -10928,6 +10930,7 @@ def parse_args() -> argparse.Namespace:
         "-a",
         "--ask",
         metavar="TEXT",
+        nargs="+",
         type=str,
         help="Prompt without file context or the configured system prompt (use - for STDIN or e to edit)",
     )
@@ -10945,6 +10948,7 @@ def parse_args() -> argparse.Namespace:
         "-t",
         "--task",
         metavar="TEXT",
+        nargs="+",
         help="Task/prompt for the model with file context (use - for STDIN or e to edit)",
     )
 
@@ -11673,8 +11677,12 @@ def parse_args() -> argparse.Namespace:
     config_print_group.add_argument(
         "--set-config",
         metavar="NAME=VALUE",
-        action="append",
-        help="Set a configuration value (use DEFAULT to reset it; may be repeated)",
+        nargs="+",
+        action="extend",
+        help=(
+            "Set one or more configuration values "
+            "(use DEFAULT to reset them; may be repeated)"
+        ),
     )
 
     config_print_group.add_argument(
@@ -11760,7 +11768,10 @@ def parse_args() -> argparse.Namespace:
     profile_action_group.add_argument(
         "--copy-profile",
         metavar="NEW_NAME",
-        help="Copy the current configuration profile to a new profile",
+        help=(
+            "Copy the current configuration profile to a new profile or "
+            "overwrite config"
+        ),
     )
 
     profile_action_group.add_argument(
