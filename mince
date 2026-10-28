@@ -3880,10 +3880,15 @@ def validate_patch_ranges(
         if start_line > end_line:
             raise ValueError(f'{patch_id}: start_line cannot be greater than end_line')
         if total_lines == 0:
-            if start_line != 1 or end_line != 1:
+            if start_line != 1:
                 raise ValueError(
                     f'{patch_id}: empty documents only support line 1 insertion'
                 )
+        elif total_lines is not None and end_line > total_lines:
+            raise ValueError(
+                f'{patch_id}: end_line {end_line} exceeds document line count '
+                f'({total_lines})'
+            )
 
         ranges.append(
             PatchRange(
@@ -4033,6 +4038,8 @@ def resolve_patch_suffix(
 def build_patch_changes(
     original_texts: dict[str, str],
     manifest: dict[str, Any],
+    *,
+    require_changes: bool = False,
  ) -> tuple[dict[str, str], str, list[tuple[str, str]]]:
     updated_texts = apply_combined_patch_manifest(
         original_texts,
@@ -4042,7 +4049,7 @@ def build_patch_changes(
     changed_items: list[tuple[str, str]] = []
     for path, updated_text in updated_texts.items():
         original_text = original_texts.get(path, "")
-        if updated_text == original_text:
+        if path in original_texts and updated_text == original_text:
             continue
         changed_items.append((path, updated_text))
         diff = generate_unified_diff(
@@ -4053,6 +4060,8 @@ def build_patch_changes(
         )
         if diff:
             diffs.append(diff)
+    if require_changes and not changed_items:
+        raise ValueError("patch manifest does not change any files")
     return updated_texts, "\n".join(diffs), changed_items
 
 
@@ -4776,12 +4785,14 @@ def parse_retry_count(value: Any) -> int:
         raise ValueError("retry count must be a non-negative integer")
     return retry_count
 
-def read_file(path: Path) -> str:
+def read_file(path: Path, *, raise_errors: bool = False) -> str:
     try:
         return read_text_preserving_line_endings(path)
     except UnicodeDecodeError:
         return path.read_bytes().decode("utf-8", errors="replace")
     except Exception as exc:
+        if raise_errors:
+            raise
         return f"ERROR: cannot read file {path} ({exc})"
 
 def edit_text(text: str, suffix: str = ".txt") -> str:
@@ -5012,41 +5023,39 @@ def build_context_sections(
     for path in file_paths:
         context_path = "/proc/self/stdin" if path == Path("-") else str(path)
         last_modified_time: int | None = None
+        content = ""
         error = ""
-        if (
-            path == Path("-") and stdin_content is None
-            or path != Path("-") and not path.exists()
-        ):
-            error = f"MISSING FILE: {context_path}"
-            if missing_file_expires_in_turns is None:
-                sections.append((context_path, f"[{error}]"))
-                continue
-            content = ""
-        elif path == Path("-"):
-            stdin_size = len(stdin_content.encode("utf-8"))
-            if stdin_size > max_bytes:
-                sections.append(
-                    (
-                        context_path,
-                        f"[SKIPPED LARGE FILE: {context_path} ({stdin_size} bytes)]",
+        try:
+            if (
+                path == Path("-") and stdin_content is None
+                or path != Path("-") and not path.exists()
+            ):
+                error = f"MISSING FILE: {context_path}"
+            elif path == Path("-"):
+                stdin_size = len(stdin_content.encode("utf-8"))
+                if stdin_size > max_bytes:
+                    error = (
+                        f"SKIPPED LARGE FILE: {context_path} "
+                        f"({stdin_size} bytes)"
                     )
-                )
-                continue
-            content = stdin_content
-        else:
-            file_stat = path.stat()
-            if file_stat.st_size > max_bytes:
-                sections.append(
-                    (
-                        context_path,
-                        f"[SKIPPED LARGE FILE: {context_path} ({file_stat.st_size} bytes)]",
+                else:
+                    content = stdin_content
+            else:
+                file_stat = path.stat()
+                if file_stat.st_size > max_bytes:
+                    error = (
+                        f"SKIPPED LARGE FILE: {context_path} "
+                        f"({file_stat.st_size} bytes)"
                     )
-                )
-                continue
-
-            content = read_file(path)
-            if include_last_modified_time:
-                last_modified_time = int(file_stat.st_mtime)
+                else:
+                    content = read_file(path, raise_errors=True)
+                    if include_last_modified_time:
+                        last_modified_time = int(file_stat.st_mtime)
+        except Exception as exc:
+            error = f"ERROR: cannot read file {context_path} ({exc})"
+        if error and missing_file_expires_in_turns is None:
+            sections.append((context_path, f"[{error}]"))
+            continue
         content_line_ending = detect_line_ending(content)
         content_total_lines = len(content.splitlines())
         if add_line_numbers:
@@ -5070,7 +5079,7 @@ def build_context_sections(
                 if last_modified_time is not None
                 else ""
             )
-            error_attribute = f" error='{error}'" if error else ""
+            error_attribute = f" error={shlex.quote(error)}" if error else ""
             if error and missing_file_expires_in_turns is not None:
                 error_attribute += (
                     f" expires_in_turns='{missing_file_expires_in_turns}'"
@@ -5081,7 +5090,7 @@ def build_context_sections(
                 model=model,
                 attributes=(
                     f"{last_refreshed_time_attribute}{last_modified_time_attribute}"
-                    f"{error_attribute} path='{context_path}' encoding='utf-8' "
+                    f"{error_attribute} path={shlex.quote(context_path)} encoding='utf-8' "
                     f"line_ending='{content_line_ending}' "
                     f"total_lines='{content_total_lines}'"
                 ),
@@ -6664,6 +6673,25 @@ def format_agent_tool_outputs(
     )
 
 
+def agent_readfile_error_output(
+    output: str,
+    contexts: tuple[tuple[str, str], ...] | None = None,
+) -> str:
+    if output.startswith("ERROR:"):
+        return output
+    contexts = parse_agent_readfile_contexts(output) or contexts
+    if not contexts:
+        return output
+    errors: list[str] = []
+    for path, section in contexts:
+        attributes = agent_file_context_attributes(section)
+        if attributes is None:
+            errors.append(section)
+        elif attributes.get("error"):
+            errors.append(f"{path}: {attributes['error']}")
+    return "\n".join(errors)
+
+
 def record_agent_tool_history(
     turns: list[AgentTurn],
     task: str,
@@ -6683,18 +6711,21 @@ def record_agent_tool_history(
             readfile_contexts,
         )
     if preceding_patch_tool_call is not None:
-        if readfile_contexts is not None:
-            if (
-                not turns
-                or turns[-1].tool_call != preceding_patch_tool_call
-            ):
-                raise ValueError(
-                    "agent patch readfile call has no preceding patch turn"
-                )
-            turns[-1] = replace(
-                turns[-1],
-                readfile_contexts=readfile_contexts,
+        if (
+            not turns
+            or turns[-1].tool_call != preceding_patch_tool_call
+        ):
+            raise ValueError(
+                "agent patch readfile call has no preceding patch turn"
             )
+        turns[-1] = replace(
+            turns[-1],
+            output=join_prompt_sections(
+                turns[-1].output,
+                agent_readfile_error_output(output, readfile_contexts),
+            ),
+            readfile_contexts=readfile_contexts,
+        )
         return
     turns.append(
         AgentTurn(
@@ -6725,7 +6756,10 @@ def agent_history_tool_content(turn: AgentTurn) -> str:
         turn.tool_call.tool == AGENT_READFILE_TOOL
         and turn.readfile_contexts is not None
     ):
-        return "`readfile` content loaded into the `<files>` tag."
+        return (
+            agent_readfile_error_output(turn.output, turn.readfile_contexts)
+            or "`readfile` content loaded into the `<files>` tag."
+        )
     return turn.output
 
 AGENT_INITIAL_FILE_CONTEXT_TURN = 0
@@ -6741,7 +6775,7 @@ def agent_file_context_section(
     if attributes is None:
         return section
     attribute_text = " ".join(
-        f"{name}='{value}'"
+        f"{name}={shlex.quote(value)}"
         for name, value in attributes.items()
         if name not in ("turn", "expires_in_turns", "token_count")
     )
@@ -7001,7 +7035,7 @@ def format_agent_history(
             format_context_entry(
                 "agent_turn",
                 f"<tool_call>\n{tool_call_content}\n</tool_call>\n"
-                f"<tool_content>\n{tool_content}\n</tool_content>\n",
+                f"<tool_output>\n{tool_content}\n</tool_output>\n",
                 model=model,
                 attributes=(
                     f"{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' "
@@ -7785,20 +7819,25 @@ def load_reused_agent_turn_metadata(
                 if number != entry["number"]
             ]
             continue
+        output = tool_outputs[call_index]
+        context_index = call_index
+        if (
+            call_index + 1 < len(tool_calls)
+            and tool_calls[call_index + 1] is not None
+            and is_agent_patch_readfile_companion(
+                tool_call, tool_calls[call_index + 1]
+            )
+        ):
+            context_index += 1
+            output = join_prompt_sections(
+                output,
+                agent_readfile_error_output(tool_outputs[context_index]),
+            )
         contexts = entry["readfile_contexts"]
         readfile_contexts: tuple[tuple[str, str], ...] | None = None
         if contexts is not None:
             restored_contexts: list[tuple[str, str]] = []
             if contexts:
-                context_index = call_index
-                if (
-                    call_index + 1 < len(tool_calls)
-                    and tool_calls[call_index + 1] is not None
-                    and is_agent_patch_readfile_companion(
-                        tool_call, tool_calls[call_index + 1]
-                    )
-                ):
-                    context_index += 1
                 source_contexts = dict(load_reused_agent_readfile_contexts(
                     source_dir, tool_outputs[context_index]
                 ) or ())
@@ -7816,7 +7855,7 @@ def load_reused_agent_turn_metadata(
             task=task,
             context=entry["context"],
             tool_call=tool_call,
-            output=tool_outputs[call_index],
+            output=output,
             turn_unix_time=entry["turn_unix_time"],
             expires_in_turns=entry["expires_in_turns"],
             purge_in_turns=entry["purge_in_turns"],
@@ -8866,6 +8905,20 @@ def request_agent_model(
                         tool_call.reason,
                         model_settings.model,
                     )
+                elif tool_call.tool == AGENT_PATCH_TOOL:
+                    try:
+                        manifest = tool_call.arguments
+                        if manifest is None:
+                            raise ValueError("agent patch tool received no manifest")
+                        build_patch_changes(
+                            load_patch_original_texts(manifest),
+                            manifest,
+                            require_changes=True,
+                        )
+                    except ValueError as exc:
+                        raise AgentControllerResponseError(
+                            f"agent patch arguments are invalid: {exc}"
+                        ) from exc
             try:
                 response = format_agent_tool_calls(list(parsed_tool_calls))
             except (TypeError, ValueError, KeyError, UnicodeError, RecursionError, OverflowError) as exc:
@@ -9171,14 +9224,12 @@ def run_agent_patch_tool(
         updated_texts, diff_text, changed_items = build_patch_changes(
             original_texts,
             manifest,
+            require_changes=True,
         )
         write_state_patch_artifacts(turn_dir, manifest_text, diff_text)
     except Exception as exc:
         return AgentToolExecution(f"ERROR: Patch tool failed: {exc}")
- 
-    if not changed_items:
-        return AgentToolExecution("Patch tool completed without changes.")
- 
+
     review_action, revision_task, suffix_provided = review_patch_changes(
         diff_text,
         suffix_provided,

@@ -91,8 +91,6 @@ mce --print-default-config
 
 Select a built-in preset with `-p`: `ask`, `task`, `tree`, `patch`, `planpatch`, `shell`, `plantask`, or `agent`. These inherit shared settings from `config`, so you can configure your endpoint and credentials once.
 
-All presets enable prompt expansion and explicit prompt caching. The `ask` and `task` presets enable quiet, streamed replies; `patch` and `planpatch` enable patch review.
-
 Internal `mce_*` profiles are read-only. Customize the corresponding preset name or create an inherited profile for your own workflow. Configuration profiles are separate from agent worker profiles.
 
 ## Basic Usage 💡
@@ -103,13 +101,15 @@ Ask a direct question without file context:
 mce -p ask -a "How are two strings concatenated?"
 ```
 
-Draft deployment files in a contained, writable workspace.  Add `--agent-review` to approve tool calls:
+Draft deployment files in a contained, writable workspace reading the API key at runtime so it does not need to be stored locally:
 
 ```bash
 mkdir -p ~/workspace
 cd ~/workspace
-mcec -W . -p agent --agent \
-  --task 'Draft an Apache HTTPD deployment and hardening script to be run as root, plus a short README. Write files only in this workspace; the system is read-only, do not install services or change system configuration.'
+mcec -W . -p agent --apikey --agent \
+  --task 'Draft an Apache HTTPD deployment and hardening script to be run as root, ' \
+  'plus a short README. Write files only in this workspace; the system is read-only, ' \
+  'do not install services or change system configuration.'
 ```
 
 Run a task with local files as context:
@@ -735,9 +735,17 @@ ok 83 - imports containment environment by name and executes commands through PA
 
 ## Usage Notes 🪧
 
+**Adjust agent context expiration depending on context window size**
+
+Adjusting `--agent-context-expires` may be required when using long context windows over many turns.  This setting and its default are still experimental and may change.
+
 **Prevent incorrect cost calculation when specifying --model**
 
 Specifying `--model` without `--token-cost` will disable token cost calculation.  Models will have unique pricing making the configured token pricing incorrect.
+
+**Token estimation influences token limits**
+
+Token estimation and actual input token usage may vary greatly model depending, adjust the token limit with the difference included for ideal results.
 
 ## Known Issues and Reporting ⚠️
 
