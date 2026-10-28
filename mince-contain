@@ -769,8 +769,8 @@ def main() -> int:
         arguments = sys.argv[1:]
         if not arguments:
             print(
-                "No arguments supplied. Use --contain-help for containment "
-                "options or --help to show MinCE command-line help."
+                "Use --contain-help for containment "
+                "options or --help to show mce command-line help."
             )
             return 0
 

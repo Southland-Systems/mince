@@ -193,9 +193,10 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "with newlines. Check exit statuses, stdout, and stderr before deciding "
     "what to do next.\n\n"
     "Task tracking:\n"
-    "- Apply an ordered `meta_task_list.operations` batch. For `add`, supply "
-    "`tasks` with `task` and explicit `status` fields. For "
-    "a task `change`, supply `tasks` with `number` and `status`. "
+    "- Apply an ordered `meta_task_list.operations` batch when task changes "
+    " are necessary. Bundle task changes with other tool calls when possible. "
+    "For task `add`, supply `tasks` with `task` and explicit `status` fields. "
+    "For a task `change`, supply `tasks` with `number` and `status`. "
     "For `remove`, supply a `numbers` array. Use only `todo`, `active`, "
     "`done`, or `skip` statuses; mark work `active` while it is in progress. "
     "Rewrite task text by removing and adding. The maximum task count is 75.\n\n"
@@ -328,6 +329,7 @@ BUILTIN_CONFIG_PROFILES: dict[str, dict[str, Any]] = {
     }
     for name, settings in {
         "ask": {
+            "explicit_prompt_cache": "on",
             "system_prompt": "",
             "system_prompt_with_task": "off",
             "line_numbers": "off",
@@ -336,15 +338,19 @@ BUILTIN_CONFIG_PROFILES: dict[str, dict[str, Any]] = {
             "prompt_expansion": "on",
         },
         "task": {
+            "explicit_prompt_cache": "on",
+            "system_prompt_with_task": "on",
             "stream": "on",
             "quiet": "on",
             "prompt_expansion": "on",
         },
         "tree": {
+            "explicit_prompt_cache": "on",
             "system_prompt_with_task": "on",
             "prompt_expansion": "on",
         },
         "patch": {
+            "explicit_prompt_cache": "on",
             "system_prompt_with_task": "on",
             "patch": "on",
             "patch_review": "on",
@@ -352,6 +358,7 @@ BUILTIN_CONFIG_PROFILES: dict[str, dict[str, Any]] = {
             "prompt_expansion": "on",
         },
         "planpatch": {
+            "explicit_prompt_cache": "on",
             "system_prompt_with_task": "on",
             "plan": "on",
             "patch": "on",
@@ -360,18 +367,22 @@ BUILTIN_CONFIG_PROFILES: dict[str, dict[str, Any]] = {
             "prompt_expansion": "on",
         },
         "shell": {
+            "explicit_prompt_cache": "on",
             "system_prompt_with_task": "on",
             "shell": "on",
             "shell_timeout": 300,
             "prompt_expansion": "on",
         },
         "plantask": {
+            "explicit_prompt_cache": "on",
+            "system_prompt_with_task": "on",
             "plan": "on",
             "stream": "on",
             "quiet": "on",
             "prompt_expansion": "on",
         },
         "agent": {
+            "explicit_prompt_cache": "on",
             "system_prompt_with_task": "on",
             "agent": "on",
             "shell_timeout": 300,
@@ -3265,6 +3276,15 @@ class ShellTurn:
     output: str
 
 SHELL_OUTPUT_TOKEN_FRACTION = 0.8
+SHELL_PAGER_ENVIRONMENT: dict[str, str] = {
+    "PAGER": "cat",
+    "GIT_PAGER": "cat",
+    "SYSTEMD_PAGER": "cat",
+    "MANPAGER": "cat",
+    "GH_PAGER": "cat",
+    "AWS_PAGER": "cat",
+    "PSQL_PAGER": "cat",
+}
 
 def _shell_step_from_value(value: Any, index: int) -> ShellStep:
     if not isinstance(value, dict):
@@ -3582,6 +3602,10 @@ def _contained_shell_command(
         "--property=RestrictNamespaces=yes",
         f"--property=RuntimeMaxSec={timeout if timeout is not None else 'infinity'}",
     ]
+    arguments.extend(
+        f"--setenv={name}={value}"
+        for name, value in SHELL_PAGER_ENVIRONMENT.items()
+    )
     if paths:
         read_write_paths = " ".join(
             json.dumps(str(path), ensure_ascii=False) for path in paths
@@ -3687,6 +3711,7 @@ def execute_shell_commands(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env={**os.environ, **SHELL_PAGER_ENVIRONMENT},
                 start_new_session=os.name == "posix",
                 preexec_fn=preexec_fn,
             )
@@ -8589,6 +8614,7 @@ def run_agent_hook_context_scripts(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                env={**os.environ, **SHELL_PAGER_ENVIRONMENT},
                 check=False,
             )
         except Exception:
@@ -11762,7 +11788,7 @@ def parse_args() -> argparse.Namespace:
     profile_action_group.add_argument(
         "--init-profile",
         metavar="NAME",
-        help="Interactively initialise a new configuration profile",
+        help="Interactively initialize a new configuration profile",
     )
 
     profile_action_group.add_argument(
