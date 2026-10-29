@@ -26,6 +26,7 @@ import tempfile
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from urllib.parse import urlsplit, urlunsplit
 import fnmatch
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -156,83 +157,102 @@ AGENT_TASK_PRIORITY_SYSTEM_PROMPT = (
     "the next action. Use the broad instructions as overall session guidance."
 )
 AGENT_TOOL_CALL_SYSTEM_PROMPT = (
-    "Control the autonomous agent session through the provided tools. Complete "
-    "the task, verify actual outcomes, and avoid duplicate work. Default agent "
-    "mode executes calls without confirmation; keep actions safe and scoped, "
-    "and honor any review decisions or revision instructions.\n\n"
-    "Tool-call protocol:\n"
-    "- Return one or more native tool calls on every controller turn, with no "
-    "ordinary response text, code fences, or JSON that merely describes calls. "
+    "Control the autonomous agent session through the available tools. "
+    "Complete the task accurately and efficiently, verify actual outcomes. "
+    "Response protocol:\n"
+    "- Return one or more native tool calls on each controller turn. Do not "
+    "return ordinary text, code fences, or JSON that only describes calls. "
     "Follow the argument schemas in `<agent_tool_json_schemas>` exactly.\n"
-    "- Calls run sequentially in returned order. Batch work when possible. "
-    "Put patch and task/action calls first and context-retention "
-    "calls afterward; `meta_task_list` may be first. Use `session` "
-    "alone. A `meta_context_control` call may start a response only when it "
-    "uses `action=summary` and is the sole call.\n"
-    "- Supply `expires_in_turns` for every tool except `meta_task_list`, using "
-    "the schema's configured bounds and default. Another controller turn "
-    "follows automatically after tools finish.\n\n"
-    "File and shell work:\n"
-    "- Use `readfile` with `paths` to load file context in `<files>`. `<files>` "
-    "are automatically refreshed each turn. Inspect numbered `<file>` snapshots, their "
-    "turn/expiry metadata, and any errors. Do not use `shell` to read or inspect "
-    "whole files.\n"
-    "- Edit or create files with `patch`, never shell commands. Pass the "
-    "`line_replace_manifest` fields directly, plus `expires_in_turns`. Group "
-    "each file's patches in one `files` entry in one call. Use current, "
-    "non-overlapping, 1-based inclusive ranges; preserve source line endings "
-    "and strip displayed line-number prefixes from replacement lines.\n"
-    "- Expect a `readfile` companion immediately after each `patch` for its "
-    "document paths; do not run another `readfile` on the paths. "
-    "patches overwrite source files. "
-    "Check actual outcomes and `<written_paths>` before assuming files changed.\n"
-    "- Use `shell` to search, inspect the environment, and verify work with "
-    "safe, necessary commands. Pass the `shell_commands` fields directly, "
-    "plus `expires_in_turns`. Give every command a concise, non-empty `reason`. "
-    "Use `lines` only for standard input; entries are sent in order, joined "
-    "with newlines. Check exit statuses, stdout, and stderr before deciding "
-    "what to do next.\n\n"
+    "- Include `expires_in_turns` on every tool except `meta_task_list`.\n"
+    "- Calls execute sequentially in the order returned. Batch or combine any tool "
+    "call types together.\n"
+    "- Put patch and other action calls before context-retention calls; "
+    "`meta_task_list` may come first. Do not begin with "
+    "`meta_context_control` unless it is a sole `action=summary` call. "
+    "A `session` call must also be the sole call.\n\n"
+    "Progress and loop prevention:\n"
+    "- Before each action, compare the requested outcomes with the newest "
+    "actual tool results. Identify the remaining unmet requirement and choose "
+    "a call that changes the state or answers a specific unresolved question.\n"
+    "- Do not repeat the same or equivalent tool call on unchanged inputs just "
+    "to reconfirm a result. Rewording its `reason` is not progress. Retry only "
+    "after a relevant change or to test a distinct hypothesis, with a clear "
+    "stopping condition.\n"
+    "- Once a verification succeeds, do not run it again without a relevant "
+    "change. Mark completed tasks `done` and move to unmet requirements.\n"
+    "- If two consecutive turns produce no new evidence or substantive task "
+    "progress, break the loop: choose a different targeted action or call "
+    "`session` with `action=end` and report the blocker. Task-list and context "
+    "updates alone are not substantive progress.\n"
+    "- Preserve completed work, verification results, blockers, and the next "
+    "unresolved step in summaries so expired history does not restart finished "
+    "checks.\n\n"
+    "File context:\n"
+    "- Reuse current `<file>` entries in `<files>` instead of reading the "
+    "same paths again. Inspect their content, errors, and turn/expiry "
+    "metadata before use. Use `readfile` with `paths` for file context, "
+    "do not use `shell` commands that read whole files such as `cat`.\n"
+    "- Identify files by `path`. An optional `relative_path` is relative to "
+    "the enclosing `<files>` tag's `current_working_directory`.\n\n"
+    "File edits:\n"
+    "- Use `patch` to edit or create files, never shell commands. Pass the "
+    "`line_replace_manifest` fields directly, plus `expires_in_turns`. "
+    "Group all patches for a file in one `files` entry in a single call.\n"
+    "- Use current, non-overlapping, 1-based inclusive line ranges. Each "
+    "`content_line_array` item must be one source line with no line ending "
+    "or displayed line-number prefix. Preserve source line endings. For a "
+    "new or empty file, use the range 1-1.\n"
+    "- The runtime automatically runs a `readfile` companion immediately "
+    "after each `patch` for its document paths, do not add duplicate "
+    "`readfile` calls for those paths.\n"
+    "- Inspect the tool output and `<written_paths>` before "
+    "assuming a file changed.\n\n"
+    "Shell work:\n"
+    "- Use `shell` for any command except reading of whole files. "
+    "Pass the `shell_commands` fields directly, plus `expires_in_turns`. "
+    "Choose safe, necessary commands and give each a concise, non-empty "
+    "`reason`.\n"
+    "- Supply `lines` only when a command needs standard input. Entries are "
+    "joined with newlines and sent in order. Each command runs in a separate "
+    "shell; directory changes and shell variables do not carry to later "
+    "commands. Check exit statuses, stdout, and stderr before proceeding.\n\n"
     "Task tracking:\n"
-    "- Apply an ordered `meta_task_list.operations` batch when task changes "
-    " are necessary. Bundle task changes with other tool calls when possible. "
-    "For task `add`, supply `tasks` with `task` and explicit `status` fields. "
-    "For a task `change`, supply `tasks` with `number` and `status`. "
-    "For `remove`, supply a `numbers` array. Use only `todo`, `active`, "
-    "`done`, or `skip` statuses; mark work `active` while it is in progress. "
-    "Rewrite task text by removing and adding. The maximum task count is 75.\n\n"
+    "- Use an ordered `meta_task_list` batch for task list edits, "
+    "ideally bundle with other calls. For `add`, provide `tasks` "
+    "with `task` and explicit `status`; for `change`, provide `tasks` with "
+    "`number` and `status`; for `remove`, provide task `numbers`.\n"
+    "- Use only `todo`, `active`, `done`, or `skip` statuses. Mark work "
+    "`active` while in progress. To rewrite task text, remove and add a "
+    "task. Keep at most 75 tasks.\n\n"
     "Continuation and delegation:\n"
-    "- Use generic `agent` only to replace the active task and context for "
-    "the next turn, not as a no-op or a worker. If its tool description selects "
-    "a default profile, use it as a worker instead.\n"
-    "- Delegate through an applicable available `agent_<profile_name>` tool. "
-    "For both `agent` and profile calls, provide a self-contained, non-empty "
-    "`task` and the required `context` and `reason` strings, empty if unused. "
-    "Inspect worker results: even `patch` and `shell` profiles only return "
-    "structured output. Submit proposed edits or commands through `patch` or "
-    "`shell` to execute them.\n\n"
+    "- Without a default worker profile, `agent` replaces the active task "
+    "and context for the next turn. Use it only for that change, not as a "
+    "no-op or worker. If its tool description selects a default profile, "
+    "`agent` invokes that worker instead.\n"
+    "- Delegate to an applicable available `agent_<profile_name>` tool. "
+    "For `agent` and all profile calls, provide a self-contained, non-empty "
+    "`task` and the required `context` and `reason` strings; these two "
+    "strings may be empty when unused.\n\n"
     "Context management:\n"
-    "- Read `<agent_history>` newest to oldest and distinguish actual outcomes "
-    "from attempted actions. Unpinned files and history turns expire after "
-    "their displayed `expires_in_turns`. Use the token estimates to manage "
-    "context before important details are dropped.\n"
+    "- Read `<agent_history>` newest to oldest, distinguishing attempted "
+    "actions from actual outcomes. Unpinned files and history turns expire "
+    "after their displayed `expires_in_turns`. Use token estimates to manage "
+    "context before important details are lost.\n"
     "- Use `meta_context_control` with `action=pin` to retain an available "
-    "initial file path or prior `turn:N`; use `action=set_expires_in_turns` "
-    "to set its expiry to the call's value. Put the target in `context_id`. "
-    "For files loaded by `readfile` or patch companions, target the owning "
-    "turn shown in `<file>`. Use displayed history turn indexes, not request "
-    "numbers. Pins prevent expiry, not removal under token pressure.\n"
-    "- Use `<agent_context_summary>` as compressed context, not live file "
+    "initial file path or prior `turn:N`; put the target in `context_id`. "
+    "Use `action=set_expires_in_turns` to set that target's expiry to the "
+    "call's `expires_in_turns` value.\n"
+    "- For files loaded by `readfile` or patch companions, target the owning "
+    "history turn shown in `<file>`. Pins prevent expiry, not removal under token pressure.\n"
+    "- Treat `<agent_context_summary>` as compressed context, not live file "
     "contents. It uses the configured default expiry and refreshes "
     "automatically. To replace it and compact context, call "
     "`meta_context_control` alone with `action=summary`, `context_id=all`, "
-    "and non-empty Markdown in `reason`. Merge the previous summary; preserve "
-    "constraints, decisions, actual outcomes, blockers, next steps, and "
-    "relevant file paths and descriptions. Exclude the persistent task list.\n\n"
+    "and non-empty Markdown in `reason`.\n"
     "Session completion:\n"
     "- When complete or blocked from further safe progress, call `session` "
-    "alone with `action=end` and a non-empty `reason` reporting results, "
-    "verification, and remaining limitations. Do not claim success for "
-    "rejected, saved-only, or failed actions."
+    "alone with `action=end` and a non-empty `reason`. Report results, "
+    "verification, and remaining limitations."
 )
 DEFAULT_PROMPT_LIBRARY_ENTRIES: dict[str, str] = {
     "mce_system": DEFAULT_SYSTEM_PROMPT,
@@ -906,13 +926,13 @@ def state_turn_directories(state_session_dir: Path) -> list[tuple[int, Path]]:
 
 def completed_state_turn_directories(
     state_session_dir: Path,
-    maximum_turn: int,
+    maximum_turn: int | None = None,
 ) -> list[tuple[int, Path]]:
     return sorted(
         (turn, entry)
         for turn, entry in resumed_state_turn_directories(state_session_dir)
         if (
-            turn <= maximum_turn
+            (maximum_turn is None or turn <= maximum_turn)
             and (entry / "response").is_file()
             and not (entry / "response").is_symlink()
         )
@@ -921,7 +941,7 @@ def completed_state_turn_directories(
 
 def next_state_turn_index(state_session_dir: Path) -> int:
     return max(
-        (turn for turn, _ in resumed_state_turn_directories(state_session_dir)),
+        (turn for turn, _ in completed_state_turn_directories(state_session_dir)),
         default=-1,
     ) + 1
 
@@ -976,6 +996,7 @@ STATE_TURN_ARTIFACTS = (
     "response_reasoning",
     "response_reasoning_encrypted_content",
     "response",
+    "response_error",
     "response_schema_patch",
     "response_diff_patch",
     "response_schema_patch_applied",
@@ -1516,6 +1537,21 @@ def write_state_artifact(
     (state_directory / artifact_name).write_text(content, encoding="utf-8")
 
 
+def append_state_response_error(
+    state_directory: Path,
+    error: BaseException | str,
+) -> None:
+    detail = (
+        format_exception_message(error)
+        if isinstance(error, BaseException)
+        else str(error).strip()
+    )
+    append_session_log(
+        state_directory / "response_error",
+        f"ERROR: {detail or type(error).__name__}\n",
+    )
+
+
 def write_state_reasoning_items(
     turn_dir: Path,
     reasoning_items: tuple[dict[str, Any], ...],
@@ -1539,7 +1575,12 @@ def complete_state_turn(
  ) -> None:
     write_state_artifact(turn_dir, "response_reasoning", reasoning)
     write_state_reasoning_items(turn_dir, reasoning_items)
-    write_state_artifact(turn_dir, "response", response)
+    temporary_path = turn_dir / ".response"
+    try:
+        write_state_artifact(turn_dir, temporary_path.name, response)
+        temporary_path.replace(turn_dir / "response")
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def write_state_patch_artifacts(
@@ -2621,7 +2662,7 @@ def format_log_settings(
         )
     return (
         "<settings>\n"
-        f"<configuration path=\"{CONFIG_FILE}\">\n"
+        f"<configuration path={quote_tag_attribute(CONFIG_FILE)}>\n"
         f"{json.dumps(logged_config, separators=(', ', ': '), ensure_ascii=False, default=str)}\n"
         "</configuration>\n"
         "<arguments>\n"
@@ -4351,6 +4392,20 @@ def token_encoding_for_model(model: str) -> Any:
         return tiktoken.get_encoding("o200k_base")
 
 
+def quote_tag_attribute(value: Any) -> str:
+    return f"'{value}'"
+
+
+def file_context_relative_path_attribute(path: str) -> str:
+    if not path or path == "/proc/self/stdin":
+        return ""
+    try:
+        relative_path = Path(os.path.abspath(path)).relative_to(Path.cwd())
+    except (OSError, ValueError):
+        return ""
+    return f" relative_path={quote_tag_attribute(relative_path.as_posix())}"
+
+
 def format_context_entry(
     name: str,
     content: str,
@@ -5008,6 +5063,7 @@ def build_context_sections(
     model: str = "",
     token_limit: int | None = None,
     current_token_estimate: int = 0,
+    existing_context_sections: tuple[tuple[str, str], ...] = (),
 ) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     encoding = (
@@ -5015,6 +5071,7 @@ def build_context_sections(
         if token_limit is not None
         else None
     )
+    existing_sections = dict(existing_context_sections)
     max_bytes = max_file_size_kb * 1024
     last_refreshed_time = (
         int(time.time()) if include_last_refreshed_time else None
@@ -5022,6 +5079,12 @@ def build_context_sections(
 
     for path in file_paths:
         context_path = "/proc/self/stdin" if path == Path("-") else str(path)
+        if encoding is not None and context_path in existing_sections:
+            current_token_estimate = max(
+                0,
+                current_token_estimate
+                - len(encoding.encode(existing_sections.pop(context_path))),
+            )
         last_modified_time: int | None = None
         content = ""
         error = ""
@@ -5031,22 +5094,20 @@ def build_context_sections(
                 or path != Path("-") and not path.exists()
             ):
                 error = f"MISSING FILE: {context_path}"
-            elif path == Path("-"):
-                stdin_size = len(stdin_content.encode("utf-8"))
-                if stdin_size > max_bytes:
-                    error = (
-                        f"SKIPPED LARGE FILE: {context_path} "
-                        f"({stdin_size} bytes)"
-                    )
-                else:
-                    content = stdin_content
             else:
-                file_stat = path.stat()
-                if file_stat.st_size > max_bytes:
+                if path == Path("-"):
+                    file_size = len(stdin_content.encode("utf-8"))
+                else:
+                    file_stat = path.stat()
+                    file_size = file_stat.st_size
+                if file_size > max_bytes:
                     error = (
                         f"SKIPPED LARGE FILE: {context_path} "
-                        f"({file_stat.st_size} bytes)"
+                        f"({file_size} bytes)"
                     )
+                    print(f"WARNING: {error}", file=sys.stderr)
+                elif path == Path("-"):
+                    content = stdin_content
                 else:
                     content = read_file(path, raise_errors=True)
                     if include_last_modified_time:
@@ -5079,7 +5140,9 @@ def build_context_sections(
                 if last_modified_time is not None
                 else ""
             )
-            error_attribute = f" error={shlex.quote(error)}" if error else ""
+            error_attribute = (
+                f" error={quote_tag_attribute(error)}" if error else ""
+            )
             if error and missing_file_expires_in_turns is not None:
                 error_attribute += (
                     f" expires_in_turns='{missing_file_expires_in_turns}'"
@@ -5090,8 +5153,9 @@ def build_context_sections(
                 model=model,
                 attributes=(
                     f"{last_refreshed_time_attribute}{last_modified_time_attribute}"
-                    f"{error_attribute} path={shlex.quote(context_path)} encoding='utf-8' "
-                    f"line_ending='{content_line_ending}' "
+                    f"{error_attribute} path={quote_tag_attribute(context_path)}"
+                    f"{file_context_relative_path_attribute(context_path)} "
+                    f"encoding='utf-8' line_ending='{content_line_ending}' "
                     f"total_lines='{content_total_lines}'"
                 ),
             )
@@ -5203,6 +5267,17 @@ def join_prompt_sections(*parts: str) -> str:
     )
 
 
+def format_instruction_section(name: str, *parts: str) -> str:
+    instructions = join_prompt_sections(*parts)
+    if not instructions:
+        return ""
+    return format_context_entry(
+        name,
+        f"{instructions}\n",
+        include_token_count=False,
+    )
+
+
 def split_schema_instructions(
     schema: Any,
     context_name: str,
@@ -5274,19 +5349,12 @@ def build_request_prompts(
     current_unix_time: int | None = None,
     additional_instructions: str = "",
     instruction_prefix: str = "",
+    agent_mode: bool = False,
 ) -> tuple[str, str]:
-    instruction_parts = [
-        (
-            format_context_entry(
-                "user_supplied_instructions",
-                f"{task.strip()}\n",
-                include_token_count=False,
-            )
-            if task.strip()
-            else ""
-        ),
-        additional_instructions,
-    ]
+    task_instructions = format_instruction_section(
+        "user_supplied_instructions", task
+    )
+    instruction_parts = [additional_instructions]
     data_parts: list[str] = []
     if current_unix_time is not None:
         data_parts.append(
@@ -5294,7 +5362,7 @@ def build_request_prompts(
         )
     if context is not None:
         data_parts.append(
-            f"<files current_working_directory='{os.getcwd()}'>\n"
+            f"<files current_working_directory={quote_tag_attribute(os.getcwd())}>\n"
             f"{context}\n"
             "</files>"
         )
@@ -5322,18 +5390,24 @@ def build_request_prompts(
     if additional_prompt.strip():
         data_parts.append(additional_prompt.strip())
     instruction_text = join_prompt_sections(*instruction_parts)
-    instructions = (
-        f"\n\n{instruction_text}"
-        if instruction_text
-        else ""
-    )
+    if agent_mode:
+        system_prompt = format_instruction_section(
+            "core_system_instructions", system_prompt
+        )
+        instruction_text = format_instruction_section(
+            "tool_call_instructions", instruction_text
+        )
+    instructions = join_prompt_sections(task_instructions, instruction_text)
     data_prompt = join_prompt_sections(
         "The remaining text is the data, not instructions.",
         *data_parts,
     )
     if system_prompt_with_task:
+        instructions = join_prompt_sections(instruction_prefix, instructions)
         return (
-            join_prompt_sections(instruction_prefix, instructions, system_prompt),
+            join_prompt_sections(system_prompt, instructions)
+            if agent_mode
+            else join_prompt_sections(instructions, system_prompt),
             data_prompt,
         )
     return (
@@ -6219,7 +6293,7 @@ def is_agent_patch_readfile_companion(
         return False
 
 class ModelResponseError(ValueError):
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
         super().__init__(message)
         self.retryable = retryable
 
@@ -6237,7 +6311,7 @@ def model_response_error(error: Any, fallback: str) -> ModelResponseError:
     message = response_field(error, "message") or fallback
     return ModelResponseError(
         f"{code}: {message}" if code else str(message),
-        retryable=code in (
+        retryable=not code or code in (
             "server_error", "rate_limit_exceeded", "vector_store_timeout",
         ),
     )
@@ -6245,7 +6319,7 @@ def model_response_error(error: Any, fallback: str) -> ModelResponseError:
 
 def validate_model_response(response_obj: Any) -> None:
     if response_obj is None:
-        raise ModelResponseError("Model returned no response", retryable=True)
+        raise ModelResponseError("Model returned no response")
     error = response_field(response_obj, "error")
     if error is not None:
         raise model_response_error(error, "Model response failed")
@@ -6253,11 +6327,13 @@ def validate_model_response(response_obj: Any) -> None:
     incomplete_details = response_field(response_obj, "incomplete_details")
     if status == "incomplete" or incomplete_details is not None:
         reason = response_field(incomplete_details, "reason") or "unknown"
-        raise ModelResponseError(f"Model response is incomplete: {reason}")
+        raise ModelResponseError(
+            f"Model response is incomplete: {reason}",
+            retryable=reason not in ("max_output_tokens", "content_filter"),
+        )
     if status not in (None, "completed"):
         raise ModelResponseError(
-            f"Model response did not complete (status={status})",
-            retryable=status == "failed",
+            f"Model response did not complete (status={status})"
         )
     output_items = response_field(response_obj, "output", [])
     if not isinstance(output_items, (list, tuple)):
@@ -6267,13 +6343,19 @@ def validate_model_response(response_obj: Any) -> None:
             continue
         if response_field(item, "status") not in (None, "completed"):
             raise ModelResponseError("Model response contains an unfinished message")
-        for content in response_field(item, "content", []) or ():
+        content_items = response_field(item, "content", []) or ()
+        if not isinstance(content_items, (list, tuple)):
+            raise ModelResponseError(
+                "Model response message content must be an array"
+            )
+        for content in content_items:
             if response_field(content, "type") == "refusal":
                 refusal = response_field(content, "refusal", "")
                 raise ModelResponseError(
                     f"Model refused the request: {refusal}"
                     if refusal
-                    else "Model refused the request"
+                    else "Model refused the request",
+                    retryable=False,
                 )
 
 
@@ -6749,7 +6831,7 @@ def agent_history_tool_content(turn: AgentTurn) -> str:
             return turn.output
         if not turn.output:
             return "Task list update was not executed."
-        return "Task list loaded into `<meta_task_list>` tag."
+        return ""
     if turn.tool_call.tool.startswith("meta_"):
         return ""
     if (
@@ -6758,7 +6840,7 @@ def agent_history_tool_content(turn: AgentTurn) -> str:
     ):
         return (
             agent_readfile_error_output(turn.output, turn.readfile_contexts)
-            or "`readfile` content loaded into the `<files>` tag."
+            or ""
         )
     return turn.output
 
@@ -6775,9 +6857,11 @@ def agent_file_context_section(
     if attributes is None:
         return section
     attribute_text = " ".join(
-        f"{name}={shlex.quote(value)}"
+        f"{name}={quote_tag_attribute(value)}"
         for name, value in attributes.items()
-        if name not in ("turn", "expires_in_turns", "token_count")
+        if name not in (
+            "turn", "expires_in_turns", "token_count", "relative_path",
+        )
     )
     return format_context_entry(
         "file",
@@ -6786,8 +6870,13 @@ def agent_file_context_section(
         attributes=(
             f" turn='{turn}' expires_in_turns='{expires_in_turns}' "
             f"{attribute_text}"
+            f"{file_context_relative_path_attribute(attributes.get('path', ''))}"
         ),
     )
+
+
+def agent_controller_turn_number(turn: AgentTurn, history_index: int) -> int:
+    return turn.state_turn if turn.state_turn is not None else history_index
 
 
 def format_agent_readfile_contexts(
@@ -6809,7 +6898,7 @@ def format_agent_readfile_contexts(
                 agent_file_context_section(
                     section,
                     file_expires_in_turns[path],
-                    turn_number,
+                    agent_controller_turn_number(turn, turn_number),
                     model=model,
                 )
             )
@@ -6925,7 +7014,9 @@ def advance_agent_readfile_context_expirations(
             (
                 path,
                 agent_file_context_section(
-                    section, file_expires_in_turns[path], turn_number
+                    section,
+                    file_expires_in_turns[path],
+                    agent_controller_turn_number(turn, turn_number),
                 ),
             )
             if path in file_expires_in_turns
@@ -7023,7 +7114,7 @@ def format_agent_history(
             else ""
         )
         pinned_attribute = (
-            " pinned" if turn_number in pinned_turn_numbers else ""
+            " pinned='true'" if turn_number in pinned_turn_numbers else ""
         )
         if purge_in_turns is not None or turn.tool_call.tool.startswith("meta_"):
             tool_call_content = turn.tool_call.tool
@@ -7038,7 +7129,9 @@ def format_agent_history(
                 f"<tool_output>\n{tool_content}\n</tool_output>\n",
                 model=model,
                 attributes=(
-                    f"{turn_unix_time_attribute}{pinned_attribute} index='{turn_number}' "
+                    f"{turn_unix_time_attribute}{pinned_attribute} "
+                    f"index='{agent_controller_turn_number(turn, turn_number)}' "
+                    f"tool_call_index='{turn.tool_call_index}' "
                     f"expires_in_turns='{turn.expires_in_turns}'{purge_attribute}"
                 ),
             )
@@ -7109,6 +7202,7 @@ def resolve_agent_context_pin(
     turns: list[AgentTurn],
     available_turn_numbers: set[int] | None = None,
     turn_number_base: int = 0,
+    turn_numbers: list[int] | None = None,
 ) -> tuple[str, str | int]:
     for path, _ in file_contexts:
         if agent_context_path_matches(context_id, path):
@@ -7121,11 +7215,24 @@ def resolve_agent_context_pin(
     )
     if turn_match is not None:
         turn_number = int(turn_match.group(1)) - turn_number_base
+        if turn_numbers is None:
+            turn_numbers = [
+                agent_controller_turn_number(turn, turn_index)
+                for turn_index, turn in enumerate(turns)
+            ]
+        if len(turn_numbers) != len(turns):
+            raise ValueError("agent turn numbers must match agent turns")
         if available_turn_numbers is None:
             available_turn_numbers = set(range(len(turns)))
-        if turn_number in available_turn_numbers:
-            return "turn", turn_number
-        if 0 <= turn_number < len(turns):
+        turn_indexes = [
+            index
+            for index, number in enumerate(turn_numbers)
+            if number == turn_number
+        ]
+        for turn_index in turn_indexes:
+            if turn_index in available_turn_numbers:
+                return "turn", turn_index
+        if turn_indexes:
             raise ValueError(f"agent turn has expired: turn:{turn_number}")
         raise ValueError(f"agent turn does not exist: turn:{turn_number}")
 
@@ -7142,24 +7249,38 @@ def apply_agent_context_control(
     pinned_paths: set[str],
     pinned_turn_numbers: set[int],
     turn_number_base: int = 0,
+    turn_numbers: list[int] | None = None,
 ) -> None:
+    if turn_numbers is None:
+        turn_numbers = [
+            agent_controller_turn_number(turn, turn_index)
+            for turn_index, turn in enumerate(turns)
+        ]
+    available_turn_indexes = set(agent_history_turn_numbers(turns))
     target_type, target = resolve_agent_context_pin(
         tool_call.context_id,
         file_contexts,
         turns,
-        set(agent_history_turn_numbers(turns)),
+        available_turn_indexes,
         turn_number_base=turn_number_base,
+        turn_numbers=turn_numbers,
     )
-    if tool_call.action == "pin":
-        if target_type == "file":
+    if target_type == "file":
+        if tool_call.action == "pin":
             pinned_paths.add(str(target))
-        else:
-            pinned_turn_numbers.add(int(target))
-    elif tool_call.action == "set_expires_in_turns":
-        if target_type == "file":
+        elif tool_call.action == "set_expires_in_turns":
             file_expires_in_turns[str(target)] = tool_call.expires_in_turns
-        else:
-            turn_index = int(target)
+        return
+    target_turn_number = turn_numbers[int(target)]
+    target_turn_indexes = [
+        index
+        for index, number in enumerate(turn_numbers)
+        if index in available_turn_indexes and number == target_turn_number
+    ]
+    if tool_call.action == "pin":
+        pinned_turn_numbers.update(target_turn_indexes)
+    elif tool_call.action == "set_expires_in_turns":
+        for turn_index in target_turn_indexes:
             turns[turn_index] = replace(
                 turns[turn_index],
                 expires_in_turns=tool_call.expires_in_turns,
@@ -7215,17 +7336,6 @@ def agent_file_context_path(section: str) -> str | None:
     ):
         return None
     return path
-
-
-def agent_file_context_matches_turn(
-    section: str,
-    turn: int,
-) -> bool:
-    attributes = agent_file_context_attributes(section)
-    return (
-        attributes is not None
-        and attributes.get("turn") == str(turn)
-    )
 
 
 def normalize_agent_context_summary(
@@ -7847,7 +7957,7 @@ def load_reused_agent_turn_metadata(
                     section = source_contexts[path]
                     if expiry is not None:
                         section = agent_file_context_section(
-                            section, expiry, entry["number"]
+                            section, expiry, source_turn
                         )
                     restored_contexts.append((path, section))
             readfile_contexts = tuple(restored_contexts)
@@ -8073,16 +8183,21 @@ def reused_agent_context_pins(
     pinned_paths = set(initial_pinned_paths or ())
     pinned_turn_numbers: set[int] = set()
     replayed_turns: list[AgentTurn] = []
+    previous_state_turn: int | None = None
     for turn in turns:
-        advance_agent_history_purges(
-            replayed_turns,
-            pinned_turn_numbers,
-        )
-        advance_agent_file_context_expirations(
-            file_contexts,
-            file_expires_in_turns,
-            pinned_paths,
-        )
+        if (
+            turn.state_turn is None
+            or turn.state_turn != previous_state_turn
+        ):
+            advance_agent_history_purges(
+                replayed_turns,
+                pinned_turn_numbers,
+            )
+            advance_agent_file_context_expirations(
+                file_contexts,
+                file_expires_in_turns,
+                pinned_paths,
+            )
         if (
             turn.tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL
             and turn.tool_call.action != "summary"
@@ -8098,10 +8213,16 @@ def reused_agent_context_pins(
                     pinned_paths,
                     pinned_turn_numbers,
                     turn_number_base=turn_number_base,
+                    turn_numbers=(
+                        list(range(len(replayed_turns)))
+                        if turn_number_base
+                        else None
+                    ),
                 )
             except ValueError:
                 pass
         replayed_turns.append(turn)
+        previous_state_turn = turn.state_turn
     turns[:] = replayed_turns
     return pinned_paths, pinned_turn_numbers
 
@@ -8309,6 +8430,7 @@ def build_agent_context_window_prompts(
     advance_expirations: bool = True,
     refresh_summary: bool = False,
     current_turn: int | None = None,
+    tool_call_instructions: str = AGENT_TOOL_CALL_SYSTEM_PROMPT,
 ) -> tuple[str, str, int | None, bool]:
     if controller_tools is None:
         controller_tools = AGENT_TOOL_SCHEMAS
@@ -8373,6 +8495,7 @@ def build_agent_context_window_prompts(
             current_turn=current_turn,
             summary_request=summary_request,
             model=model,
+            tool_call_instructions=tool_call_instructions,
         )
         return (
             full_system_prompt,
@@ -8540,6 +8663,7 @@ def build_agent_followup_prompts(
     current_turn: int | None = None,
     summary_request: bool = False,
     model: str = "",
+    tool_call_instructions: str = AGENT_TOOL_CALL_SYSTEM_PROMPT,
 ) -> tuple[str, str]:
     if current_unix_time is None:
         current_unix_time = int(time.time())
@@ -8548,6 +8672,7 @@ def build_agent_followup_prompts(
         "agent_tool_json_schemas",
     )
     instruction_parts = [
+        tool_call_instructions if not summary_request else "",
         *schema_instructions,
         "The `<meta_task_list>` uses `TASK_NUMBER. [TASK_STATUS] TASK` "
         "for each task, or `No tasks.` when empty.",
@@ -8577,8 +8702,6 @@ def build_agent_followup_prompts(
         )
 
     summary_context = format_agent_context_summary(context_summary, model=model)
-    if summary_context:
-        instruction_parts.append(summary_context)
 
     if active_context:
         additional_parts.append(
@@ -8608,20 +8731,29 @@ def build_agent_followup_prompts(
 
     instructions = join_prompt_sections(*instruction_parts)
     if summary_request:
+        agent_instructions = join_prompt_sections(
+            task,
+            format_instruction_section("tool_call_instructions", instructions),
+            summary_context,
+        )
         additional_parts.insert(
             0,
             format_context_entry(
                 "agent_instructions",
-                f"{join_prompt_sections(task, instructions)}\n",
+                f"{agent_instructions}\n",
                 model=model,
             ),
         )
         system_prompt = AGENT_SUMMARY_INSTRUCTIONS
         task = ""
         instructions = ""
+        summary_context = ""
 
     return build_request_prompts(
-        system_prompt=system_prompt,
+        system_prompt=join_prompt_sections(
+            system_prompt,
+            AGENT_TASK_PRIORITY_SYSTEM_PROMPT if not summary_request else "",
+        ),
         task=task,
         context=context,
         response_format="text",
@@ -8630,14 +8762,15 @@ def build_agent_followup_prompts(
         system_prompt_with_task=system_prompt_with_task,
         current_unix_time=current_unix_time,
         instruction_prefix=join_prompt_sections(
-            AGENT_TASK_PRIORITY_SYSTEM_PROMPT if not summary_request else "",
             format_context_entry(
                 "meta_task_list",
                 f"{format_agent_meta_task_list(meta_task_list)}\n",
                 model=model,
                 include_token_count=False,
             ),
+            summary_context,
         ),
+        agent_mode=True,
     )
 
 
@@ -8838,7 +8971,6 @@ def request_agent_model(
                 "request_agent_turn_metadata",
                 json.dumps(turn_metadata, ensure_ascii=False),
             )
-        settings.state_turn += 1
     append_log(
         "<agent_request>\n"
         f"<request_stats>\nturn={current_turn} request_characters={request_characters} "
@@ -8871,7 +9003,7 @@ def request_agent_model(
                 response_format=("schema" if json_schema is not None else "text"),
                 json_schema=json_schema,
                 retry=0,
-                error_logger=append_log,
+                report_errors=False,
                 tools=tools,
                 tool_choice="required" if tools else None,
                 parallel_tool_calls=True if tools else None,
@@ -8959,19 +9091,20 @@ def request_agent_model(
         response_reasoning_items = response_reasoning_encrypted_items(
             response_obj
         )
+        if turn_dir is not None:
+            complete_state_turn(
+                turn_dir, reasoning, response, response_reasoning_items
+            )
+            settings.state_turn += 1
+            turn_unix_time = state_artifact_last_modified_time(
+                turn_dir / "response"
+            )
+        else:
+            turn_unix_time = None
     except Exception as exc:
         if turn_dir is not None:
-            complete_state_turn(turn_dir, "", f"ERROR: {exc}")
+            append_state_response_error(turn_dir, exc)
         raise
-    if turn_dir is not None:
-        complete_state_turn(
-            turn_dir, reasoning, response, response_reasoning_items
-        )
-        turn_unix_time = state_artifact_last_modified_time(
-            turn_dir / "response"
-        )
-    else:
-        turn_unix_time = None
     statsline = print_stats(
         request_characters=request_characters,
         request_tokens=request_tokens,
@@ -9032,8 +9165,6 @@ def run_agent_profile_tool(
             worker_prompt_parts.append(settings.patch_system_prompt)
         elif profile_type == "shell":
             worker_prompt_parts.append(settings.shell_system_prompt)
-        if profile.description.strip():
-            worker_prompt_parts.append(profile.description.strip())
         worker_context = (
             format_context_entry(
                 "agent_context",
@@ -9051,11 +9182,13 @@ def run_agent_profile_tool(
             json_schema=response_schema,
             system_prompt_with_task=settings.system_prompt_with_task,
             additional_prompt=worker_context,
-            additional_instructions=format_agent_context_summary(
+            additional_instructions=profile.description.strip(),
+            instruction_prefix=format_agent_context_summary(
                 settings.context_summary,
                 model=settings.model_settings.model,
             ),
             current_unix_time=int(time.time()),
+            agent_mode=True,
         )
         result = request_agent_model(
             settings,
@@ -9083,7 +9216,9 @@ def run_agent_readfile_tool(
     current_token_estimate: int = 0,
 ) -> AgentToolExecution:
     try:
-        file_paths = resolve_context_file_paths(path_texts)
+        file_paths = list(
+            dict.fromkeys(resolve_context_file_paths(path_texts))
+        )
         sections = build_context_sections(
             file_paths=file_paths,
             max_file_size_kb=settings.max_file_size_kb,
@@ -9094,6 +9229,9 @@ def run_agent_readfile_tool(
             model=settings.model_settings.model,
             token_limit=settings.token_limit,
             current_token_estimate=current_token_estimate,
+            existing_context_sections=(
+                parse_agent_readfile_contexts(settings.context) or ()
+            ),
         )
     except Exception as exc:
         return AgentToolExecution(f"ERROR: Readfile tool failed: {exc}")
@@ -9315,6 +9453,9 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         agent_expires_in_turns_schema(settings.agent_context_expires),
         default_profile=settings.agent_profile_default,
     )
+    tool_call_instructions = agent_tool_call_system_prompt(
+        settings.agent_profiles
+    )
     turns: list[AgentTurn] = list(settings.initial_turns)
     file_contexts = list(agent_context_file_sections(settings))
     file_expires_in_turns = agent_file_context_expirations(
@@ -9373,6 +9514,17 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
     pending_revision_instruction = ""
     reasoning_items = settings.initial_reasoning_items
 
+    def current_file_context() -> str:
+        return build_agent_files_context(
+            file_contexts,
+            file_expires_in_turns,
+            set(range(len(file_contexts))),
+            turns,
+            list(range(len(turns))),
+            set(agent_history_turn_numbers(turns)),
+            model=settings.model_settings.model,
+        )
+
     def current_turn_metadata() -> dict[str, Any]:
         return build_agent_turn_metadata(
             turns,
@@ -9429,20 +9581,13 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
                 advance_expirations=advance_expirations and not refresh_summary,
                 refresh_summary=refresh_summary,
                 current_turn=settings.state_turn,
+                tool_call_instructions=tool_call_instructions,
             )
             if active_context and (
                 agent_context_checksum(active_context) == context_summary.active_context_checksum
             ):
                 active_context = ""
-            settings.context = build_agent_files_context(
-                file_contexts,
-                file_expires_in_turns,
-                set(range(len(file_contexts))),
-                turns,
-                list(range(len(turns))),
-                set(agent_history_turn_numbers(turns)),
-                model=settings.model_settings.model,
-            )
+            settings.context = current_file_context()
             result = request_agent_model(
                 settings,
                 request_system_prompt,
@@ -9522,7 +9667,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
     try:
         model_result = request_next()
     except Exception as exc:
-        print(f"API error: {exc}", file=sys.stderr)
+        report_request_error(exc)
         return 1
     while True:
         tool_calls = list(model_result.tool_calls)
@@ -9568,7 +9713,7 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             try:
                 model_result = request_next(revision_task)
             except Exception as exc:
-                print(f"API error: {exc}", file=sys.stderr)
+                report_request_error(exc)
                 return 1
             continue
 
@@ -9591,6 +9736,8 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         tool_revision_instruction = ""
         readfile_contexts_for_turn: tuple[tuple[str, str], ...] | None = None
         current_token_estimate = model_result.request_tokens
+        encoding = token_encoding_for_model(settings.model_settings.model)
+        file_context_tokens = len(encoding.encode(settings.context))
 
         def save_tool_outputs() -> bool:
             try:
@@ -9806,17 +9953,27 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             )
             executed_tool_calls.append(tool_call)
             tool_outputs.append(tool_output)
-            current_token_estimate += len(
-                token_encoding_for_model(
-                    settings.model_settings.model
-                ).encode(tool_output)
+            settings.context = current_file_context()
+            updated_file_context_tokens = len(encoding.encode(settings.context))
+            context_output = (
+                agent_readfile_error_output(tool_output, readfile_contexts)
+                if readfile_contexts is not None
+                else tool_output
             )
+            current_token_estimate = max(
+                0,
+                current_token_estimate
+                - file_context_tokens
+                + updated_file_context_tokens
+                + len(encoding.encode(context_output)),
+            )
+            file_context_tokens = updated_file_context_tokens
         if not save_tool_outputs():
             return 1
         try:
             model_result = request_next(tool_revision_instruction)
         except Exception as exc:
-            print(f"API error: {exc}", file=sys.stderr)
+            report_request_error(exc)
             return 1
 
 
@@ -9825,6 +9982,59 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
 # -------------------------------------------------------------------
 
 API_RETRY_MAX_DELAY_SECONDS = 8
+
+
+def format_exception_message(
+    exc: BaseException,
+    *,
+    include_type: bool = False,
+) -> str:
+    text = str(exc).strip()
+    if isinstance(exc, APIConnectionError):
+        details: list[str] = []
+        request = getattr(exc, "request", None)
+        if request is not None:
+            url = urlsplit(str(request.url))
+            endpoint = urlunsplit(
+                (url.scheme, url.netloc.rsplit("@", 1)[-1], url.path, "", "")
+            )
+            details.append(f"{request.method} {endpoint}")
+        cause = exc.__cause__ or (
+            exc.__context__ if not exc.__suppress_context__ else None
+        )
+        seen = {id(exc)}
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            cause_text = " ".join(str(cause).split())
+            cause_detail = (
+                f"{type(cause).__name__}: {cause_text}"
+                if cause_text
+                else type(cause).__name__
+            )
+            if cause_detail not in details:
+                details.append(cause_detail)
+            cause = cause.__cause__ or (
+                cause.__context__ if not cause.__suppress_context__ else None
+            )
+        if len(seen) == 1:
+            details.append("underlying connection cause unavailable")
+        text = " ".join(text.split()) or type(exc).__name__
+        text += f" ({'; '.join(details)})"
+    if text:
+        return f"{type(exc).__name__}: {text}" if include_type else text
+    return type(exc).__name__
+
+
+def report_request_error(
+    exc: BaseException,
+    message: str | None = None,
+) -> None:
+    if message is None:
+        if getattr(exc, "_mince_request_error_reported", False):
+            return
+        message = f"ERROR: {format_exception_message(exc)}"
+    print(message, file=sys.stderr)
+    setattr(exc, "_mince_request_error_reported", True)
 
 
 def _log_api_request_event(error_logger: Any, message: str) -> None:
@@ -9850,6 +10060,7 @@ def execute_openai_request(
     operation_name: str,
     error_logger: Any = None,
     retry_if: Callable[[BaseException], bool] | None = None,
+    report_errors: bool = True,
 ) -> Any:
     retry_count = parse_retry_count(retry)
     if retry_if is None:
@@ -9859,14 +10070,15 @@ def execute_openai_request(
         try:
             response = operation()
         except Exception as exc:
-            failed_attempt = failed_retries + 1
-            detail = str(exc).strip() or type(exc).__name__
-            failure_message = (
-                f"ERROR: {operation_name} failed "
-                f"(attempt {failed_attempt}/{retry_count + 1}): {detail}"
-            )
-            print(failure_message, file=sys.stderr)
-            _log_api_request_event(error_logger, failure_message)
+            if report_errors:
+                failed_attempt = failed_retries + 1
+                detail = format_exception_message(exc)
+                failure_message = (
+                    f"ERROR: {operation_name} failed "
+                    f"(attempt {failed_attempt}/{retry_count + 1}): {detail}"
+                )
+                report_request_error(exc, failure_message)
+                _log_api_request_event(error_logger, failure_message)
             if (
                 failed_retries >= retry_count
                 or not retry_if(exc)
@@ -9876,22 +10088,21 @@ def execute_openai_request(
             delay_seconds = min(
                 2 ** (failed_retries - 1), API_RETRY_MAX_DELAY_SECONDS
             )
-            retry_message = (
-                f"INFO: Retrying {operation_name} in {delay_seconds} "
-                f"second{'s' if delay_seconds != 1 else ''}."
-            )
-            print(retry_message, file=sys.stderr)
-            _log_api_request_event(error_logger, retry_message)
+            if report_errors:
+                retry_message = (
+                    f"INFO: Retrying {operation_name} in {delay_seconds} "
+                    f"second{'s' if delay_seconds != 1 else ''}."
+                )
+                _log_api_request_event(error_logger, retry_message)
             time.sleep(delay_seconds)
         else:
-            if failed_retries:
+            if failed_retries and report_errors:
                 success_message = (
                     f"INFO: {operation_name} succeeded after "
                     f"{failed_retries} "
                     f"{'retry' if failed_retries == 1 else 'retries'}; "
                     "retry counter reset."
                 )
-                print(success_message, file=sys.stderr)
                 _log_api_request_event(error_logger, success_message)
             return response
 
@@ -9984,6 +10195,7 @@ def call_openai(
     explicit_prompt_cache: bool = False,
     request_timer: ModelRequestTimer | None = None,
     reasoning_items: tuple[dict[str, Any], ...] | None = None,
+    report_errors: bool = True,
 ) -> tuple[Any, dict[str, Any] | None]:
     kwargs: dict[str, Any] = {
         "model": model,
@@ -10110,6 +10322,7 @@ def call_openai(
                 retry=retry,
                 operation_name="API request",
                 error_logger=error_logger,
+                report_errors=report_errors,
             )
             try:
                 yield response
@@ -10143,6 +10356,7 @@ def call_model(
     error_logger: Any = None,
     request_timer: ModelRequestTimer | None = None,
     reasoning_items: tuple[dict[str, Any], ...] | None = None,
+    report_errors: bool = True,
 ) -> tuple[Any, dict[str, Any] | None]:
     return call_openai(
         api_key=settings.api_key,
@@ -10175,6 +10389,7 @@ def call_model(
         error_logger=error_logger,
         request_timer=request_timer,
         reasoning_items=reasoning_items,
+        report_errors=report_errors,
     )
 
 
@@ -10214,8 +10429,7 @@ def consume_response_stream(
                 )
                 if completed_response is None:
                     raise ModelResponseError(
-                        "Response stream ended without a response",
-                        retryable=True,
+                        "Response stream ended without a response"
                     )
                 if response_field(completed_response, "status") is None:
                     completed_response["status"] = event_type.removeprefix("response.")
@@ -10229,10 +10443,7 @@ def consume_response_stream(
                 raise model_response_error(event, "Response stream failed")
 
     if completed_response is None:
-        raise ModelResponseError(
-            "Response stream ended before completion",
-            retryable=True,
-        )
+        raise ModelResponseError("Response stream ended before completion")
     output_items = response_field(completed_response, "output", [])
     if not isinstance(output_items, (list, tuple)):
         raise ModelResponseError("Model response output must be an array")
@@ -10536,14 +10747,6 @@ def response_reasoning_text(response_obj: Any) -> str:
     return "\n\n".join(parts)
 
 
-def _tree_exception_message(exc: BaseException) -> str:
-    text = str(exc).strip()
-    if text:
-        return f"{type(exc).__name__}: {text}"
-    return type(exc).__name__
-
-
-
 def _is_openai_temp_error(exc: BaseException) -> bool:
     if isinstance(exc, ModelResponseError):
         return exc.retryable
@@ -10605,23 +10808,33 @@ def run_tree_mode(
     def append_tree_log(text: str) -> None:
         with log_lock:
             append_session_log(log_path, text, log_enabled)
-    def start_tree_state_turn(
+    def save_tree_state_turn(
         system_prompt: str,
         task: str,
         user_prompt: str,
-    ) -> Path:
+        reasoning: str,
+        response: str,
+        error: str | None,
+    ) -> None:
         nonlocal next_state_turn
         with state_turn_lock:
-            turn = next_state_turn
+            turn_dir = start_state_turn(
+                state_session_dir,
+                next_state_turn,
+                system_prompt,
+                task,
+                file_paths=file_paths,
+                user_prompt=user_prompt,
+            )
+            if error is not None:
+                append_state_response_error(turn_dir, error)
+                return
+            try:
+                complete_state_turn(turn_dir, reasoning, response)
+            except Exception as exc:
+                append_state_response_error(turn_dir, exc)
+                raise
             next_state_turn += 1
-        return start_state_turn(
-            state_session_dir,
-            turn,
-            system_prompt,
-            task,
-            file_paths=file_paths,
-            user_prompt=user_prompt,
-        )
 
     state_db_path = str(tree_session_dir / f"{tree_session_stem}.dbm")
     rel_to_path: dict[str, Path] = {}
@@ -10737,7 +10950,7 @@ def run_tree_mode(
         response_obj: Any = None
         error_text: str | None = None
         error_type: str = "none"
-        state_turn_path: Path | None = None
+        selected_task = task
         request_timer = ModelRequestTimer()
         try:
             context = build_context(
@@ -10772,11 +10985,6 @@ def run_tree_mode(
             request_cost_log = request_cost_estimate_log(
                 token_cost, request_tokens
             )
-            state_turn_path = start_tree_state_turn(
-                system_prompt=full_system_prompt,
-                task=selected_task,
-                user_prompt=user_prompt,
-            )
             if request_tokens > token_limit:
                 raise ValueError(
                     f"Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})"
@@ -10788,7 +10996,7 @@ def run_tree_mode(
                 response_format=response_format,
                 json_schema=json_schema,
                 retry=0,
-                error_logger=append_tree_log,
+                report_errors=False,
                 request_timer=request_timer,
             )
             result = response_output_text(response_obj)
@@ -10806,7 +11014,7 @@ def run_tree_mode(
                     error_text = f"Failed to parse JSON response: {exc}"
                     error_type = "temp"
         except BaseException as exc:
-            error_text = _tree_exception_message(exc)
+            error_text = format_exception_message(exc, include_type=True)
             if _is_openai_perm_error(exc):
                 error_type = "perm"
             elif _is_openai_temp_error(exc):
@@ -10818,18 +11026,28 @@ def run_tree_mode(
         stored_result = result
         if not stored_result:
             stored_result = f"ERROR: {error_text}" if error_text else ""
-        if state_turn_path is not None:
-            complete_state_turn(state_turn_path, reasoning, stored_result)
         stored_result = format_response_output(stored_result, reasoning, print_reasoning)
         output_error: str | None = None
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(stored_result, encoding="utf-8")
         except Exception as exc:
-            output_error = _tree_exception_message(exc)
+            output_error = format_exception_message(exc, include_type=True)
             if error_text is None:
                 error_text = output_error
             error_type = "perm"
+        save_tree_state_turn(
+            system_prompt=full_system_prompt,
+            task=selected_task,
+            user_prompt=user_prompt,
+            reasoning=reasoning,
+            response=result,
+            error=(
+                f"{file_path}: {error_text}"
+                if error_text is not None
+                else None
+            ),
+        )
         response_cost_components = response_cost_amounts(token_cost, usage)
         response_cost = response_cost_line(token_cost, usage)
         statsline = print_stats(
@@ -10842,7 +11060,7 @@ def run_tree_mode(
         )
         if log_enabled:
             append_tree_log(
-                f"<tree_file path='{file_path}'>\n"
+                f"<tree_file path={quote_tag_attribute(file_path)}>\n"
                 "<tree_request_stats>\n"
                 f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
                 f"reasoning={model_settings.openai_reasoning} reasoning_mode={model_settings.reasoning_mode} "
@@ -10876,6 +11094,7 @@ def run_tree_mode(
             "response_cost_components": response_cost_components,
             "success": success,
             "error_type": error_type,
+            "error": error_text,
         }
         return record
     records: list[dict[str, Any]] = []
@@ -10913,20 +11132,26 @@ def run_tree_mode(
                                     f"{'retry' if failed_retry_count == 1 else 'retries'}; "
                                     "retry counter reset."
                                 )
-                                if VERBOSE:
-                                    print(reset_message, file=sys.stderr)
                                 _log_api_request_event(
                                     append_tree_log, reset_message
                                 )
                         elif record.get("error_type") == "temp":
                             if schedule_tree_retry(
                                 rel,
-                                str(record.get("result", "unknown error")),
+                                str(record.get("error") or "unknown error"),
                             ):
                                 temp_errors_this_round += 1
+                        else:
+                            failure_message = (
+                                f"ERROR: Tree file {rel} failed: "
+                                f"{record.get('error') or 'unknown error'}"
+                            )
+                            print(failure_message, file=sys.stderr)
+                            _log_api_request_event(
+                                append_tree_log, failure_message
+                            )
                     except BaseException as exc:
-                        error_text = _tree_exception_message(exc)
-                        print(f"ERROR: Tree worker failed: {error_text}", file=sys.stderr)
+                        error_text = format_exception_message(exc, include_type=True)
                         set_status(rel, f"temp_error:{error_text}")
                         if schedule_tree_retry(rel, error_text):
                             temp_errors_this_round += 1
@@ -11030,6 +11255,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     mode_group.add_argument(
+        "-T",
         "--task-file",
         metavar="FILE",
         nargs="+",
@@ -11298,6 +11524,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "-R",
         "--resume-session",
         nargs="+",
         metavar=("SESSION_NAME", "TURN"),
@@ -13117,11 +13344,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if agent_mode:
         response_format = "text"
         json_schema = None
-        system_prompt = join_prompt_sections(
-            system_prompt,
-            agent_system_prompt,
-            agent_tool_call_system_prompt(selected_agent_profiles),
-        )
+        system_prompt = join_prompt_sections(system_prompt, agent_system_prompt)
         add_line_numbers = True
     stream_enabled = config["stream"]
     explicit_prompt_cache = config["explicit_prompt_cache"]
@@ -13598,6 +13821,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 else None
             ),
             system_prompt_with_task=system_prompt_with_task,
+            agent_mode=agent_mode,
         )
         if patch_mode:
             original_texts: dict[str, str] = {}
@@ -13659,6 +13883,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             current_unix_time=(
                 int(time.time()) if agent_mode else None
             ),
+            agent_mode=agent_mode,
         )
         plan_request_tokens = estimate_request_tokens(
             model=model,
@@ -13685,7 +13910,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             skip_missing_files=agent_mode,
             user_prompt=plan_user_prompt,
         )
-        state_turn += 1
         append_log(
             "<plan_request>\n"
             f"<plan_request_stats>\n{plan_turn_log}request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n"
@@ -13709,23 +13933,23 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 reasoning_items=reasoning_items,
             )
             plan_result = response_output_text(plan_response_obj).strip()
+            if not plan_result:
+                raise ModelResponseError("LLM returned an empty AI prompt plan")
+            plan_reasoning = response_reasoning_text(plan_response_obj)
+            reasoning_items = response_reasoning_encrypted_items(plan_response_obj)
+            complete_state_turn(
+                plan_state_turn_path, plan_reasoning, plan_result, reasoning_items
+            )
+            state_turn += 1
         except Exception as exc:
-            complete_state_turn(plan_state_turn_path, "", f"ERROR: {exc}")
-            print(f"API error: {exc}", file=sys.stderr)
+            append_state_response_error(plan_state_turn_path, exc)
+            report_request_error(exc)
             return 1
         finally:
             plan_elapsed = plan_request_timer.elapsed()
             cumulative_stats.add(
                 plan_request_timer.elapsed(total=True), plan_usage
             )
-        plan_reasoning = response_reasoning_text(plan_response_obj)
-        reasoning_items = response_reasoning_encrypted_items(plan_response_obj)
-        complete_state_turn(
-            plan_state_turn_path, plan_reasoning, plan_result, reasoning_items
-        )
-        if not plan_result:
-            print("ERROR: LLM returned an empty AI prompt plan", file=sys.stderr)
-            return 1
         plan_response_cost = response_cost_line(token_cost, plan_usage)
         plan_statsline = print_stats(
             request_characters=plan_request_characters,
@@ -13781,6 +14005,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             response_format=response_format,
             json_schema=json_schema,
             system_prompt_with_task=system_prompt_with_task,
+            agent_mode=agent_mode,
         )
     if agent_mode:
         agent_settings = AgentRunSettings(
@@ -13958,61 +14183,109 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 file_paths=file_paths,
                 user_prompt=request_user_prompt,
             )
-            state_turn += 1
         stream_sink = None
+        stream_output_emitted = False
         usage: dict[str, Any] | None = None
         try:
             if stream and not print_reasoning:
                 def emit_stream_text(delta: str) -> None:
+                    nonlocal stream_output_emitted
                     if OUTPUT_FILE is not None:
                         write_output_file(delta)
                     else:
                         sys.stdout.write(delta)
                         sys.stdout.flush()
+                    stream_output_emitted = True
 
                 stream_sink = emit_stream_text
 
-            response_obj, usage = call_model(
-                model_settings,
-                request_system_prompt,
-                request_user_prompt,
-                response_format=(
-                    response_format
-                    if response_format_override is None
-                    else response_format_override
-                ),
-                json_schema=(
-                    json_schema
-                    if response_format_override is None
-                    else json_schema_override
-                ),
-                stream=stream,
-                error_logger=append_log,
-                request_timer=request_timer,
-                reasoning_items=reasoning_items if state_enabled else None,
-            )
-            if stream:
-                response, usage, completed_response = consume_response_stream(
-                    response_obj, stream_sink
+            def request_response() -> tuple[str, dict[str, Any] | None, Any]:
+                response_obj, usage = call_model(
+                    model_settings,
+                    request_system_prompt,
+                    request_user_prompt,
+                    response_format=(
+                        response_format
+                        if response_format_override is None
+                        else response_format_override
+                    ),
+                    json_schema=(
+                        json_schema
+                        if response_format_override is None
+                        else json_schema_override
+                    ),
+                    stream=stream,
+                    retry=0,
+                    report_errors=False,
+                    request_timer=request_timer,
+                    reasoning_items=reasoning_items if state_enabled else None,
                 )
-                if completed_response is not None:
-                    response_obj = completed_response
-                stream_output_emitted = stream_sink is not None
-            else:
-                response = response_output_text(response_obj)
+                if stream:
+                    response, usage, response_obj = consume_response_stream(
+                        response_obj, stream_sink
+                    )
+                else:
+                    response = response_output_text(response_obj)
+                if not response.strip():
+                    raise ModelResponseError("LLM returned an empty response")
+                return response, usage, response_obj
+
+            response, usage, response_obj = execute_openai_request(
+                request_response,
+                retry=model_settings.retry,
+                operation_name="API request",
+                error_logger=append_log,
+                retry_if=lambda exc: (
+                    not stream_output_emitted and _is_openai_temp_error(exc)
+                ),
+            )
+            if shell_mode:
+                if json_schema_override is SHELL_FOLLOWUP_SCHEMA:
+                    parse_shell_followup_response(
+                        response, response_json_repair
+                    )
+                else:
+                    parse_shell_manifest(response, response_json_repair)
+            elif patch_mode:
+                manifest = parse_json_response(response, response_json_repair)
+                if not isinstance(manifest, dict):
+                    raise ValueError("Patch manifest must be a JSON object")
+                if patch_branch_mode:
+                    raw_commit_message = manifest.get("commit_message")
+                    if (
+                        not isinstance(raw_commit_message, str)
+                        or not raw_commit_message.strip()
+                    ):
+                        raise ValueError(
+                            "Patch manifest commit_message cannot be empty"
+                        )
+                build_patch_changes(original_texts, manifest)
+            elif (
+                response_format
+                if response_format_override is None
+                else response_format_override
+            ) in ("json", "schema"):
+                parse_json_response(response, response_json_repair)
+            reasoning = response_reasoning_text(response_obj)
+            response_reasoning_items = response_reasoning_encrypted_items(
+                response_obj
+            )
+            if request_state_path is not None:
+                complete_state_turn(
+                    request_state_path,
+                    reasoning,
+                    response,
+                    response_reasoning_items,
+                )
+                state_turn += 1
+            reasoning_items = response_reasoning_items
         except Exception as exc:
             if request_state_path is not None:
-                complete_state_turn(request_state_path, "", f"ERROR: {exc}")
+                append_state_response_error(request_state_path, exc)
             raise
         finally:
             elapsed = request_timer.elapsed()
             cumulative_stats.add(request_timer.elapsed(total=True), usage)
-        reasoning = response_reasoning_text(response_obj)
-        reasoning_items = response_reasoning_encrypted_items(response_obj)
-        if request_state_path is not None:
-            complete_state_turn(
-                request_state_path, reasoning, response, reasoning_items
-            )
         state_turn_path = request_state_path
         statsline = print_stats(
             request_characters=request_characters,
@@ -14040,7 +14313,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 task,
                 file_paths=file_paths,
             )
-            state_turn += 1
+            parse_reused_shell_response(result, response_json_repair)
             reused_request = read_optional_state_artifact(
                 reused_shell_turn.turn_dir / "request"
             )
@@ -14050,16 +14323,19 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     "request",
                     reused_request,
                 )
-            complete_state_turn(
-                state_turn_path, reasoning, result, reasoning_items
-            )
             if reused_shell_turn.shell_output is not None:
                 write_state_artifact(
                     state_turn_path,
                     "response_shell_output_0",
                     reused_shell_turn.shell_output,
                 )
+            complete_state_turn(
+                state_turn_path, reasoning, result, reasoning_items
+            )
+            state_turn += 1
         except Exception as exc:
+            if state_turn_path is not None:
+                append_state_response_error(state_turn_path, exc)
             print(
                 f"ERROR: Failed to save resumed shell turn: {exc}",
                 file=sys.stderr,
@@ -14083,7 +14359,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 stream=stream_enabled,
             )
         except Exception as exc:
-            print(f"API error: {exc}", file=sys.stderr)
+            report_request_error(exc)
             return 1
 
     if shell_mode and VERBOSE:
@@ -14321,11 +14597,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                         revision_task,
                         shell_steps,
                     )
-                except ValueError as exc:
-                    print(f'ERROR: {exc}', file=sys.stderr)
-                    return 1
                 except Exception as exc:
-                    print(f'API error: {exc}', file=sys.stderr)
+                    report_request_error(exc)
                     return 1
                 try:
                     shell_steps = parse_shell_manifest(
@@ -14391,11 +14664,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     shell_output,
                     shell_steps,
                 )
-            except ValueError as exc:
-                print(f"ERROR: {exc}", file=sys.stderr)
-                return 1
             except Exception as exc:
-                print(f"API error: {exc}", file=sys.stderr)
+                report_request_error(exc)
                 return 1
             try:
                 (
@@ -14610,7 +14880,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     try:
                         request_patch_revision(revision_task)
                     except Exception as exc:
-                        print(f'API error: {exc}', file=sys.stderr)
+                        report_request_error(exc)
                         return 1
                     continue
 
@@ -14726,7 +14996,9 @@ finally:
         elif NONINTERACTIVE:
             print(f"{SESSION_NAME}")
 
-    if err is not None:
+    if isinstance(err, BaseException):
+        report_request_error(err)
+    elif err is not None:
         print(f"{err}", file=sys.stderr)
     sys.exit(rv)
 

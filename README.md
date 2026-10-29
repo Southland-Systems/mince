@@ -106,7 +106,7 @@ Draft deployment files in a contained, writable workspace reading the API key at
 ```bash
 mkdir -p ~/workspace
 cd ~/workspace
-mcec -W . -p agent --apikey --agent \
+mcec -W . -p agent --apikey --reasoning max --response-verbosity high \
   --task 'Draft an Apache HTTPD deployment and hardening script to be run as root, ' \
   'plus a short README. Write files only in this workspace; the system is read-only, ' \
   'do not install services or change system configuration.'
@@ -642,11 +642,11 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 
 ## Tests passed 🧪
 
-Last tested: `2026-10-28`
+Last tested: `2026-10-29`
 
 ```text
 TAP version 13
-1..83
+1..86
 ok 1 - prints the built-in configuration offline
 ok 2 - resolves virtual built-in profiles and protects internal profiles
 ok 3 - repairs invalid configuration and rejects assignment batches atomically
@@ -669,67 +669,70 @@ ok 19 - streams text responses to an output file
 ok 20 - reconstructs streamed reasoning, replays cached context, and rejects incomplete streams
 ok 21 - enables text streaming from configuration
 ok 22 - preserves prompt placement and line-number overrides
-ok 23 - separates schema instructions from literal schema data in either instruction role
-ok 24 - handles custom JSON-schema responses
-ok 25 - validates and writes an API patch response
-ok 26 - creates API patch files without initial context
-ok 27 - records session patch artifacts and reapplies exported JSON
-ok 28 - applies deletion and replacement patch ranges
-ok 29 - rejects resumed sessions with changed files
-ok 30 - executes shell scripts and saves state offline
-ok 31 - handles shell follow-up commands and failures
-ok 32 - rejects invalid shell follow-ups while preserving accepted output and unexecuted proposals
-ok 33 - separates shell execution timeouts from API timeouts
-ok 34 - traces shell and agent commands into distinct indexed state artifacts
-ok 35 - resumes completed shell sessions without an extra request
-ok 36 - writes and commits patch changes on a git branch
-ok 37 - merges and removes patch branches
-ok 38 - rejects invalid patch ranges, content, endings, and duplicate paths
-ok 39 - applies a saved session patch only once
-ok 40 - repairs JSON and controls explicit prompt caching
-ok 41 - validates response completion, refusals, and retryable response errors
-ok 42 - selects API keys securely from configuration, environment, and file descriptors
-ok 43 - retries transient but not permanent API failures
-ok 44 - disables conflicting task modes for ask requests
-ok 45 - ignores standalone patch and shell options in agent mode
-ok 46 - revises the last shell command turn after session completion
-ok 47 - restricts shell network address families unless enabled
-ok 48 - applies native agent patches and refreshes companion file context
-ok 49 - bounds readfile content and expires missing files independently
-ok 50 - updates persistent agent tasks atomically at capacity
-ok 51 - retries invalid agent requests and rejects invalid call batches
-ok 52 - manages agent profiles and replays reasoning across worker delegation
-ok 53 - delegates named and default built-in worker profiles without executing their proposals
-ok 54 - reviews plans and preserves accepted, rejected, and saved state
-ok 55 - navigates patch revisions and applies the selected state turn
-ok 56 - resumes indexed and legacy shell output without executing commands again
-ok 57 - pins agent file context and extends unpinned context expiry
-ok 58 - restores selected agent history, tasks, file context, and remaining expiry
-ok 59 - redacts API keys in configuration output and session logs
-ok 60 - writes text and JSON output files without duplicating stdout
-ok 61 - estimates tokens and rejects oversized requests before API calls
-ok 62 - rejects invalid shell manifests before executing commands
-ok 63 - runs agent hooks per turn and omits failed output and stdin
-ok 64 - refreshes readfile context without retaining stale files or overwriting snapshots
-ok 65 - preserves rejected tool proposals without applying patches or executing commands
-ok 66 - revises resumed patches with checksum verification explicitly skipped
-ok 67 - honors explicit automatic-agent patch suffixes without modifying source files
-ok 68 - rejects task-list overflow atomically and renumbers removal batches
-ok 69 - persists encrypted reasoning and replays it when resuming a task
-ok 70 - forks resumed session chains and respects inherited turn cutoffs
-ok 71 - distinguishes automatic, reviewed, rejected, and saved agent execution
-ok 72 - compacts agent context into persisted Markdown summaries
-ok 73 - automatically compacts pinned context and resumes summary-only turns
-ok 74 - refreshes expired summaries without compacting or double-aging live context
-ok 75 - retains deprecated option compatibility with explicit warnings
-ok 76 - builds default containment commands and preserves argument boundaries
-ok 77 - selects containment state, visibility, network, runtime, and shell modes
-ok 78 - resolves, quotes, deduplicates, and orders containment grants and bindings
-ok 79 - preserves mapped working directories and exposes explicit grant overrides
-ok 80 - forwards nested shell containment grants and respects argument separators
-ok 81 - grants and executes containment tracing without modifying dry-run destinations
-ok 82 - rejects invalid containment options and paths before execution
-ok 83 - imports containment environment by name and executes commands through PATH
+ok 23 - reports relative file paths without inventing them for external files or stdin
+ok 24 - separates schema instructions from literal schema data in either instruction role
+ok 25 - handles custom JSON-schema responses
+ok 26 - validates and writes an API patch response
+ok 27 - creates API patch files without initial context
+ok 28 - records session patch artifacts and reapplies exported JSON
+ok 29 - applies deletion and replacement patch ranges
+ok 30 - rejects resumed sessions with changed files
+ok 31 - executes shell scripts and saves state offline
+ok 32 - handles shell follow-up commands and failures
+ok 33 - rejects invalid shell follow-ups while preserving accepted output and recording response errors
+ok 34 - separates shell execution timeouts from API timeouts
+ok 35 - totals shell and agent usage and costs once in stderr and session logs
+ok 36 - traces shell and agent commands into distinct indexed state artifacts
+ok 37 - resumes completed shell sessions without an extra request
+ok 38 - writes and commits patch changes on a git branch
+ok 39 - merges and removes patch branches
+ok 40 - rejects invalid patch ranges, content, endings, and duplicate paths
+ok 41 - applies a saved session patch only once
+ok 42 - repairs JSON and controls explicit prompt caching
+ok 43 - validates response completion, refusals, and retryable response errors
+ok 44 - records failed requests without completing turns and resumes only completed work
+ok 45 - selects API keys securely from configuration, environment, and file descriptors
+ok 46 - retries transient but not permanent API failures
+ok 47 - disables conflicting task modes for ask requests
+ok 48 - ignores standalone patch and shell options in agent mode
+ok 49 - revises the last shell command turn after session completion
+ok 50 - restricts shell network address families unless enabled
+ok 51 - applies native agent patches and refreshes companion file context
+ok 52 - bounds readfile content and expires missing files independently
+ok 53 - updates persistent agent tasks atomically at capacity
+ok 54 - retries invalid agent requests and rejects invalid call batches
+ok 55 - manages agent profiles and replays reasoning across worker delegation
+ok 56 - delegates named and default built-in worker profiles without executing their proposals
+ok 57 - reviews plans and preserves accepted, rejected, and saved state
+ok 58 - navigates patch revisions and applies the selected state turn
+ok 59 - resumes indexed and legacy shell output without executing commands again
+ok 60 - pins agent file context and extends unpinned context expiry
+ok 61 - restores selected agent history, tasks, file context, and remaining expiry
+ok 62 - redacts API keys in configuration output and session logs
+ok 63 - writes text and JSON output files without duplicating stdout
+ok 64 - estimates tokens and rejects oversized requests before API calls
+ok 65 - rejects invalid shell manifests before executing commands
+ok 66 - runs agent hooks per turn and omits failed output and stdin
+ok 67 - refreshes readfile context without retaining stale files or overwriting snapshots
+ok 68 - preserves rejected tool proposals without applying patches or executing commands
+ok 69 - revises resumed patches with checksum verification explicitly skipped
+ok 70 - honors explicit automatic-agent patch suffixes without modifying source files
+ok 71 - rejects task-list overflow atomically and renumbers removal batches
+ok 72 - persists encrypted reasoning and replays it when resuming a task
+ok 73 - forks resumed session chains and respects inherited turn cutoffs
+ok 74 - distinguishes automatic, reviewed, rejected, and saved agent execution
+ok 75 - compacts agent context into persisted Markdown summaries
+ok 76 - automatically compacts pinned context and resumes summary-only turns
+ok 77 - refreshes expired summaries without compacting or double-aging live context
+ok 78 - retains deprecated option compatibility with explicit warnings
+ok 79 - builds default containment commands and preserves argument boundaries
+ok 80 - selects containment state, visibility, network, runtime, and shell modes
+ok 81 - resolves, quotes, deduplicates, and orders containment grants and bindings
+ok 82 - preserves mapped working directories and exposes explicit grant overrides
+ok 83 - forwards nested shell containment grants and respects argument separators
+ok 84 - grants and executes containment tracing without modifying dry-run destinations
+ok 85 - rejects invalid containment options and paths before execution
+ok 86 - imports containment environment by name and executes commands through PATH
 ```
 
 
