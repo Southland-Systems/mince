@@ -16,6 +16,8 @@ import argparse
 import getpass
 import json
 import math
+import locale
+import unicodedata
 import sys
 import time
 import re
@@ -2672,110 +2674,1061 @@ def format_log_settings(
     )
 
 
-def prompt_config_value(
-    config: dict[str, Any],
-    key: str,
-    label: str,
-    mask: bool = False,
-) -> None:
-    current = config.get(key)
+class NcursesUI:
+    GLYPHS = {
+        "horizontal": ("─", "-"),
+        "vertical": ("│", "|"),
+        "top_left": ("┌", "+"),
+        "top_right": ("┐", "+"),
+        "bottom_left": ("└", "+"),
+        "bottom_right": ("┘", "+"),
+        "marker": ("›", ">"),
+        "bullet": ("•", "*"),
+        "check": ("✓", "x"),
+        "bar_full": ("█", "#"),
+        "up_arrow": ("↑", "^"),
+        "down_arrow": ("↓", "v"),
+        "newline": ("↵", "\\n"),
+    }
 
-    masked = (
-        mask_api_key(current)
-        if mask and isinstance(current, str) and current
-        else current
-    )
-    value = input(f"{label} [{masked}]: ").strip()
+    @classmethod
+    def run(cls, screen: Callable[[NcursesUI], Any]) -> Any:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise ValueError("interactive terminal input and output are required")
+        try:
+            import curses
+        except ImportError as exc:
+            raise ValueError(
+                "the terminal interface requires Python curses support"
+            ) from exc
+        try:
+            locale.setlocale(locale.LC_CTYPE, "")
+        except locale.Error:
+            pass
+        try:
+            return curses.wrapper(lambda stdscr: screen(cls(stdscr, curses)))
+        except curses.error as exc:
+            raise ValueError(f"terminal interface failed: {exc}") from exc
 
-    if not value:
-        return
+    def __init__(self, stdscr: Any, curses: Any) -> None:
+        self.stdscr = stdscr
+        self.curses = curses
+        self.encoding = (
+            getattr(stdscr, "encoding", None)
+            or locale.getpreferredencoding(False)
+            or "ascii"
+        )
+        self.utf8_supported = "utf" in self.encoding.lower()
+        self.utf8_enabled = self.utf8_supported
+        self.theme_name = "Mono"
+        self.style = self.init_theme()
+        self.focus_style = self.style | curses.A_REVERSE | curses.A_BOLD
+        self.mouse_enabled = False
+        stdscr.keypad(True)
+        stdscr.timeout(250)
+        try:
+            curses.set_escdelay(25)
+        except (AttributeError, curses.error):
+            pass
+        try:
+            available, _ = curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            self.mouse_enabled = bool(available)
+        except (AttributeError, curses.error):
+            pass
 
-    try:
-        if value == "DEFAULT":
-            parent_name = _inherit_profile_name(config, CONFIG_FILE)
-            if parent_name is None:
-                config[key] = get_default_config_value(key)
-            else:
-                inherited_config = merged_config(get_profile_path(parent_name))
-                if key in inherited_config:
-                    config[key] = inherited_config[key]
-                else:
-                    config.pop(key, None)
-        else:
-            raw_value = "" if value in ("-", '""') else value
-            _, config[key] = parse_config_assignment(
-                f"{key}={raw_value}", config
+    def init_theme(self) -> int:
+        curses = self.curses
+        try:
+            if not curses.has_colors():
+                return curses.A_BOLD
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                background = -1
+            except (AttributeError, curses.error):
+                background = curses.COLOR_BLACK
+            if curses.COLOR_PAIRS < 2:
+                return curses.A_BOLD
+            foreground = 214 if curses.COLORS >= 256 else curses.COLOR_YELLOW
+            curses.init_pair(1, foreground, background)
+            self.theme_name = "Amber"
+            return curses.color_pair(1)
+        except (AttributeError, curses.error):
+            return curses.A_BOLD
+
+    def glyph(self, name: str) -> str:
+        return self.GLYPHS[name][0 if self.utf8_enabled else 1]
+
+    @staticmethod
+    def character_width(character: str) -> int:
+        category = unicodedata.category(character)
+        if unicodedata.combining(character) or category in ("Cf", "Mn", "Me"):
+            return 0
+        return 2 if unicodedata.east_asian_width(character) in ("F", "W") else 1
+
+    @classmethod
+    def text_width(cls, text: str) -> int:
+        return sum(cls.character_width(character) for character in text)
+
+    @classmethod
+    def fit(cls, text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        result = []
+        used = 0
+        for character in text:
+            cells = cls.character_width(character)
+            if used + cells > width:
+                break
+            result.append(character)
+            used += cells
+        return "".join(result)
+
+    @classmethod
+    def wrap_text(cls, text: str, width: int) -> list[str]:
+        lines = []
+        line = ""
+        cells = 0
+        for character in text:
+            character_cells = cls.character_width(character)
+            if line and cells + character_cells > width:
+                lines.append(line.rstrip())
+                line = ""
+                cells = 0
+            if not line and character.isspace():
+                continue
+            line += character
+            cells += character_cells
+        lines.append(line.rstrip())
+        return lines
+
+    def display_text(self, text: str) -> str:
+        result = "".join(
+            self.glyph("newline") if character == "\n"
+            else "\\t" if character == "\t"
+            else "\\r" if character == "\r"
+            else character if character.isprintable()
+            else "?"
+            for character in text
+        )
+        if not self.utf8_supported:
+            result = result.encode(
+                self.encoding, errors="replace"
+            ).decode(self.encoding)
+        return result
+
+    def write(
+        self,
+        row: int,
+        column: int,
+        text: str,
+        attribute: int = 0,
+        width: int | None = None,
+    ) -> None:
+        rows, columns = self.stdscr.getmaxyx()
+        if row < 0 or row >= rows or column < 0 or column >= columns - 1:
+            return
+        available = columns - column - 1
+        if width is not None:
+            available = min(available, width)
+        clipped = self.fit(self.display_text(text), available)
+        if clipped:
+            try:
+                self.stdscr.addstr(row, column, clipped, attribute)
+            except (self.curses.error, UnicodeError):
+                pass
+
+    def centered(self, row: int, text: str, attribute: int = 0) -> None:
+        _, width = self.stdscr.getmaxyx()
+        text = self.display_text(text)
+        self.write(row, max(0, (width - self.text_width(text)) // 2), text, attribute)
+
+    def refresh(self, cursor: tuple[int, int] | None = None) -> None:
+        try:
+            self.curses.curs_set(1 if cursor is not None else 0)
+        except self.curses.error:
+            pass
+        try:
+            if cursor is not None:
+                self.stdscr.move(*cursor)
+            self.stdscr.refresh()
+        except self.curses.error:
+            pass
+
+    def box(
+        self, top: int, left: int, height: int, width: int, title: str = ""
+    ) -> None:
+        if height < 2 or width < 2:
+            return
+        horizontal = self.glyph("horizontal") * (width - 2)
+        self.write(
+            top, left,
+            self.glyph("top_left") + horizontal + self.glyph("top_right"),
+            self.style | self.curses.A_BOLD,
+        )
+        for row in range(top + 1, top + height - 1):
+            self.write(row, left + 1, " " * (width - 2))
+            self.write(row, left, self.glyph("vertical"), self.style)
+            self.write(row, left + width - 1, self.glyph("vertical"), self.style)
+        self.write(
+            top + height - 1, left,
+            self.glyph("bottom_left") + horizontal + self.glyph("bottom_right"),
+            self.style | self.curses.A_BOLD,
+        )
+        if title:
+            self.write(
+                top, left + 2, " " + title + " ",
+                self.style | self.curses.A_BOLD, width - 4,
             )
-    except Exception:
-        print(f"WARNING: Invalid value for {key}; keeping existing value.")
+
+    def text_view(
+        self,
+        value: str,
+        width: int,
+        cursor: int | None = None,
+        secret: bool = False,
+    ) -> tuple[str, int]:
+        width = max(1, width)
+        characters = [
+            self.glyph("bullet") if secret else self.display_text(character)
+            for character in value
+        ]
+        start = 0
+        cursor_column = 0
+        if cursor is not None:
+            start = min(max(0, cursor), len(characters))
+            while start:
+                cells = self.text_width(characters[start - 1])
+                if cursor_column + cells >= width:
+                    break
+                start -= 1
+                cursor_column += cells
+        visible = self.fit("".join(characters[start:]), width)
+        return visible + " " * (width - self.text_width(visible)), cursor_column
+
+    @staticmethod
+    def is_key(key: Any, *characters: str) -> bool:
+        return any(key == character or key == ord(character) for character in characters)
+
+    def is_enter(self, key: Any) -> bool:
+        return key == self.curses.KEY_ENTER or self.is_key(key, "\n", "\r")
+
+    def read_key(self) -> Any:
+        try:
+            return self.stdscr.get_wch()
+        except self.curses.error:
+            return None
+
+    def mouse_event(self) -> tuple[str, int, int] | None:
+        curses = self.curses
+        try:
+            _, x, y, _, state = curses.getmouse()
+        except curses.error:
+            return None
+        for action, names in (
+            ("up", ("BUTTON4_PRESSED", "BUTTON4_CLICKED")),
+            ("down", ("BUTTON5_PRESSED", "BUTTON5_CLICKED")),
+            ("click", ("BUTTON1_PRESSED", "BUTTON1_CLICKED")),
+        ):
+            if any(state & getattr(curses, name, 0) for name in names):
+                return action, y, x
+        return None
+
+    def suspend(self, operation: Callable[[], Any]) -> Any:
+        self.curses.def_prog_mode()
+        self.curses.endwin()
+        try:
+            return operation()
+        finally:
+            self.curses.reset_prog_mode()
+            self.stdscr.keypad(True)
+            self.stdscr.timeout(250)
+            self.stdscr.clear()
+
+    def dialog(
+        self,
+        title: str,
+        lines: tuple[str, ...],
+        buttons: tuple[str, ...] = ("Close",),
+        default: int = 0,
+    ) -> str | None:
+        curses = self.curses
+        selection = default % len(buttons)
+        scroll = 0
+        button_width = sum(self.text_width(button) + 4 for button in buttons)
+        button_width += 2 * (len(buttons) - 1)
+        while True:
+            height, width = self.stdscr.getmaxyx()
+            ready = height >= 8 and width >= max(30, button_width + 8)
+            self.stdscr.erase()
+            positions = []
+            if ready:
+                inner_width = min(76, width - 8)
+                wrapped = [
+                    wrapped_line
+                    for paragraph in lines
+                    for line in paragraph.splitlines() or [""]
+                    for wrapped_line in self.wrap_text(
+                        self.display_text(line), inner_width
+                    )
+                ] or [""]
+                visible_rows = max(1, min(len(wrapped), height - 6))
+                scroll = min(max(0, scroll), max(0, len(wrapped) - visible_rows))
+                box_height = visible_rows + 4
+                box_width = inner_width + 4
+                top = (height - box_height) // 2
+                left = (width - box_width) // 2
+                self.box(top, left, box_height, box_width, title)
+                for offset, line in enumerate(wrapped[scroll:scroll + visible_rows], 1):
+                    self.write(top + offset, left + 2, line, width=inner_width)
+                column = left + 2
+                action_row = top + visible_rows + 2
+                for index, button in enumerate(buttons):
+                    text = "[ " + button + " ]"
+                    size = self.text_width(text)
+                    positions.append((action_row, column, size))
+                    self.write(
+                        action_row, column, text,
+                        self.focus_style if index == selection else self.style,
+                    )
+                    column += size + 2
+                self.write(
+                    height - 1, 2,
+                    "Up/Down: scroll  Tab: choose  Enter: accept  Esc: back",
+                    curses.A_DIM, width - 4,
+                )
+            else:
+                self.centered(height // 2, "Resize the terminal to continue", curses.A_BOLD)
+            self.refresh()
+            key = self.read_key()
+            if key is None or key == curses.KEY_RESIZE:
+                continue
+            if self.is_key(key, "\x1b", "q", "Q"):
+                return None
+            if key == curses.KEY_MOUSE:
+                event = self.mouse_event()
+                if not ready or event is None:
+                    continue
+                action, y, x = event
+                if action == "up":
+                    scroll -= 3
+                elif action == "down":
+                    scroll += 3
+                elif action == "click":
+                    for index, (row, column, size) in enumerate(positions):
+                        if y == row and column <= x < column + size:
+                            return buttons[index]
+                continue
+            if not ready:
+                continue
+            if self.is_enter(key):
+                return buttons[selection]
+            if key in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB) or self.is_key(key, "\t"):
+                step = -1 if key in (curses.KEY_LEFT, curses.KEY_BTAB) else 1
+                selection = (selection + step) % len(buttons)
+            elif key == curses.KEY_UP:
+                scroll -= 1
+            elif key == curses.KEY_DOWN:
+                scroll += 1
+            elif key == curses.KEY_PPAGE:
+                scroll -= visible_rows
+            elif key == curses.KEY_NPAGE:
+                scroll += visible_rows
+            elif key == curses.KEY_HOME:
+                scroll = 0
+            elif key == curses.KEY_END:
+                scroll = len(wrapped)
+
+
+@dataclass(frozen=True)
+class NcursesField:
+    name: str
+    label: str
+    kind: str = "text"
+    choices: tuple[str, ...] = ()
+    description: str = ""
+    secret: bool = False
+
+
+class NcursesForm:
+    ACTIONS = ("Save", "Revert", "Cancel")
+    HELP_LINES = (
+        "Tab/Shift-Tab or Up/Down (j/k): next/previous control.",
+        "PageUp/PageDown: move a page; Home/End: first/last field.",
+        "Enter/Space: edit, toggle a checkbox, or activate a button.",
+        "Left/Right: cycle choices or toggle a checkbox.",
+        "While editing, Enter accepts and Esc cancels the edit.",
+        "Tab accepts an edit and moves to the next control.",
+        "Ctrl+A/E: start/end; Ctrl+U: clear; Ctrl+K: erase to end.",
+        "F4 or e: open the selected text field in the external editor.",
+        "d: restore a field's default; r: revert all unsaved changes.",
+        "F2, Ctrl+S, or s: save and close; Esc/q: close.",
+        "u: toggle UTF-8 styling; ?: show help.",
+        "Mouse: click controls, select choices, or scroll with the wheel.",
+    )
+
+    def __init__(
+        self,
+        title: str,
+        subtitle: str,
+        fields: tuple[NcursesField, ...],
+        values: dict[str, Any],
+        defaults: dict[str, Any],
+        on_save: Callable[[dict[str, Any]], None],
+        editor: Callable[[str], str] | None = None,
+    ) -> None:
+        self.title = title
+        self.subtitle = subtitle
+        self.fields = fields
+        self.values = values.copy()
+        self.applied = values.copy()
+        self.defaults = defaults.copy()
+        self.default_label = "Default"
+        self.on_save = on_save
+        self.editor = editor
+        self.focus = 0
+        self.scroll = 0
+        self.editing = False
+        self.buffer = ""
+        self.cursor = 0
+        self.notice = ""
+
+    def format_value(self, field: NcursesField, value: Any) -> str:
+        return "" if value is None else str(value)
+
+    def parse_value(self, field: NcursesField, value: str) -> Any:
+        if field.kind == "bool":
+            return value.strip().lower() in ("on", "true", "yes", "1")
+        if field.kind == "number":
+            return int(value)
+        return value
+
+    def boolean_value(self, value: Any) -> bool:
+        return bool(value)
+
+    def field_label(self, field: NcursesField) -> str:
+        return field.label
+
+    def default_note(self, field: NcursesField) -> str:
+        value = self.format_value(field, self.defaults[field.name])
+        if field.secret and value:
+            value = "(hidden)"
+        return f"{self.default_label}: {value or '(empty)'}"
+
+    def modified(self) -> bool:
+        if self.values != self.applied:
+            return True
+        if not self.editing:
+            return False
+        field = self.fields[self.focus]
+        return self.buffer != self.format_value(field, self.values[field.name])
+
+    def set_value(self, field: NcursesField, text: str) -> bool:
+        try:
+            value = self.parse_value(field, text)
+        except (TypeError, ValueError) as exc:
+            self.notice = str(exc)
+            return False
+        self.values[field.name] = value
+        self.notice = ""
+        return True
+
+    def begin_edit(self) -> None:
+        field = self.fields[self.focus]
+        self.buffer = self.format_value(field, self.values[field.name])
+        self.cursor = len(self.buffer)
+        self.editing = True
+        self.notice = ""
+
+    def finish_edit(self, cancel: bool = False) -> bool:
+        if cancel:
+            self.editing = False
+            self.notice = ""
+            return True
+        if self.set_value(self.fields[self.focus], self.buffer):
+            self.editing = False
+            return True
+        return False
+
+    def move_focus(self, step: int) -> None:
+        self.focus = (self.focus + step) % (len(self.fields) + len(self.ACTIONS))
+        self.notice = ""
+
+    def cycle(self, field: NcursesField, step: int, editing: bool = False) -> None:
+        if not field.choices:
+            return
+        current = self.buffer if editing else self.format_value(field, self.values[field.name])
+        try:
+            selected = field.choices.index(current)
+        except ValueError:
+            selected = 0
+        value = field.choices[(selected + step) % len(field.choices)]
+        if editing:
+            self.buffer = value
+        else:
+            self.set_value(field, value)
+
+    def apply(self) -> bool:
+        if self.editing and not self.finish_edit():
+            return False
+        try:
+            self.on_save(self.values)
+        except Exception as exc:
+            self.notice = f"Save failed: {exc}"
+            return False
+        self.applied = self.values.copy()
+        return True
+
+    def close(self, ui: NcursesUI) -> bool | None:
+        if not self.modified():
+            return False
+        choice = ui.dialog(
+            "Unsaved changes",
+            ("Save changes before closing?",),
+            ("Save", "Discard", "Cancel"),
+            default=2,
+        )
+        if choice == "Discard":
+            return False
+        if choice == "Save" and self.apply():
+            return True
+        return None
+
+    def activate(self, ui: NcursesUI) -> bool | None:
+        if self.focus < len(self.fields):
+            field = self.fields[self.focus]
+            if field.kind == "bool":
+                self.set_value(
+                    field, "off" if self.boolean_value(self.values[field.name]) else "on"
+                )
+            else:
+                self.begin_edit()
+            return None
+        action = self.ACTIONS[self.focus - len(self.fields)]
+        if action == "Save":
+            return True if self.apply() else None
+        if action == "Revert":
+            self.values = self.applied.copy()
+            self.notice = "Restored the initial values"
+            return None
+        return self.close(ui)
+
+    def edit_external(self, ui: NcursesUI) -> None:
+        if self.focus >= len(self.fields):
+            return
+        field = self.fields[self.focus]
+        if self.editor is None or field.kind not in ("text", "number") or field.secret:
+            self.notice = "External editing is unavailable for this field"
+            return
+        text = self.buffer if self.editing else self.format_value(field, self.values[field.name])
+        try:
+            edited = ui.suspend(lambda: self.editor(text))
+        except Exception as exc:
+            self.notice = f"Editor failed: {exc}"
+            return
+        self.buffer = edited
+        self.cursor = len(edited)
+        self.editing = True
+        self.finish_edit()
+
+    def help(self, ui: NcursesUI) -> None:
+        lines = list(self.HELP_LINES)
+        if self.focus < len(self.fields):
+            field = self.fields[self.focus]
+            lines.extend((
+                "", self.field_label(field), field.description, self.default_note(field),
+            ))
+        if self.notice:
+            lines[0:0] = [self.notice, ""]
+        ui.dialog(self.title + " help", tuple(lines))
+
+    def layout(self, ui: NcursesUI) -> tuple[int, int, int, int, int] | None:
+        height, columns = ui.stdscr.getmaxyx()
+        if height < 12 or columns < 50:
+            return None
+        width = columns - 4
+        label_width = min(
+            max((ui.text_width(self.field_label(field)) + 1 for field in self.fields), default=12),
+            width // 2 - 4,
+        )
+        return 3, 2, width, height - 10, label_width
+
+    def action_positions(
+        self, ui: NcursesUI, layout: tuple[int, int, int, int, int]
+    ) -> tuple[tuple[int, int, int], ...]:
+        top, left, _, rows, _ = layout
+        column = left + 2
+        positions = []
+        for action in self.ACTIONS:
+            size = ui.text_width(action) + 4
+            positions.append((top + rows + 2, column, size))
+            column += size + 2
+        return tuple(positions)
+
+    def menu_layout(
+        self, ui: NcursesUI, layout: tuple[int, int, int, int, int]
+    ) -> tuple[int, int, int, int, int] | None:
+        if not self.editing:
+            return None
+        field = self.fields[self.focus]
+        if field.kind != "enum" or not field.choices:
+            return None
+        top, left, width, _, label_width = layout
+        height, _ = ui.stdscr.getmaxyx()
+        menu_height = min(len(field.choices) + 2, height - 5)
+        menu_width = min(
+            width - label_width - 6,
+            max(ui.text_width(choice) for choice in field.choices) + 4,
+        )
+        row = top + 1 + self.focus - self.scroll
+        menu_top = max(top, min(row + 1, height - 2 - menu_height))
+        try:
+            selected = field.choices.index(self.buffer)
+        except ValueError:
+            selected = 0
+        visible_rows = menu_height - 2
+        start = max(0, min(selected - visible_rows + 1, len(field.choices) - visible_rows))
+        return menu_top, left + label_width + 4, menu_height, menu_width, start
+
+    def draw(self, ui: NcursesUI) -> tuple[int, int, int, int, int] | None:
+        curses = ui.curses
+        height, columns = ui.stdscr.getmaxyx()
+        ui.stdscr.erase()
+        layout = self.layout(ui)
+        if layout is None:
+            ui.centered(max(0, height // 2 - 1), "Terminal too small", curses.A_BOLD)
+            ui.centered(height // 2, "Resize to at least 50 columns x 12 rows")
+            ui.centered(height // 2 + 1, "Esc: cancel edit; q: close; Ctrl+C: quit", curses.A_DIM)
+            ui.refresh()
+            return None
+        top, left, width, rows, label_width = layout
+        count = len(self.fields)
+        if self.focus < count:
+            self.scroll = min(self.scroll, self.focus)
+            self.scroll = max(self.scroll, self.focus - rows + 1)
+        self.scroll = min(max(0, self.scroll), max(0, count - rows))
+        ui.centered(0, self.title.upper(), ui.style | curses.A_BOLD)
+        ui.write(1, left, self.subtitle, curses.A_DIM, width)
+        ui.write(2, left, ui.glyph("horizontal") * width, ui.style)
+        ui.box(top, left, rows + 2, width, "VALUES" + (" *" if self.modified() else ""))
+        control_column = left + label_width + 4
+        control_width = width - label_width - 6
+        cursor_position = None
+        for index in range(self.scroll, min(count, self.scroll + rows)):
+            field = self.fields[index]
+            row = top + 1 + index - self.scroll
+            selected = index == self.focus
+            value = self.values[field.name]
+            changed = value != self.applied[field.name]
+            label = ("*" if changed else " ") + self.field_label(field)
+            ui.write(row, left + 1, ui.glyph("marker") if selected else " ", ui.style)
+            ui.write(row, left + 3, label, curses.A_BOLD, label_width)
+            if field.kind == "bool":
+                enabled = self.boolean_value(value)
+                text = "[" + (ui.glyph("check") if enabled else " ") + "] "
+                text += "On" if enabled else "Off"
+            elif field.kind == "enum":
+                text = self.buffer if selected and self.editing else self.format_value(field, value)
+                text = "[ " + text + " " + ui.glyph("down_arrow") + " ]"
+            else:
+                editing = selected and self.editing
+                visible, cursor_column = ui.text_view(
+                    self.buffer if editing else self.format_value(field, value),
+                    control_width - 4,
+                    self.cursor if editing else None,
+                    field.secret,
+                )
+                text = "[ " + visible + " ]"
+                if editing:
+                    cursor_position = row, control_column + 2 + cursor_column
+            fitted = ui.fit(text, control_width)
+            ui.write(
+                row, control_column,
+                fitted + " " * (control_width - ui.text_width(fitted)),
+                ui.focus_style if selected else 0,
+            )
+        if count > rows:
+            thumb_height = max(1, rows * rows // count)
+            thumb_start = (rows - thumb_height) * self.scroll // (count - rows)
+            for offset in range(rows):
+                in_thumb = thumb_start <= offset < thumb_start + thumb_height
+                ui.write(
+                    top + 1 + offset, left + width - 1,
+                    ui.glyph("bar_full") if in_thumb else ui.glyph("vertical"),
+                    ui.style if in_thumb else curses.A_DIM,
+                )
+        for offset, (row, column, _) in enumerate(self.action_positions(ui, layout)):
+            ui.write(
+                row, column, "[ " + self.ACTIONS[offset] + " ]",
+                ui.focus_style if self.focus == count + offset else ui.style,
+            )
+        if self.focus < count:
+            field = self.fields[self.focus]
+            ui.write(height - 4, left, field.description, curses.A_DIM, width)
+            ui.write(height - 3, left, self.default_note(field), curses.A_DIM, width)
+        else:
+            notes = (
+                "Validate and save all changes, then close.",
+                "Restore the values from when this screen opened.",
+                "Close; ask about any unsaved changes.",
+            )
+            ui.write(height - 4, left, notes[self.focus - count], curses.A_DIM, width)
+        state = "modified" if self.modified() else "unchanged"
+        mode = "UTF-8" if ui.utf8_enabled else "ASCII"
+        input_mode = "mouse" if ui.mouse_enabled else "keyboard"
+        position = f"{min(count, self.scroll + 1)}-{min(count, self.scroll + rows)}/{count}"
+        status = self.notice or f"{state} | {mode} | {input_mode}"
+        status_style = ui.style | curses.A_REVERSE
+        if self.notice:
+            status_style |= curses.A_BOLD
+        ui.write(height - 2, left, " " * width, status_style)
+        ui.write(height - 2, left, status, status_style, width)
+        if self.editing:
+            shortcuts = "Enter accept  Esc cancel  Tab next  Ctrl+U clear"
+            if self.fields[self.focus].kind == "enum":
+                shortcuts = "Up/Down choose  Enter accept  Esc cancel  Tab next"
+        else:
+            arrows = ui.glyph("up_arrow") + ui.glyph("down_arrow")
+            shortcuts = f"Tab/{arrows} move  Enter edit  s save  q close  ? help"
+        ui.write(height - 1, left, shortcuts, curses.A_DIM, width)
+        menu = self.menu_layout(ui, layout)
+        if menu is not None:
+            menu_top, menu_left, menu_height, menu_width, start = menu
+            ui.box(menu_top, menu_left, menu_height, menu_width)
+            field = self.fields[self.focus]
+            for offset, choice in enumerate(field.choices[start:start + menu_height - 2], 1):
+                text = ui.fit(" " + choice, menu_width - 2)
+                text += " " * (menu_width - 2 - ui.text_width(text))
+                ui.write(
+                    menu_top + offset, menu_left + 1, text,
+                    ui.focus_style if choice == self.buffer else 0,
+                )
+        ui.refresh(cursor_position)
+        return layout
+
+    def edit_key(self, ui: NcursesUI, key: Any) -> None:
+        curses = ui.curses
+        field = self.fields[self.focus]
+        if ui.is_key(key, "\x1b"):
+            self.finish_edit(cancel=True)
+        elif ui.is_enter(key):
+            self.finish_edit()
+        elif key == curses.KEY_BTAB or ui.is_key(key, "\t"):
+            if self.finish_edit():
+                self.move_focus(-1 if key == curses.KEY_BTAB else 1)
+        elif field.kind == "enum":
+            if key in (curses.KEY_UP, curses.KEY_LEFT) or ui.is_key(key, "k", "K"):
+                self.cycle(field, -1, editing=True)
+            elif key in (curses.KEY_DOWN, curses.KEY_RIGHT) or ui.is_key(key, "j", "J"):
+                self.cycle(field, 1, editing=True)
+            elif key == curses.KEY_HOME:
+                self.buffer = field.choices[0]
+            elif key == curses.KEY_END:
+                self.buffer = field.choices[-1]
+        else:
+            value = self.buffer
+            cursor = self.cursor
+            if key == curses.KEY_LEFT:
+                self.cursor = max(0, cursor - 1)
+            elif key == curses.KEY_RIGHT:
+                self.cursor = min(len(value), cursor + 1)
+            elif key == curses.KEY_HOME or ui.is_key(key, "\x01"):
+                self.cursor = 0
+            elif key == curses.KEY_END or ui.is_key(key, "\x05"):
+                self.cursor = len(value)
+            elif key == curses.KEY_BACKSPACE or ui.is_key(key, "\b", "\x7f"):
+                if cursor:
+                    self.buffer = value[:cursor - 1] + value[cursor:]
+                    self.cursor -= 1
+            elif key == curses.KEY_DC:
+                self.buffer = value[:cursor] + value[cursor + 1:]
+            elif ui.is_key(key, "\x15"):
+                self.buffer = ""
+                self.cursor = 0
+            elif ui.is_key(key, "\x0b"):
+                self.buffer = value[:cursor]
+            elif isinstance(key, str) and key.isprintable():
+                self.buffer = value[:cursor] + key + value[cursor:]
+                self.cursor += len(key)
+
+    def click(
+        self,
+        ui: NcursesUI,
+        layout: tuple[int, int, int, int, int],
+        event: tuple[str, int, int],
+    ) -> bool | None:
+        action, y, x = event
+        if action in ("up", "down"):
+            step = -1 if action == "up" else 1
+            if self.editing and self.fields[self.focus].kind == "enum":
+                self.cycle(self.fields[self.focus], step, editing=True)
+            elif not self.editing or self.finish_edit():
+                self.focus = min(len(self.fields) - 1, max(0, self.focus + step * 3))
+            return None
+        menu = self.menu_layout(ui, layout)
+        if menu is not None:
+            top, left, height, width, start = menu
+            if top <= y < top + height and left <= x < left + width:
+                option = y - top - 1
+                if 0 <= option < height - 2 and left < x < left + width - 1:
+                    self.buffer = self.fields[self.focus].choices[start + option]
+                    self.finish_edit()
+                return None
+            self.finish_edit(cancel=True)
+        top, left, width, rows, _ = layout
+        index = self.scroll + y - top - 1
+        if top < y <= top + rows and left < x < left + width - 1 and index < len(self.fields):
+            if self.editing and self.focus == index:
+                return None
+            if self.editing and not self.finish_edit():
+                return None
+            self.focus = index
+            return self.activate(ui)
+        for offset, (row, column, size) in enumerate(self.action_positions(ui, layout)):
+            if y == row and column <= x < column + size:
+                if self.editing and not self.finish_edit():
+                    return None
+                self.focus = len(self.fields) + offset
+                return self.activate(ui)
+        return None
+
+    def run(self, ui: NcursesUI) -> bool:
+        curses = ui.curses
+        while True:
+            layout = self.draw(ui)
+            key = ui.read_key()
+            if key is None or key == curses.KEY_RESIZE:
+                continue
+            if key == curses.KEY_F1 or (not self.editing and ui.is_key(key, "?")):
+                self.help(ui)
+                continue
+            if key == curses.KEY_MOUSE:
+                event = ui.mouse_event()
+                if layout is not None and event is not None:
+                    result = self.click(ui, layout, event)
+                    if result is not None:
+                        return result
+                continue
+            if layout is None:
+                if ui.is_key(key, "\x1b") and self.editing:
+                    self.finish_edit(cancel=True)
+                elif not self.editing and ui.is_key(key, "\x1b", "q", "Q"):
+                    result = self.close(ui)
+                    if result is not None:
+                        return result
+                continue
+            if key == curses.KEY_F2 or ui.is_key(key, "\x13"):
+                if self.apply():
+                    return True
+                continue
+            if key == curses.KEY_F4 or (not self.editing and ui.is_key(key, "e", "E")):
+                self.edit_external(ui)
+                continue
+            if self.editing:
+                self.edit_key(ui, key)
+                continue
+            if ui.is_key(key, "\x1b", "q", "Q"):
+                result = self.close(ui)
+                if result is not None:
+                    return result
+            elif ui.is_key(key, "s", "S"):
+                if self.apply():
+                    return True
+            elif ui.is_key(key, "r", "R"):
+                self.values = self.applied.copy()
+                self.notice = "Restored the initial values"
+            elif ui.is_key(key, "u", "U"):
+                if ui.utf8_supported:
+                    ui.utf8_enabled = not ui.utf8_enabled
+                else:
+                    self.notice = "UTF-8 styling is unavailable in this locale"
+            elif key == curses.KEY_BTAB or key == curses.KEY_UP or ui.is_key(key, "k", "K"):
+                self.move_focus(-1)
+            elif key == curses.KEY_DOWN or ui.is_key(key, "\t", "j", "J"):
+                self.move_focus(1)
+            elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                step = -layout[3] if key == curses.KEY_PPAGE else layout[3]
+                self.focus = min(len(self.fields) + len(self.ACTIONS) - 1, max(0, self.focus + step))
+            elif key == curses.KEY_HOME:
+                self.focus = 0
+            elif key == curses.KEY_END:
+                self.focus = max(0, len(self.fields) - 1)
+            elif ui.is_enter(key) or ui.is_key(key, " "):
+                result = self.activate(ui)
+                if result is not None:
+                    return result
+            elif self.focus < len(self.fields):
+                field = self.fields[self.focus]
+                if ui.is_key(key, "d", "D"):
+                    self.values[field.name] = self.defaults[field.name]
+                    self.notice = "Restored " + self.default_label.lower()
+                elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                    if field.kind == "enum":
+                        self.cycle(field, -1 if key == curses.KEY_LEFT else 1)
+                    elif field.kind == "bool":
+                        self.activate(ui)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                offset = self.focus - len(self.fields)
+                step = -1 if key == curses.KEY_LEFT else 1
+                self.focus = len(self.fields) + (offset + step) % len(self.ACTIONS)
+
+
+class ConfigurationScreen(NcursesForm):
+    FIELD_HELP = {
+        "model": "Model name.",
+        "api_key": "API key; OPENAI_API_KEY overrides this value at runtime.",
+        "base_url": "OpenAI-compatible API base URL.",
+        "proxy_server": "HTTP(S) proxy URL, such as http://user:pass@proxy:8080.",
+        "meta_organization": "Optional organization name or ID.",
+        "meta_project": "Optional project name or ID.",
+        "service_tier": "API service tier; off omits the setting.",
+        "explicit_prompt_cache": "Enable explicit prompt caching.",
+        "safety_identifier": "Optional OpenAI moderation safety identifier.",
+        "system_prompt": "System prompt text or prompt file/library references.",
+        "linenum_system_prompt": "System prompt for context file line numbers.",
+        "patch_system_prompt": "System prompt for patch mode.",
+        "plan_system_prompt": "System prompt for plan mode.",
+        "shell_system_prompt": "System prompt for shell command mode.",
+        "agent_system_prompt": "System prompt for agent mode.",
+        "agent_context_expires": "Agent context expiry: DEFAULT [MIN] [MAX] turns.",
+        "system_prompt_with_task": "Prepend task and generated instructions to the system prompt.",
+        "line_numbers": "Prefix context files with line numbers; recommended on.",
+        "prompt_expansion": "Expand ^^promptname^^ references found in prompts.",
+        "plan": "Create a plan for review before using it as the task.",
+        "agent": "Run a multi-turn agent tool-call session.",
+        "shell": "Generate, review, and run shell commands.",
+        "shell_trace": "Trace shell commands with strace.",
+        "shell_networking": "Allow networking for shell commands.",
+        "shell_timeout": "Shell command timeout in seconds; 0 disables the timeout.",
+        "patch": "Generate and apply file patches.",
+        "patch_review": "Review patches before writing files.",
+        "patch_branch": "Patch branch setting: off, on, or a branch name.",
+        "patch_suffix": "Suffix for patched files.",
+        "quiet": "Suppress extra output such as statistics and information.",
+        "temperature": "Sampling temperature from 0.0 to 2.0, or off.",
+        "top_p": "Top-p nucleus sampling from 0.0 to 1.0, or off.",
+        "reasoning": "Reasoning effort; off omits reasoning settings.",
+        "reasoning_mode": "Reasoning mode.",
+        "print_reasoning": "Include reasoning output in <think> tags.",
+        "token_limit": "Maximum input token count; must be positive.",
+        "max_output_tokens": "Maximum output token count; must be positive.",
+        "token_cost": "Token cost per million tokens: input:output, or off.",
+        "max_file_size_kb": "Maximum context file size in KB.",
+        "files": "Context file paths separated by |.",
+        "response_format": "Response format: text, JSON, or JSON Schema.",
+        "response_json_repair": "Repair malformed JSON responses.",
+        "stream": "Stream text responses as they are generated.",
+        "response_verbosity": "Verbosity level for text responses.",
+        "llm_timeout": "API timeout in seconds; must be positive.",
+        "retry": "Number of additional transient API retries.",
+        "extra_body": "Custom model parameters as key=value pairs or a JSON object.",
+        "log": "Log sessions to ~/.local/state/mince/logs.",
+        "api_log": "Store logs within the OpenAI-compatible API.",
+    }
+    HELP_LINES = NcursesForm.HELP_LINES + (
+        "",
+        "Prompt references: @system|./prompt_name.md|/path/file additional text",
+        "@system refers to ./mce_system.md. Use F4 for multiline text.",
+        "^ marks values inherited from the parent profile.",
+        "DEFAULT or d restores the inherited value, or the built-in default.",
+        "To blank a text value, use Ctrl+U followed by Enter.",
+        "The API key stays masked and is edited only within this screen.",
+    )
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        config = _merged_config_from_path(path, set())
+        self.parent_name = _inherit_profile_name(config, path)
+        defaults = (
+            _merged_config_from_path(
+                get_profile_path(self.parent_name),
+                {path.parent.resolve() / path.name},
+            )
+            if self.parent_name is not None
+            else DEFAULT_CONFIG.copy()
+        )
+        fields = tuple(
+            NcursesField(
+                name=name,
+                label=name,
+                kind=(
+                    "bool" if name in CONFIG_BOOLEAN_KEYS
+                    else "enum" if name in CONFIG_VALUE_CHOICES
+                    else "number" if isinstance(default, int)
+                    else "text"
+                ),
+                choices=CONFIG_VALUE_CHOICES.get(name, ()),
+                description=self.FIELD_HELP.get(name, ""),
+                secret=name == "api_key",
+            )
+            for name, default in DEFAULT_CONFIG.items()
+        )
+        super().__init__(
+            "Configuration", str(path), fields, config, defaults,
+            self.save_values, editor=edit_text,
+        )
+        self.default_label = (
+            f"Inherited from {self.parent_name}"
+            if self.parent_name is not None
+            else "Built-in default"
+        )
+
+    def boolean_value(self, value: Any) -> bool:
+        return coerce_bool(value)
+
+    def field_label(self, field: NcursesField) -> str:
+        inherited = (
+            self.parent_name is not None
+            and self.values[field.name] == self.defaults[field.name]
+        )
+        return ("^" if inherited else "") + field.label
+
+    def format_value(self, field: NcursesField, value: Any) -> str:
+        if field.kind == "bool":
+            return "on" if coerce_bool(value) else "off"
+        if field.kind == "enum":
+            return str(parse_config_value(field.name, value))
+        if field.name == "agent_context_expires":
+            return normalize_agent_context_expires(value)
+        return format_config_value(value)
+
+    def parse_value(self, field: NcursesField, value: str) -> Any:
+        name = field.name
+        if value.strip() == "DEFAULT":
+            return self.defaults[name]
+        if name == "extra_body" and value.lstrip().startswith(("{", "[")):
+            try:
+                parsed_value = json.loads(value)
+            except ValueError as exc:
+                raise ValueError(f"extra_body: invalid JSON ({exc})") from exc
+        else:
+            _, parsed_value = parse_config_assignment(f"{name}={value}", self.values)
+        parsed = parse_config_value(name, parsed_value)
+        for existing in (self.applied[name], self.defaults[name]):
+            if parsed == parse_config_value(name, existing):
+                return existing
+        return parsed_value
+
+    def save_values(self, values: dict[str, Any]) -> None:
+        for index, field in enumerate(self.fields):
+            try:
+                parse_config_value(field.name, values[field.name])
+            except ValueError:
+                self.focus = index
+                raise
+        save_config(values, self.path)
 
 
 def init_config_interactive() -> None:
+    if NONINTERACTIVE:
+        raise ValueError(
+            "--init and --init-profile cannot be used with --noninteractive"
+        )
     ensure_writable_config_path(CONFIG_FILE)
-    config = load_config()
+    screen = ConfigurationScreen(CONFIG_FILE)
+    saved = NcursesUI.run(screen.run)
+    print("Configuration saved." if saved else "Configuration unchanged.")
 
-    print(
-        f"Config file: {CONFIG_FILE}\n"
-        f"Use DEFAULT to reset any value. "
-        f"Use - or \"\" to blank text values.\n"
-        f"System prompt file and library include syntax:\n"
-        f"@system|./prompt_name.md|/path/file additional text\n"
-        f"@system refers to ./mce_system.md.\n\n"
-    )
-
-    prompt_config_value(config, "model", "Model")
-    prompt_config_value(config, "api_key", "API key (OPENAI_API_KEY overrides)", mask=True)
-    prompt_config_value(config, "base_url", "OpenAI-compatible base URL")
-    prompt_config_value(config, "proxy_server", "HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)")
-    prompt_config_value(config, "meta_organization", "Organization name or ID (optional)")
-    prompt_config_value(config, "meta_project", "Project name or ID (optional)")
-    prompt_config_value(config, "safety_identifier", "OpenAI moderation safety identifier (optional)")
-    prompt_config_value(config, "service_tier", "Service tier (off, auto, default, flex, scale, priority)")
-    prompt_config_value(config, "explicit_prompt_cache", "Explicit prompt caching (off, on)")
-    prompt_config_value(config, "files", "Context files (eg: /path/file1|file2)")
-    prompt_config_value(config, "system_prompt_with_task", "Prepend task and generated instructions to system prompt [recommended: on] (off, on)")
-    prompt_config_value(config, "system_prompt", "System prompt")
-    prompt_config_value(config, "linenum_system_prompt", "System prompt for context file line numbers")
-    prompt_config_value(config, "patch_system_prompt", "System prompt for patch mode")
-    prompt_config_value(config, "plan_system_prompt", "System prompt for plan mode")
-    prompt_config_value(config, "shell_system_prompt", "System prompt for shell command mode")
-    prompt_config_value(config, "agent_system_prompt", "System prompt for agent mode")
-    prompt_config_value(config, "agent_context_expires", "Agent context expiry (DEFAULT [MIN] [MAX])")
-    prompt_config_value(config, "plan", "Plan mode (off, on)")
-    prompt_config_value(config, "agent", "Agent mode (off, on)")
-    prompt_config_value(config, "patch", "Patch files (off, on)")
-    prompt_config_value(config, "shell", "Shell mode (off, on)")
-    prompt_config_value(config, "shell_trace", "Trace shell commands with strace (off, on)")
-    prompt_config_value(config, "shell_networking", "Allow networking for shell commands (off, on)")
-    prompt_config_value(config, "shell_timeout", "Shell command timeout in seconds (0 to disable)")
-    prompt_config_value(config, "patch_review", "Review patches before writing (off, on)")
-    prompt_config_value(config, "patch_branch", "Patch branch name (off, on, NAME)")
-    prompt_config_value(config, "patch_suffix", "Suffix for patched files")
-    prompt_config_value(config, "prompt_expansion", "Expand ^^promptname^^ references found in prompts (off, on)")
-    prompt_config_value(config, "temperature", "Temperature (0.0-2.0 or off)")
-    prompt_config_value(config, "top_p", "Top P (0.0-1.0 or off)")
-    prompt_config_value(config, "response_format", "Response format (text, json, schema)")
-    prompt_config_value(config, "response_verbosity", "Verbosity level for text responses (off, low, medium, high)")
-    prompt_config_value(config, "response_json_repair", "Repair JSON responses (off, on)")
-    prompt_config_value(config, "stream", "Streaming text responses (off, on)")
-    prompt_config_value(config, "reasoning", "Reasoning (off, none, minimal, low, medium, high, xhigh, max)")
-    prompt_config_value(config, "reasoning_mode", "Reasoning mode (standard, pro)")
-    prompt_config_value(config, "print_reasoning", "Include reasoning output in <think> tags (off, on)")
-    prompt_config_value(config, "extra_body", "Custom model parameters (key=value pairs separated by commas)")
-    prompt_config_value(config, "token_limit", "Input token limit")
-    prompt_config_value(config, "max_output_tokens", "Max output tokens")
-    prompt_config_value(config, "token_cost", "Token cost per million tokens (input:output, off)")
-    prompt_config_value(config, "max_file_size_kb", "Max file size KB")
-    prompt_config_value(config, "line_numbers", "Context file line numbers [recommended on] (off, on)")
-    prompt_config_value(config, "llm_timeout", "API timeout in seconds")
-    prompt_config_value(config, "retry", "Additional transient API retries")
-    prompt_config_value(config, "log", "Log sessions to HOME/.local/state/mince/logs (off, on)")
-    prompt_config_value(config, "api_log", "Store logs within the OpenAI-compatible API (off, on)")
-    prompt_config_value(config, "quiet", "Quiet mode (off, on)")
-
-    save_config(config)
-
-    print(f"\nConfiguration saved.")
 
 def get_profile_path(name: str) -> Path:
     if name == "config":
@@ -3962,10 +4915,6 @@ def validate_patch_contents(patches: list[dict[str, Any]]) -> None:
         ):
             raise ValueError(
                 f"{patch['patch_id']}: content_line_array must be an array of strings"
-            )
-        if any("\r" in line or "\n" in line for line in content_lines):
-            raise ValueError(
-                f"{patch['patch_id']}: content lines must not contain line endings"
             )
 
 
@@ -6329,7 +7278,7 @@ def validate_model_response(response_obj: Any) -> None:
         reason = response_field(incomplete_details, "reason") or "unknown"
         raise ModelResponseError(
             f"Model response is incomplete: {reason}",
-            retryable=reason not in ("max_output_tokens", "content_filter"),
+            retryable=reason
         )
     if status not in (None, "completed"):
         raise ModelResponseError(
@@ -10207,38 +11156,14 @@ def call_openai(
 
     if reasoning_items is not None:
         kwargs["include"] = ["reasoning.encrypted_content"]
-    if explicit_prompt_cache:
-        input_items: list[dict[str, Any]] = []
-        if system_prompt:
-            input_items.append({
-                "role": "developer",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": system_prompt,
-                        "prompt_cache_breakpoint": {"mode": "explicit"},
-                    },
-                ],
-            })
-        input_items.extend(reasoning_items or ())
-        input_items.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": user_prompt,
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
-                },
-            ],
-        })
-        kwargs.pop("instructions")
-        kwargs["input"] = input_items
-        kwargs["prompt_cache_options"] = {"mode": "explicit"}
-    elif reasoning_items:
+    if reasoning_items:
         kwargs["input"] = [
             *reasoning_items,
             {"role": "user", "content": user_prompt},
         ]
+
+    if explicit_prompt_cache:
+        kwargs["prompt_cache_options"] = {"mode": "explicit"}
 
     if tools is not None:
         if not tools:
@@ -11227,8 +12152,8 @@ def parse_args() -> argparse.Namespace:
         description="mce: Minimal Context Engine"
     )
 
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
+    ask_group = parser.add_mutually_exclusive_group()
+    ask_group.add_argument(
         "-a",
         "--ask",
         metavar="TEXT",
@@ -11237,7 +12162,7 @@ def parse_args() -> argparse.Namespace:
         help="Prompt without file context or the configured system prompt (use - for STDIN or e to edit)",
     )
 
-    mode_group.add_argument(
+    ask_group.add_argument(
         "--ask-file",
         metavar="FILE",
         nargs="+",
@@ -11246,7 +12171,7 @@ def parse_args() -> argparse.Namespace:
         help="Read and combine ask prompts from one or more files",
     )
 
-    mode_group.add_argument(
+    parser.add_argument(
         "-t",
         "--task",
         metavar="TEXT",
@@ -11254,14 +12179,14 @@ def parse_args() -> argparse.Namespace:
         help="Task/prompt for the model with file context (use - for STDIN or e to edit)",
     )
 
-    mode_group.add_argument(
+    parser.add_argument(
         "-T",
         "--task-file",
         metavar="FILE",
         nargs="+",
         action="extend",
         type=Path,
-        help="Read and combine task prompts from one or more files",
+        help="Read and combine task prompts from one or more files, after --task text",
     )
 
     parser.add_argument(
@@ -12060,13 +12985,13 @@ def parse_args() -> argparse.Namespace:
     profile_action_group.add_argument(
         "--init",
         action="store_true",
-        help="Initialize and interactively change the configuration file",
+        help="Edit the configuration in a full-screen terminal interface",
     )
 
     profile_action_group.add_argument(
         "--init-profile",
         metavar="NAME",
-        help="Interactively initialize a new configuration profile",
+        help="Initialize or edit a configuration profile in the terminal interface",
     )
 
     profile_action_group.add_argument(
@@ -12310,6 +13235,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if (args.ask is not None or args.ask_file is not None) and (
+        args.task is not None or args.task_file is not None
+    ):
+        parser.error(
+            "--ask and --ask-file cannot be combined with --task or --task-file"
+        )
+    if args.noninteractive and (args.init or args.init_profile is not None):
+        parser.error(
+            "--init and --init-profile cannot be used with --noninteractive"
+        )
     if args.apikey_from_fd is not None and args.apikey_from_fd < 0:
         parser.error("--apikey-from-fd requires a non-negative file descriptor")
     if args.agent_auto:
@@ -12411,9 +13346,9 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
 
     SESSION_NAME = None
 
+    args = parse_args()
     ensure_config_exists()
 
-    args = parse_args()
     if args.profile is not None:
         if not args.profile.isidentifier():
             print(f"ERROR: Invalid profile name '{args.profile}'.", file=sys.stderr)
@@ -12477,13 +13412,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         else:
             patch_file_print_turn = parsed_turn
     NONINTERACTIVE = args.noninteractive
-    if args.noninteractive and (args.init or args.init_profile is not None):
-        print(
-            "ERROR: --init and --init-profile cannot be used with "
-            "--noninteractive",
-            file=sys.stderr,
-        )
-        return 1
     patch_file_option_name: str | None = None
     if args.patch_file_apply is not None:
         patch_file_option_name = "--patch-file-apply"
@@ -12694,7 +13622,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 new_name = validate_prompt_profile_name(args.init_profile)
                 CONFIG_FILE = get_profile_path(new_name)
             init_config_interactive()
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             print(
                 f"ERROR: Failed to initialize configuration: {exc}",
                 file=sys.stderr,
@@ -13056,10 +13984,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         print("ERROR: tree options require --tree-files or --tree-files-list", file=sys.stderr)
         return 1
     elif not ask_mode and not args.list_models:
-        if args.task:
-            task = read_prompt_argument(args.task)
-        elif args.task_file:
-            task = read_prompt_files(args.task_file)
+        if args.task or args.task_file:
+            task = join_prompt_sections(
+                read_prompt_argument(args.task) if args.task else "",
+                read_prompt_files(args.task_file) if args.task_file else "",
+            )
         elif args.resume_session is not None:
             task = ""
         else:
