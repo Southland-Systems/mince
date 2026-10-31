@@ -132,8 +132,9 @@ def page_or_print(text: str) -> None:
 
 
 APP_DIR = Path.home() / ".local/state/mince"
+CONFIG_DIR = APP_DIR / "conf"
 STATE_DIR = APP_DIR / "state"
-DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
+DEFAULT_CONFIG_FILE = CONFIG_DIR / "config.json"
 CONFIG_FILE = DEFAULT_CONFIG_FILE
 
 DEFAULT_SYSTEM_PROMPT = "You are a concise and technically accurate software engineering assistant."
@@ -250,7 +251,7 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "contents. It uses the configured default expiry and refreshes "
     "automatically. To replace it and compact context, call "
     "`meta_context_control` alone with `action=summary`, `context_id=all`, "
-    "and non-empty Markdown in `reason`.\n"
+    "and non-empty Markdown in `reason`.\n\n"
     "Session completion:\n"
     "- When complete or blocked from further safe progress, call `session` "
     "alone with `action=end` and a non-empty `reason`. Report results, "
@@ -657,7 +658,7 @@ META_TASK_LIST_SCHEMA: dict[str, Any] = {
 # -------------------------------------------------------------------
 
 def configuration_profile_name(path: Path) -> str | None:
-    if path.suffix == ".json" and path.parent.resolve() == APP_DIR.resolve():
+    if path.suffix == ".json" and path.parent.resolve() == CONFIG_DIR.resolve():
         return path.stem
     return None
 
@@ -814,8 +815,22 @@ def normalize_config_document(
     return normalized_config
 
 
+def ensure_config_directory() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(APP_DIR.glob("*.json")):
+        if not path.is_file():
+            continue
+        destination = CONFIG_DIR / path.name
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(
+                f"cannot migrate configuration file {path}: "
+                f"destination already exists: {destination}"
+            )
+        path.rename(destination)
+
+
 def ensure_config_exists() -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_config_directory()
     ensure_default_prompt_library_entries()
 
     if not DEFAULT_CONFIG_FILE.exists():
@@ -2010,7 +2025,7 @@ def handle_prompt_remove(name: str) -> int:
             prompt_path.write_text(default_prompt, encoding="utf-8")
         else:
             documents: list[tuple[Path, dict[str, Any]]] = []
-            for config_path in sorted(APP_DIR.glob("*.json")):
+            for config_path in sorted(CONFIG_DIR.glob("*.json")):
                 documents.append((config_path, read_config_document(config_path)))
 
             for config_path, config in documents:
@@ -2101,7 +2116,7 @@ def handle_prompt_list() -> int:
                 config_path.stem,
                 read_config_document(config_path),
             )
-            for config_path in sorted(APP_DIR.glob("*.json"))
+            for config_path in sorted(CONFIG_DIR.glob("*.json"))
         ]
     except Exception as exc:
         print(f"ERROR: Failed to list prompts: {exc}", file=sys.stderr)
@@ -3771,7 +3786,7 @@ def init_config_interactive() -> None:
 def get_profile_path(name: str) -> Path:
     if name == "config":
         return DEFAULT_CONFIG_FILE
-    return APP_DIR / f"{name}.json"
+    return CONFIG_DIR / f"{name}.json"
 
 
 def handle_copy_profile(
@@ -3852,7 +3867,7 @@ def configuration_profile_names() -> list[str]:
     ensure_config_exists()
     profile_names = {
         path.stem
-        for path in APP_DIR.glob("*.json")
+        for path in CONFIG_DIR.glob("*.json")
         if path.is_file()
     }
     profile_names.update(BUILTIN_CONFIG_PROFILES)
@@ -6719,8 +6734,9 @@ AGENT_SUMMARY_INSTRUCTIONS = (
     "pending revisions, and next steps. Include relevant files with their "
     "exact paths and concise descriptions of their responsibilities, important "
     "symbols, and relevant changes. Suggest a solution for detected error loops "
-    "or other continuous problem states. Do not summarize the `<meta_task_list>`. "
-    "Consider the task context when writing the summary. "
+    "or other continuous problem states. Do not summarize the `<meta_task_list>`, "
+    "it is already present in context.  Do not consider the token budget. "
+    "Consider the user instructions when writing the summary. "
     "Consider that the summary will be available over many turns. "
     "Return only the Markdown summary."
 )
@@ -13851,6 +13867,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     args = parse_args()
     if args.chdir is not None:
         change_working_directory(args.chdir)
+    ensure_config_directory()
 
     if args.profile is not None:
         if not args.profile.isidentifier():
@@ -14570,6 +14587,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             if args.contain is not None
             else None
         )
+        if contain is not None and agent_backup is not None:
+            contain = tuple(dict.fromkeys((*contain, agent_backup.backup_dir)))
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: Invalid containment path: {exc}", file=sys.stderr)
         return 1

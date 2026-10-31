@@ -80,7 +80,8 @@ def print_usage() -> None:
         "Run mce through a transient systemd user service. "
         "ProtectSystem makes the host filesystem read-only, PrivateTmp "
         "supplies private writable temporary directories, and only mce's "
-        "state directory plus explicitly granted paths remain writable.\n\n"
+        "state directory, the --agent-backup directory when requested, "
+        "and explicitly granted paths remain writable.\n\n"
         "Containment options:\n"
         "  --contain-write-path PATH\n"
         "  -W PATH\n"
@@ -144,9 +145,16 @@ def _option_value(
     option: str,
     arguments: list[str],
     index: int,
+    *,
+    const: str | None = None,
 ) -> tuple[bool, str, int]:
     if argument == option:
         value_index = index + 1
+        if const is not None and (
+            value_index >= len(arguments)
+            or arguments[value_index].startswith("-")
+        ):
+            return True, const, value_index
         if value_index >= len(arguments):
             raise ValueError(f"{option} requires an argument")
         return True, arguments[value_index], value_index + 1
@@ -551,20 +559,16 @@ def resolve_contained_command(
         for index, argument in enumerate(mince_arguments, start=1):
             if argument == "--":
                 break
-            option, separator, value = argument.partition("=")
-            if option == "--agent":
-                agent_mode = True
-            elif option == "--shell":
-                if not separator:
-                    value = (
-                        mince_arguments[index]
-                        if index < len(mince_arguments)
-                        and not mince_arguments[index].startswith("-")
-                        else "on"
-                    )
-                shell_mode = _on_off(value, option)
-            else:
+            option = argument.partition("=")[0]
+            if option not in ("--agent", "--shell"):
                 continue
+            _, value, _ = _option_value(
+                argument, option, mince_arguments, index - 1, const="on"
+            )
+            if option == "--agent":
+                agent_mode = _on_off(value, option)
+            else:
+                shell_mode = _on_off(value, option)
             if mode_index is None:
                 mode_index = index
         if mode_index is not None and (agent_mode or shell_mode):
@@ -595,6 +599,56 @@ def path_is_below(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def resolve_agent_backup_directory(
+    arguments: list[str],
+    working_directory: Path,
+) -> Path | None:
+    backup_value: str | None = None
+    chdir_value: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            break
+        option = argument.partition("=")[0]
+        if option not in ("--agent-backup", "--chdir"):
+            index += 1
+            continue
+        _, value, index = _option_value(
+            argument, option, arguments, index,
+            const="" if option == "--agent-backup" else None,
+        )
+        if option == "--agent-backup":
+            backup_value = value
+        else:
+            chdir_value = value
+    if backup_value is None:
+        return None
+    try:
+        enabled = _on_off(backup_value or "on", "--agent-backup")
+    except ValueError:
+        backup_value = _require_nonempty(
+            "--agent-backup", backup_value.strip()
+        )
+    else:
+        if not enabled:
+            return None
+        backup_value = ""
+    source_directory = resolve_working_directory(
+        chdir_value or None, working_directory
+    )
+    backup_directory = (
+        absolute_path(backup_value, source_directory)
+        if backup_value
+        else source_directory.parent / ".mce-agent-backup"
+    )
+    if path_is_below(backup_directory.resolve(), source_directory):
+        raise ValueError(
+            "agent backup directory must be outside the working directory"
+        )
+    return backup_directory
 
 
 def path_needs_visibility_binding(
@@ -787,6 +841,13 @@ def main() -> int:
         working_directory = resolve_working_directory(
             options.working_directory, invocation_directory
         )
+        if not options.use_shell:
+            backup_directory = resolve_agent_backup_directory(
+                mince_arguments, working_directory
+            )
+            if backup_directory is not None:
+                backup_directory.resolve().mkdir(parents=True, exist_ok=True)
+                options.write_paths.append(str(backup_directory))
         command_arguments, runtime_grants = resolve_contained_command(
             options, mince_arguments, invocation_directory
         )
