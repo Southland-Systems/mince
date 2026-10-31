@@ -4617,7 +4617,7 @@ def _contained_shell_command(
         "--wait",
         "--collect",
         f"--unit={unit_name}",
-        "--pty",
+        "--pipe",
         f"--working-directory={Path.cwd()}",
         "--property=Type=exec",
         "--property=ProtectSystem=strict",
@@ -5480,43 +5480,73 @@ def estimate_request_tokens(
         )
     )
 
-def truncate_text_to_tokens(text: str, model: str, max_tokens: int) -> str:
+def truncate_text_to_tokens(
+    text: str,
+    model: str,
+    max_tokens: int,
+    *,
+    fits_context: Callable[[str], bool] | None = None,
+) -> str:
     if max_tokens <= 0 or not text:
         return ""
     encoding = token_encoding_for_model(model)
     tokens = encoding.encode(text)
-    if len(tokens) <= max_tokens:
+    if len(tokens) <= max_tokens and (
+        fits_context is None or fits_context(text)
+    ):
         return text
 
-    marker = "\n[... shell output truncated ...]"
+    marker = "\n[... shell output truncated ...]\n"
     lower = 0
-    upper = min(len(tokens), max_tokens)
-    best: str | None = None
+    upper = min(len(tokens) - 1, max_tokens)
+    best = ""
     while lower <= upper:
         midpoint = (lower + upper) // 2
-        candidate = encoding.decode(tokens[:midpoint]) + marker
-        if len(encoding.encode(candidate)) <= max_tokens:
+        prefix_tokens = (midpoint + 1) // 2
+        suffix_tokens = midpoint // 2
+        candidate = (
+            encoding.decode(tokens[:prefix_tokens], errors="ignore")
+            + marker
+            + (
+                encoding.decode(tokens[-suffix_tokens:], errors="ignore")
+                if suffix_tokens
+                else ""
+            )
+        )
+        if len(encoding.encode(candidate)) <= max_tokens and (
+            fits_context is None or fits_context(candidate)
+        ):
             best = candidate
             lower = midpoint + 1
         else:
             upper = midpoint - 1
-    if best is not None:
-        return best
-    return encoding.decode(tokens[:max_tokens])
+    return best
+
 
 def limit_shell_output_for_context(
     shell_output: str,
     model: str,
     token_limit: int,
- ) -> str:
+    *,
+    estimate_context_tokens: Callable[[str], int] | None = None,
+) -> str:
     max_output_tokens = max(
         0, int(token_limit * SHELL_OUTPUT_TOKEN_FRACTION)
     )
+
+    def fits_context(output: str) -> bool:
+        return (
+            estimate_context_tokens is None
+            or estimate_context_tokens(output) <= token_limit
+        )
+
     return truncate_text_to_tokens(
         shell_output,
         model,
         max_output_tokens,
+        fits_context=fits_context,
     )
+
 
 def parse_token_cost(value: Any) -> tuple[float, float] | None:
     raw = str(value).strip()
@@ -8009,6 +8039,24 @@ def record_agent_tool_history(
 
 
 
+def limit_agent_shell_turn_for_context(
+    turn: AgentTurn,
+    model: str,
+    token_limit: int,
+) -> AgentTurn:
+    if (
+        turn.tool_call.tool != AGENT_SHELL_TOOL
+        or turn.purge_in_turns is not None
+    ):
+        return turn
+    return replace(
+        turn,
+        output=limit_shell_output_for_context(
+            turn.output, model, token_limit
+        ),
+    )
+
+
 def agent_history_tool_content(turn: AgentTurn) -> str:
     if turn.tool_call.tool == AGENT_META_TASK_LIST_TOOL:
         if turn.output.startswith("ERROR:"):
@@ -9537,7 +9585,9 @@ def update_agent_context_summary(
         if remaining_tokens <= 0:
             break
         if kind == "turn":
-            turn = turns[index]
+            turn = limit_agent_shell_turn_for_context(
+                turns[index], model, token_limit
+            )
             context = "\n".join(
                 value for value in (
                     format_agent_history(
@@ -9640,6 +9690,10 @@ def build_agent_context_window_prompts(
             file_expires_in_turns,
             pinned_paths,
         )
+    context_turns = [
+        limit_agent_shell_turn_for_context(turn, model, token_limit)
+        for turn in turns
+    ]
     visible_turn_numbers = set(agent_history_turn_numbers(turns))
     turn_numbers = list(range(len(turns)))
     visible_file_indexes = set(range(len(file_contexts)))
@@ -9661,7 +9715,7 @@ def build_agent_context_window_prompts(
             file_contexts,
             file_expires_in_turns,
             visible_file_indexes,
-            turns,
+            context_turns,
             turn_numbers,
             visible_turn_numbers,
             model=model,
@@ -9670,7 +9724,7 @@ def build_agent_context_window_prompts(
             system_prompt=system_prompt,
             task=task,
             context=visible_context,
-            turns=turns,
+            turns=context_turns,
             turn_numbers=turn_numbers,
             visible_turn_numbers=visible_turn_numbers,
             pinned_turn_numbers=pinned_turn_numbers,
@@ -9730,7 +9784,7 @@ def build_agent_context_window_prompts(
             (
                 full_system_prompt, user_prompt, request_tokens,
             ) = build_visible_prompts_with_token_estimate()
-            if request_tokens < token_limit:
+            if request_tokens <= token_limit:
                 return full_system_prompt, user_prompt, request_tokens
             try:
                 kind, index = next(candidates)
@@ -9741,6 +9795,23 @@ def build_agent_context_window_prompts(
                     "or persistent context, or increase the token limit"
                 ) from None
             if kind == "turn":
+                turn = turns[index]
+                if turn.tool_call.tool == AGENT_SHELL_TOOL and turn.output:
+                    def estimate_shell_context_tokens(output: str) -> int:
+                        context_turns[index] = replace(turn, output=output)
+                        return build_visible_prompts_with_token_estimate()[2]
+
+                    if estimate_shell_context_tokens("") <= token_limit:
+                        limited_output = limit_shell_output_for_context(
+                            turn.output,
+                            model,
+                            token_limit,
+                            estimate_context_tokens=estimate_shell_context_tokens,
+                        )
+                        context_turns[index] = replace(
+                            turn, output=limited_output
+                        )
+                        continue
                 visible_turn_numbers.remove(index)
                 removed_turn_numbers.add(index)
             elif kind == "file":
@@ -11222,11 +11293,23 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
             tool_outputs.append(tool_output)
             settings.context = current_file_context()
             updated_file_context_tokens = len(encoding.encode(settings.context))
-            context_output = (
-                agent_readfile_error_output(tool_output, readfile_contexts)
-                if readfile_contexts is not None
-                else tool_output
-            )
+            if tool_call.tool == AGENT_SHELL_TOOL:
+                context_turn = limit_agent_shell_turn_for_context(
+                    turns[-1],
+                    settings.model_settings.model,
+                    settings.token_limit,
+                )
+                context_output = format_agent_history(
+                    [context_turn],
+                    [len(turns) - 1],
+                    model=settings.model_settings.model,
+                )
+            else:
+                context_output = (
+                    agent_readfile_error_output(tool_output, readfile_contexts)
+                    if readfile_contexts is not None
+                    else tool_output
+                )
             current_token_estimate = max(
                 0,
                 current_token_estimate
@@ -15934,55 +16017,29 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 archived_shell_turns.pop(0)
                 continue
             current_turn = shell_turn_history[-1]
-            current_output_token_count = len(
-                token_encoding_for_model(model).encode(current_turn.output)
-            )
-            if not current_turn.output or current_output_token_count == 0:
-                raise ValueError(
-                    f'Estimated shell follow-up input token count '
-                    f'({followup_request_tokens}) exceeds token limit '
-                    f'({token_limit})'
-                )
 
-            lower = 0
-            upper = current_output_token_count - 1
-            best_output: str | None = None
-            while lower <= upper:
-                midpoint = (lower + upper) // 2
-                candidate_output = truncate_text_to_tokens(
-                    current_turn.output,
-                    model,
-                    midpoint,
-                )
+            def estimate_shell_context_tokens(output: str) -> int:
                 candidate_history = [
                     *shell_turn_history[:-1],
-                    replace(current_turn, output=candidate_output),
+                    replace(current_turn, output=output),
                 ]
-                _, _, candidate_request_tokens = build_followup_request(
-                    candidate_history
-                )
-                if candidate_request_tokens <= token_limit:
-                    best_output = candidate_output
-                    lower = midpoint + 1
-                else:
-                    upper = midpoint - 1
+                return build_followup_request(candidate_history)[2]
 
-            if best_output is None:
-                empty_history = [
-                    *shell_turn_history[:-1],
-                    replace(current_turn, output=""),
-                ]
-                _, _, empty_request_tokens = build_followup_request(empty_history)
-                if empty_request_tokens > token_limit:
-                    raise ValueError(
-                        f'Estimated shell follow-up input token count '
-                        f'({empty_request_tokens}) exceeds token limit '
-                        f'({token_limit})'
-                    )
-                best_output = ""
+            empty_request_tokens = estimate_shell_context_tokens("")
+            if empty_request_tokens > token_limit:
+                raise ValueError(
+                    f'Estimated shell follow-up input token count '
+                    f'({empty_request_tokens}) exceeds token limit '
+                    f'({token_limit})'
+                )
             shell_turn_history[-1] = replace(
                 current_turn,
-                output=best_output,
+                output=limit_shell_output_for_context(
+                    shell_output,
+                    model,
+                    token_limit,
+                    estimate_context_tokens=estimate_shell_context_tokens,
+                ),
             )
         followup_result, followup_reasoning, followup_statsline = request_model_turn(
             followup_system_prompt,
