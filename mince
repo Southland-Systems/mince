@@ -164,7 +164,7 @@ AGENT_TOOL_CALL_SYSTEM_PROMPT = (
     "Response protocol:\n"
     "- Return one or more native tool calls on each controller turn. Do not "
     "return ordinary text, code fences, or JSON that only describes calls. "
-    "Follow the argument schemas in `<agent_tool_json_schemas>` exactly.\n"
+    "Follow each tool's argument schema exactly.\n"
     "- Include `expires_in_turns` on every tool except `meta_task_list`.\n"
     "- Calls execute sequentially in the order returned. Batch or combine any tool "
     "call types together.\n"
@@ -310,6 +310,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "prompt_expansion": "off",
     "plan": "off",
     "agent": "off",
+    "agent_backup": "off",
+    "agent_backup_interval": 12,
     "shell": "off",
     "shell_trace": "off",
     "shell_networking": "off",
@@ -328,6 +330,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_output_tokens": 65534,
     "token_cost": "0.10:0.50",
     "max_file_size_kb": 512,
+    "chdir": "",
     "files": "",
     "response_format": "text",
     "response_json_repair": "off",
@@ -711,6 +714,8 @@ def _inherit_profile_name(
 def _merged_config_from_path(
     path: Path,
     active_paths: set[Path],
+    *,
+    write_updates: bool = True,
  ) -> dict[str, Any]:
     resolved_path = path.parent.resolve() / path.name
     if resolved_path in active_paths:
@@ -718,7 +723,9 @@ def _merged_config_from_path(
     active_paths.add(resolved_path)
     try:
         config = DEFAULT_CONFIG.copy()
-        raw = read_config_document(path, missing_ok=True)
+        raw = read_config_document(
+            path, missing_ok=True, write_updates=write_updates
+        )
         parent_name = _inherit_profile_name(raw, path)
         if parent_name is not None:
             parent_path = get_profile_path(parent_name)
@@ -726,17 +733,27 @@ def _merged_config_from_path(
                 raise ValueError(
                     f"inherited profile '{parent_name}' does not exist"
                 )
-            config.update(_merged_config_from_path(parent_path, active_paths))
+            config.update(
+                _merged_config_from_path(
+                    parent_path, active_paths, write_updates=write_updates
+                )
+            )
         config.update(raw)
         return config
     finally:
         active_paths.remove(resolved_path)
 
 
-def merged_config(config_path: Path | None = None) -> dict[str, Any]:
+def merged_config(
+    config_path: Path | None = None,
+    *,
+    write_updates: bool = True,
+) -> dict[str, Any]:
     path = CONFIG_FILE if config_path is None else config_path
     try:
-        return _merged_config_from_path(path, set())
+        return _merged_config_from_path(
+            path, set(), write_updates=write_updates
+        )
     except Exception as exc:
         print(f"ERROR: Failed to parse config: {path} ({exc})", file=sys.stderr)
         raise SystemExit(1)
@@ -1526,7 +1543,7 @@ def start_state_turn(
         write_state_artifact(
             turn_dir,
             "request",
-            format_request_text(system_prompt, user_prompt),
+            format_request_text(system_prompt, user_prompt, tools=tools),
         )
     request_files_path = state_session_dir / "request_files"
     if not request_files_path.exists():
@@ -1671,7 +1688,12 @@ def read_json_document(path: Path, label: str) -> Any:
         raise ValueError(f"cannot read {label} {path} ({exc})") from exc
 
 
-def read_config_document(path: Path, missing_ok: bool = False) -> dict[str, Any]:
+def read_config_document(
+    path: Path,
+    missing_ok: bool = False,
+    *,
+    write_updates: bool = True,
+) -> dict[str, Any]:
     builtin_document = builtin_config_document(path)
     if builtin_document is not None:
         return builtin_document
@@ -1685,7 +1707,7 @@ def read_config_document(path: Path, missing_ok: bool = False) -> dict[str, Any]
     normalized_config = normalize_config_document(
         raw, path, repair_invalid=True
     )
-    if normalized_config != raw:
+    if write_updates and normalized_config != raw:
         try:
             write_json_document(path, normalized_config)
         except OSError as exc:
@@ -2556,7 +2578,7 @@ def get_default_config_value(name: str) -> Any:
     return DEFAULT_CONFIG[name]
 
 
-def parse_patch_branch_value(value: Any) -> bool | str:
+def parse_bool_or_string(value: Any, name: str) -> bool | str:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -2566,13 +2588,13 @@ def parse_patch_branch_value(value: Any) -> bool | str:
                 return parse_bool(raw_value)
             except argparse.ArgumentTypeError:
                 return raw_value
-    raise ValueError('patch_branch must be a boolean or branch name')
+    raise ValueError(f"{name} must be a boolean or non-empty string")
 
 
-def resolve_patch_branch_setting(value: Any) -> str | None:
+def resolve_optional_string_setting(value: Any, name: str) -> str | None:
     if value == "":
         return ""
-    parsed = parse_patch_branch_value(value)
+    parsed = parse_bool_or_string(value, name)
     if isinstance(parsed, bool):
         return "" if parsed else None
     return parsed
@@ -2600,8 +2622,10 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
         )
     if raw_value == "DEFAULT":
         parsed_value = get_default_config_value(canonical_name)
-    elif canonical_name == "patch_branch":
-        parsed_value = parse_patch_branch_value(raw_value)
+    elif canonical_name in ("patch_branch", "agent_backup"):
+        parsed_value = parse_bool_or_string(raw_value, canonical_name)
+    elif canonical_name == "agent_backup_interval":
+        parsed_value = parse_config_value(canonical_name, raw_value)
     elif canonical_name == "agent_context_expires":
         parsed_value = normalize_agent_context_expires(raw_value)
     elif canonical_name == "retry":
@@ -3591,6 +3615,7 @@ class NcursesForm:
 
 class ConfigurationScreen(NcursesForm):
     FIELD_HELP = {
+        "chdir": "Working directory to enter before work; empty keeps the current directory.",
         "model": "Model name.",
         "api_key": "API key; OPENAI_API_KEY overrides this value at runtime.",
         "base_url": "OpenAI-compatible API base URL.",
@@ -3611,6 +3636,8 @@ class ConfigurationScreen(NcursesForm):
         "prompt_expansion": "Expand ^^promptname^^ references found in prompts.",
         "plan": "Create a plan for review before using it as the task.",
         "agent": "Run a multi-turn agent tool-call session.",
+        "agent_backup": "Backup destination: off, on for ../.mce-agent-backup, or a path.",
+        "agent_backup_interval": "Real-time minutes between backups; 0 backs up before every turn.",
         "shell": "Generate, review, and run shell commands.",
         "shell_trace": "Trace shell commands with strace.",
         "shell_networking": "Allow networking for shell commands.",
@@ -5251,11 +5278,12 @@ def handle_patch_file_apply(
     )
 
     try:
-        patch_branch_setting = resolve_patch_branch_setting(
+        patch_branch_setting = resolve_optional_string_setting(
             resolve_config_option(
                 patch_branch_argument, config, "patch_branch",
                 DEFAULT_CONFIG["patch_branch"],
-            )
+            ),
+            "patch_branch",
         )
     except ValueError as exc:
         print(f"ERROR: Invalid patch branch value: {exc}", file=sys.stderr)
@@ -5418,9 +5446,25 @@ def format_context_entry(
 def format_request_text(
     system_prompt: str,
     user_prompt: str,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
-    request_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
-    return request_text
+    sections = [
+        format_context_entry(
+            "system", f"{system_prompt}\n", include_token_count=False
+        ),
+        format_context_entry(
+            "user", f"{user_prompt}\n", include_token_count=False
+        ),
+    ]
+    if tools:
+        sections.append(
+            format_context_entry(
+                "tools",
+                f"{json.dumps(tools, indent=2, ensure_ascii=False)}\n",
+                include_token_count=False,
+            )
+        )
+    return "\n\n".join(sections)
 
 
 def estimate_request_tokens(
@@ -5431,7 +5475,9 @@ def estimate_request_tokens(
 ) -> int:
     encoding = token_encoding_for_model(model)
     return len(
-        encoding.encode(format_request_text(system_prompt, user_prompt))
+        encoding.encode(
+            format_request_text(system_prompt, user_prompt, tools=tools)
+        )
     )
 
 def truncate_text_to_tokens(text: str, model: str, max_tokens: int) -> str:
@@ -5628,6 +5674,68 @@ class CumulativeStats:
         if VERBOSE:
             print(statsline, file=sys.stderr)
 
+
+@dataclass
+class AgentBackup:
+    source_dir: Path
+    backup_dir: Path
+    interval_minutes: float = DEFAULT_CONFIG["agent_backup_interval"]
+    last_backup_time: float | None = None
+
+    def run_if_due(self) -> None:
+        if (
+            self.last_backup_time is not None
+            and time.monotonic() - self.last_backup_time < self.interval_minutes * 60
+        ):
+            return
+        backup_dir = self.backup_dir.resolve()
+        if (
+            backup_dir == self.source_dir
+            or self.source_dir in backup_dir.parents
+        ):
+            raise ValueError(
+                "agent backup directory must be outside the working directory"
+            )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = int(time.time())
+        backup_path = backup_dir / f"{self.source_dir.name}-{timestamp}"
+        timestamp_ns = time.time_ns()
+        while True:
+            try:
+                backup_path.mkdir()
+            except FileExistsError:
+                seconds, nanoseconds = divmod(timestamp_ns, 1_000_000_000)
+                backup_path = backup_dir / (
+                    f"{self.source_dir.name}-{seconds}.{nanoseconds:09d}"
+                )
+                timestamp_ns += 1
+            else:
+                break
+        try:
+            completed = subprocess.run(
+                [
+                    "cp", "-a", "--reflink=auto", "--",
+                    f"{self.source_dir}/.", str(backup_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                if not detail:
+                    detail = f"exit status {completed.returncode}"
+                raise ValueError(f"cp --reflink=auto failed: {detail}")
+        except BaseException:
+            shutil.rmtree(backup_path, ignore_errors=True)
+            raise
+        self.last_backup_time = time.monotonic()
+        if VERBOSE:
+            print(f"agent_backup={backup_path}", file=sys.stderr)
+
+
 def coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -5681,8 +5789,20 @@ def parse_config_value(name: str, value: Any) -> Any:
                 if not isinstance(value, str):
                     raise ValueError("must be a boolean")
                 value = parse_bool(value)
-        elif name == "patch_branch":
-            value = resolve_patch_branch_setting(value)
+        elif name in ("patch_branch", "agent_backup"):
+            value = resolve_optional_string_setting(value, name)
+            if (
+                name == "agent_backup"
+                and value is not None
+                and "\x00" in value
+            ):
+                raise ValueError("cannot contain a null byte")
+        elif name == "agent_backup_interval":
+            value = parse_optional_float(value)
+            if value is None or value < 0:
+                raise ValueError(
+                    "must be a finite non-negative number of minutes"
+                )
         elif name == "agent_context_expires":
             value = parse_agent_context_expires(value)
         elif name in ("temperature", "top_p"):
@@ -5749,6 +5869,8 @@ def parse_config_value(name: str, value: Any) -> Any:
                 value = value.strip()
             if name in ("model", "base_url") and not value:
                 raise ValueError("cannot be empty")
+            if name == "chdir" and "\x00" in value:
+                raise ValueError("cannot contain a null byte")
             if name == "patch_suffix":
                 if "\x00" in value:
                     raise ValueError("cannot contain a null byte")
@@ -5756,6 +5878,18 @@ def parse_config_value(name: str, value: Any) -> Any:
     except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
         raise ValueError(f"{name}: {exc}") from exc
     return value
+
+
+def change_working_directory(value: Any) -> None:
+    path_text = parse_config_value("chdir", value)
+    if not path_text:
+        return
+    try:
+        os.chdir(Path(path_text).expanduser())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"cannot change working directory to {path_text!r} ({exc})"
+        ) from exc
 
 
 def resolve_runtime_config(
@@ -6704,6 +6838,7 @@ class AgentRunSettings:
     initial_turn_metadata: dict[str, Any] | None = None
     initial_turn_number_base: int = 0
     refresh_initial_file_contexts: bool = False
+    agent_backup: AgentBackup | None = None
     cumulative_stats: CumulativeStats = field(default_factory=CumulativeStats)
 
 @dataclass(frozen=True)
@@ -7387,6 +7522,55 @@ def response_output_text(response_obj: Any) -> str:
             response_field(item, "content", []), "output_text"
         )
     )
+
+
+def response_log_text(response_obj: Any) -> str:
+    output_items = response_field(response_obj, "output", [])
+    if not isinstance(output_items, (list, tuple)):
+        return response_output_text(response_obj)
+    blocks: list[str] = []
+    text_parts: list[str] = []
+    has_structured_output = False
+    for item in output_items:
+        item_type = response_field(item, "type")
+        if item_type == "message":
+            content_items = response_field(item, "content", [])
+            if not isinstance(content_items, (list, tuple)):
+                continue
+            for content in content_items:
+                content_type = response_field(content, "type")
+                if content_type == "output_text":
+                    text = response_field(content, "text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+                elif content_type == "refusal":
+                    has_structured_output = True
+                    if text_parts:
+                        blocks.append("".join(text_parts))
+                        text_parts.clear()
+                    refusal = response_field(content, "refusal", "")
+                    blocks.append(f"<refusal>\n{refusal}\n</refusal>")
+        elif item_type == "function_call":
+            has_structured_output = True
+            if text_parts:
+                blocks.append("".join(text_parts))
+                text_parts.clear()
+            arguments = response_field(item, "arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(
+                    arguments, ensure_ascii=False, default=str
+                )
+            blocks.append(
+                f"<function_call name={quote_tag_attribute(response_field(item, 'name', ''))} "
+                f"call_id={quote_tag_attribute(response_field(item, 'call_id', ''))}>\n"
+                f"{arguments}\n"
+                "</function_call>"
+            )
+    if text_parts:
+        blocks.append("".join(text_parts))
+    if not has_structured_output:
+        return response_output_text(response_obj)
+    return "\n\n".join(blocks)
 
 
 def parse_agent_response_json(
@@ -9493,7 +9677,6 @@ def build_agent_context_window_prompts(
             active_context=visible_active_context,
             context_summary=visible_summary,
             revision_instruction=revision_instruction,
-            controller_tools=controller_tools,
             hook_contents=hook_contents,
             meta_task_list=meta_task_list,
             current_token_estimate=current_token_estimate,
@@ -9634,20 +9817,6 @@ def build_agent_context_window_prompts(
         request_system_prompt, user_prompt, summary_token_budget, compact_context,
     )
 
-def format_agent_tool_schema_context(
-    controller_tools: list[dict[str, Any]] | None = None,
- ) -> str:
-    schemas = (
-        AGENT_TOOL_SCHEMAS
-        if controller_tools is None
-        else controller_tools
-    )
-    return (
-        "<agent_tool_json_schemas>\n"
-        f"{json.dumps(schemas, indent=2, ensure_ascii=False)}\n"
-        "</agent_tool_json_schemas>"
-    )
-
 
 def build_agent_followup_prompts(
     system_prompt: str,
@@ -9659,7 +9828,6 @@ def build_agent_followup_prompts(
     turn_numbers: list[int] | None = None,
     visible_turn_numbers: set[int] | None = None,
     pinned_turn_numbers: set[int] | None = None,
-    controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
     meta_task_list: list[dict[str, Any]] | None = None,
     current_token_estimate: int | None = None,
@@ -9674,19 +9842,12 @@ def build_agent_followup_prompts(
 ) -> tuple[str, str]:
     if current_unix_time is None:
         current_unix_time = int(time.time())
-    schemas, schema_instructions = split_schema_instructions(
-        AGENT_TOOL_SCHEMAS if controller_tools is None else controller_tools,
-        "agent_tool_json_schemas",
-    )
     instruction_parts = [
         tool_call_instructions if not summary_request else "",
-        *schema_instructions,
         "The `<meta_task_list>` uses `TASK_NUMBER. [TASK_STATUS] TASK` "
         "for each task, or `No tasks.` when empty.",
     ]
-    additional_parts: list[str] = [
-        format_agent_tool_schema_context(schemas),
-    ]
+    additional_parts: list[str] = []
     if current_token_estimate is not None and token_limit is not None:
         instruction_parts.append(
             "Each line in `<prior_token_estimates>` has the format "
@@ -9896,8 +10057,30 @@ def append_session_log(
 ) -> None:
     if not enabled or log_path is None:
         return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(text)
+
+
+def format_model_response_log(
+    response_text: str,
+    reasoning: str,
+    response_tag: str = "response",
+) -> str:
+    reasoning_tag = (
+        "reasoning"
+        if response_tag == "response"
+        else f"{response_tag}_reasoning"
+    )
+    reasoning_block = (
+        f"<{reasoning_tag}>\n{reasoning}\n</{reasoning_tag}>\n"
+        if reasoning
+        else ""
+    )
+    return (
+        f"{reasoning_block}"
+        f"<{response_tag}>\n{response_text}\n</{response_tag}>\n"
+    )
 
 
 def request_agent_model(
@@ -9925,6 +10108,13 @@ def request_agent_model(
             settings.log_path, text, settings.log_enabled
         )
 
+    def log_response(response_text: str, reasoning: str) -> None:
+        append_log(
+            format_model_response_log(
+                response_text, reasoning, "agent_response"
+            )
+        )
+
     request_tokens = estimate_request_tokens(
         model=settings.model_settings.model,
         system_prompt=system_prompt,
@@ -9936,12 +10126,10 @@ def request_agent_model(
             f"Estimated agent input token count ({request_tokens}) exceeds "
             f"token limit ({settings.token_limit})"
         )
-    tool_schema_text = (
-        json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
-        if tools
-        else ""
+    request_text = format_request_text(
+        system_prompt, user_prompt, tools=tools
     )
-    request_characters = len(system_prompt + user_prompt + tool_schema_text)
+    request_characters = len(request_text)
     request_cost_log = request_cost_estimate_log(
         settings.token_cost, request_tokens
     )
@@ -9982,8 +10170,7 @@ def request_agent_model(
         f"<request_stats>\nturn={current_turn} request_characters={request_characters} "
         f"request_tokens_estimate={request_tokens}{request_cost_log}"
         "\n</request_stats>\n"
-        f"<system_prompt>\n{system_prompt}\n</system_prompt>\n"
-        f"<user_prompt>\n{user_prompt}\n</user_prompt>\n"
+        f"<request>\n{request_text}\n</request>\n"
         "</agent_request>\n",
     )
     if VERBOSE:
@@ -10010,6 +10197,7 @@ def request_agent_model(
                 json_schema=json_schema,
                 retry=0,
                 report_errors=False,
+                response_logger=log_response,
                 tools=tools,
                 tool_choice="required" if tools else None,
                 parallel_tool_calls=True if tools else None,
@@ -10110,19 +10298,22 @@ def request_agent_model(
     except Exception as exc:
         if turn_dir is not None:
             append_state_response_error(turn_dir, exc)
+        append_log(
+            "<agent_response_error>\n"
+            f"{format_exception_message(exc)}\n"
+            "</agent_response_error>\n"
+        )
         raise
     statsline = print_stats(
         request_characters=request_characters,
         request_tokens=request_tokens,
         processing_time=elapsed,
-        response_text=response,
+        response_text=response_log_text(response_obj),
         usage=usage,
         response_cost=response_cost_line(settings.token_cost, usage),
         turn=current_turn,
     )
     append_log(
-        f"<agent_response_reasoning>\n{reasoning}\n</agent_response_reasoning>\n"
-        f"<agent_response>\n{response}\n</agent_response>\n"
         f"<agent_response_stats>\n{statsline}\n</agent_response_stats>\n",
     )
     if VERBOSE:
@@ -10539,7 +10730,9 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
     refresh_summary = (
         bool(context_summary.content) and context_summary.expires_in_turns <= 0
     )
-    request_system_prompt, user_prompt, _, _ = build_agent_context_window_prompts(
+    (
+        request_system_prompt, user_prompt, summary_token_budget, _,
+    ) = build_agent_context_window_prompts(
         model=settings.model_settings.model,
         token_limit=settings.token_limit,
         system_prompt=settings.agent_system_prompt,
@@ -10562,6 +10755,7 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
         model=settings.model_settings.model,
         system_prompt=request_system_prompt,
         user_prompt=user_prompt,
+        tools=None if summary_token_budget is not None else controller_tools,
     )
 
 
@@ -10620,14 +10814,16 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         nonlocal active_context, pending_revision_instruction, reasoning_items
         if revision_instruction:
             pending_revision_instruction = revision_instruction
-        hook_contents = run_agent_hook_context_scripts(
-            settings.agent_hook_context_scripts
-        )
         advance_expirations = True
         refresh_summary = (
             bool(context_summary.content) and context_summary.expires_in_turns <= 0
         )
         while True:
+            if settings.agent_backup is not None:
+                settings.agent_backup.run_if_due()
+            hook_contents = run_agent_hook_context_scripts(
+                settings.agent_hook_context_scripts
+            )
             (
                 request_system_prompt, user_prompt,
                 summary_token_budget, compact_context,
@@ -11146,15 +11342,15 @@ def execute_openai_request(
             delay_seconds = min(
                 2 ** (failed_retries - 1), API_RETRY_MAX_DELAY_SECONDS
             )
+            retry_delay = f" +{delay_seconds}s" if should_retry else ""
+            failure_message = (
+                f"ERROR: {operation_name} failed "
+                f"({failed_retries + 1}/{retry_count + 1}{retry_delay}): "
+                f"{format_exception_message(exc)}"
+            )
             if report_errors:
-                retry_delay = f" +{delay_seconds}s" if should_retry else ""
-                failure_message = (
-                    f"ERROR: {operation_name} failed "
-                    f"({failed_retries + 1}/{retry_count + 1}{retry_delay}): "
-                    f"{format_exception_message(exc)}"
-                )
                 report_request_error(exc, failure_message)
-                _log_api_request_event(error_logger, failure_message)
+            _log_api_request_event(error_logger, failure_message)
             if not should_retry:
                 raise
             time.sleep(delay_seconds)
@@ -11245,6 +11441,7 @@ def call_openai(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
     error_logger: Any = None,
+    response_logger: Callable[[str, str], None] | None = None,
     explicit_prompt_cache: bool = False,
     request_timer: ModelRequestTimer | None = None,
     reasoning_items: tuple[dict[str, Any], ...] | None = None,
@@ -11343,6 +11540,11 @@ def call_openai(
                     request_timer.reset()
                 response = client.responses.create(**kwargs)
                 if not stream:
+                    if response_logger is not None:
+                        response_logger(
+                            response_log_text(response),
+                            response_reasoning_text(response),
+                        )
                     validate_model_response(response)
                 return response
 
@@ -11383,6 +11585,7 @@ def call_model(
     parallel_tool_calls: bool | None = None,
     retry: int | None = None,
     error_logger: Any = None,
+    response_logger: Callable[[str, str], None] | None = None,
     request_timer: ModelRequestTimer | None = None,
     reasoning_items: tuple[dict[str, Any], ...] | None = None,
     report_errors: bool = True,
@@ -11416,6 +11619,7 @@ def call_model(
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         error_logger=error_logger,
+        response_logger=response_logger,
         request_timer=request_timer,
         reasoning_items=reasoning_items,
         report_errors=report_errors,
@@ -11425,79 +11629,100 @@ def call_model(
 def consume_response_stream(
     stream: Any,
     emit: Any = None,
+    response_logger: Callable[[str, str], None] | None = None,
 ) -> tuple[str, dict[str, Any] | None, Any]:
     chunks: list[str] = []
     completed_response: dict[str, Any] | None = None
     completed_items: dict[int, dict[str, Any]] = {}
 
-    with closing(stream):
-        for event in stream:
-            event_type = response_field(event, "type", "")
-            if event_type == "response.output_text.delta":
-                delta = response_field(event, "delta", "")
-                if delta:
-                    chunks.append(delta)
-                    if emit is not None:
-                        emit(delta)
-            elif event_type == "response.output_item.done":
-                output_index = response_field(event, "output_index")
-                item = usage_to_dict(response_field(event, "item"))
-                if (
-                    isinstance(output_index, bool)
-                    or not isinstance(output_index, int)
-                    or output_index < 0
-                    or item is None
+    try:
+        with closing(stream):
+            for event in stream:
+                event_type = response_field(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = response_field(event, "delta", "")
+                    if delta:
+                        chunks.append(delta)
+                        if emit is not None:
+                            emit(delta)
+                elif event_type == "response.output_item.done":
+                    output_index = response_field(event, "output_index")
+                    item = usage_to_dict(response_field(event, "item"))
+                    if (
+                        isinstance(output_index, bool)
+                        or not isinstance(output_index, int)
+                        or output_index < 0
+                        or item is None
+                    ):
+                        raise ModelResponseError("Invalid completed response output item")
+                    completed_items[output_index] = item
+                elif event_type in (
+                    "response.completed", "response.failed", "response.incomplete",
                 ):
-                    raise ModelResponseError("Invalid completed response output item")
-                completed_items[output_index] = item
-            elif event_type in (
-                "response.completed", "response.failed", "response.incomplete",
-            ):
-                completed_response = usage_to_dict(
-                    response_field(event, "response")
-                )
-                if completed_response is None:
-                    raise ModelResponseError(
-                        "Response stream ended without a response"
+                    completed_response = usage_to_dict(
+                        response_field(event, "response")
                     )
-                if response_field(completed_response, "status") is None:
-                    completed_response["status"] = event_type.removeprefix("response.")
-                if event_type != "response.completed":
-                    validate_model_response(completed_response)
-                    raise ModelResponseError(
-                        f"Response stream ended with {event_type}"
-                    )
-                break
-            elif event_type == "error":
-                raise model_response_error(event, "Response stream failed")
+                    if completed_response is None:
+                        raise ModelResponseError(
+                            "Response stream ended without a response"
+                        )
+                    if response_field(completed_response, "status") is None:
+                        completed_response["status"] = event_type.removeprefix("response.")
+                    if event_type != "response.completed":
+                        validate_model_response(completed_response)
+                        raise ModelResponseError(
+                            f"Response stream ended with {event_type}"
+                        )
+                    break
+                elif event_type == "error":
+                    raise model_response_error(event, "Response stream failed")
 
-    if completed_response is None:
-        raise ModelResponseError("Response stream ended before completion")
-    output_items = response_field(completed_response, "output", [])
-    if not isinstance(output_items, (list, tuple)):
-        raise ModelResponseError("Model response output must be an array")
-    output_items = list(output_items)
-    for output_index, item in sorted(completed_items.items()):
-        if output_index > len(output_items):
-            raise ModelResponseError("Response stream is missing output items")
-        if output_index == len(output_items):
-            output_items.append(item)
-        else:
-            output_items[output_index] = item
-    completed_response["output"] = output_items
-    validate_model_response(completed_response)
-    usage = usage_to_dict(response_field(completed_response, "usage"))
-    streamed_text = "".join(chunks)
-    response_text = response_output_text(completed_response)
-    if response_text:
-        if emit is not None and response_text != streamed_text:
-            if not response_text.startswith(streamed_text):
-                raise ModelResponseError(
-                    "Response stream text differs from the completed response"
-                )
-            emit(response_text[len(streamed_text):])
-        streamed_text = response_text
-    return streamed_text, usage, completed_response
+        if completed_response is None:
+            raise ModelResponseError("Response stream ended before completion")
+        output_items = response_field(completed_response, "output", [])
+        if not isinstance(output_items, (list, tuple)):
+            raise ModelResponseError("Model response output must be an array")
+        output_items = list(output_items)
+        for output_index, item in sorted(completed_items.items()):
+            if output_index > len(output_items):
+                raise ModelResponseError("Response stream is missing output items")
+            if output_index == len(output_items):
+                output_items.append(item)
+            else:
+                output_items[output_index] = item
+        completed_response["output"] = output_items
+        validate_model_response(completed_response)
+        usage = usage_to_dict(response_field(completed_response, "usage"))
+        streamed_text = "".join(chunks)
+        response_text = response_output_text(completed_response)
+        if response_text:
+            if emit is not None and response_text != streamed_text:
+                if not response_text.startswith(streamed_text):
+                    raise ModelResponseError(
+                        "Response stream text differs from the completed response"
+                    )
+                emit(response_text[len(streamed_text):])
+            streamed_text = response_text
+        return streamed_text, usage, completed_response
+    finally:
+        if response_logger is not None and (
+            completed_response is not None or completed_items or chunks
+        ):
+            logged_response = dict(completed_response or {})
+            output_items = response_field(logged_response, "output", [])
+            logged_items = (
+                dict(enumerate(output_items))
+                if isinstance(output_items, (list, tuple))
+                else {}
+            )
+            logged_items.update(completed_items)
+            logged_response["output"] = [
+                item for _, item in sorted(logged_items.items())
+            ]
+            response_logger(
+                response_log_text(logged_response) or "".join(chunks),
+                response_reasoning_text(logged_response),
+            )
 
 
 
@@ -11864,6 +12089,7 @@ def run_tree_mode(
     log_enabled: bool,
     log_path: Path | None,
     tree_session_stem: str = "",
+    agent_backup: AgentBackup | None = None,
 ) -> int:
     retry = parse_retry_count(model_settings.retry)
     model = model_settings.model
@@ -12010,16 +12236,30 @@ def run_tree_mode(
         output_path = tree_session_dir / relative_path
         request_characters = 0
         request_tokens = 0
-        request_cost_log = ""
         full_system_prompt = ""
         user_prompt = ""
         result = ""
+        response_text = ""
+        reasoning = ""
         usage: dict[str, Any] | None = None
-        response_obj: Any = None
         error_text: str | None = None
         error_type: str = "none"
         selected_task = task
         request_timer = ModelRequestTimer()
+
+        def log_response(text: str, response_reasoning: str) -> None:
+            nonlocal response_text, reasoning
+            response_text = text
+            reasoning = response_reasoning
+            append_tree_log(
+                f"<tree_file path={quote_tag_attribute(file_path)}>\n"
+                f"{format_model_response_log(text, response_reasoning)}"
+                "</tree_file>\n"
+            )
+
+        if agent_backup is not None:
+            with state_turn_lock:
+                agent_backup.run_if_due()
         try:
             (
                 selected_task, full_system_prompt, user_prompt,
@@ -12041,7 +12281,8 @@ def run_tree_mode(
                 system_prompt=full_system_prompt,
                 user_prompt=user_prompt,
             )
-            request_characters = len(full_system_prompt + user_prompt)
+            request_text = format_request_text(full_system_prompt, user_prompt)
+            request_characters = len(request_text)
             request_cost_log = request_cost_estimate_log(
                 token_cost, request_tokens
             )
@@ -12049,6 +12290,16 @@ def run_tree_mode(
                 raise ValueError(
                     f"Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})"
                 )
+            append_tree_log(
+                f"<tree_file path={quote_tag_attribute(file_path)}>\n"
+                "<tree_request_stats>\n"
+                f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
+                f"reasoning={model_settings.openai_reasoning} reasoning_mode={model_settings.reasoning_mode} "
+                f"max_output_tokens={model_settings.max_output_tokens} api_log={model_settings.api_log} timeout={model_settings.llm_timeout}\n"
+                "</tree_request_stats>\n"
+                f"<request>\n{request_text}\n</request>\n"
+                "</tree_file>\n"
+            )
             response_obj, usage = call_model(
                 model_settings,
                 full_system_prompt,
@@ -12058,6 +12309,7 @@ def run_tree_mode(
                 retry=0,
                 report_errors=False,
                 request_timer=request_timer,
+                response_logger=log_response,
             )
             result = response_output_text(response_obj)
             if not result.strip():
@@ -12082,7 +12334,6 @@ def run_tree_mode(
             else:
                 error_type = "perm"
         elapsed = request_timer.elapsed()
-        reasoning = response_reasoning_text(response_obj) if response_obj is not None else ""
         stored_result = result
         if not stored_result:
             stored_result = f"ERROR: {error_text}" if error_text else ""
@@ -12114,24 +12365,15 @@ def run_tree_mode(
             request_characters=request_characters,
             request_tokens=request_tokens,
             processing_time=elapsed,
-            response_text=stored_result,
+            response_text=response_text,
             usage=usage,
             response_cost=response_cost,
         )
         if log_enabled:
             append_tree_log(
                 f"<tree_file path={quote_tag_attribute(file_path)}>\n"
-                "<tree_request_stats>\n"
-                f"request_characters={request_characters} request_tokens_estimate={request_tokens}{request_cost_log} model={model} "
-                f"reasoning={model_settings.openai_reasoning} reasoning_mode={model_settings.reasoning_mode} "
-                f"max_output_tokens={model_settings.max_output_tokens} api_log={model_settings.api_log} timeout={model_settings.llm_timeout}\n"
-                "</tree_request_stats>\n"
-                f"<system_prompt>\n{full_system_prompt}\n</system_prompt>\n"
-                f"<user_prompt>\n{user_prompt}\n</user_prompt>\n"
-                + (f"<reasoning>\n{reasoning}\n</reasoning>\n" if reasoning else "")
                 + (f"<error>{error_text}</error>\n" if error_text else "")
-                + f"<response>\n{stored_result}\n</response>\n"
-                f"<response_stats>\n{statsline}\n</response_stats>\n"
+                + f"<response_stats>\n{statsline}\n</response_stats>\n"
                 f"<end_time>{time.ctime(int(time.time()))} [{int(time.time())}]</end_time>\n"
                 "</tree_file>\n"
             )
@@ -12287,6 +12529,12 @@ def parse_args() -> argparse.Namespace:
         description="mce: Minimal Context Engine"
     )
 
+    parser.add_argument(
+        "--chdir",
+        metavar="PATH",
+        help="Change to PATH before any work or requested files are loaded",
+    )
+
     ask_group = parser.add_mutually_exclusive_group()
     ask_group.add_argument(
         "-a",
@@ -12354,6 +12602,28 @@ def parse_args() -> argparse.Namespace:
             "confirming and outputting each call before execution; patches "
             "overwrite source files unless --patch-suffix is specified. Conflicting "
             "standalone patch and shell options are ignored"
+        ),
+    )
+
+    parser.add_argument(
+        "--agent-backup",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Back up the working directory before work with cp --reflink=auto "
+            "(default destination: ../.mce-agent-backup)"
+        ),
+    )
+
+    parser.add_argument(
+        "--agent-backup-interval",
+        metavar="MINUTES",
+        type=float,
+        help=(
+            "Real-time minutes between backups, checked before each turn "
+            "(0 for every turn; default: 12)"
         ),
     )
 
@@ -13496,7 +13766,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     SESSION_NAME = None
 
     args = parse_args()
-    ensure_config_exists()
+    if args.chdir is not None:
+        change_working_directory(args.chdir)
 
     if args.profile is not None:
         if not args.profile.isidentifier():
@@ -13513,6 +13784,43 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if args.noninteractive:
         args.log = True
         args.quiet = True
+
+    startup_config = merged_config(write_updates=False)
+    if args.chdir is None:
+        change_working_directory(startup_config["chdir"])
+    if resolve_bool_option(args.quiet, startup_config, "quiet"):
+        VERBOSE = 0
+    backup_setting = parse_config_value(
+        "agent_backup",
+        resolve_config_option(
+            args.agent_backup, startup_config, "agent_backup",
+            DEFAULT_CONFIG["agent_backup"],
+        ),
+    )
+    backup_interval = parse_config_value(
+        "agent_backup_interval",
+        resolve_config_option(
+            args.agent_backup_interval,
+            startup_config,
+            "agent_backup_interval",
+            DEFAULT_CONFIG["agent_backup_interval"],
+        ),
+    )
+    agent_backup: AgentBackup | None = None
+    if backup_setting is not None:
+        source_dir = Path.cwd()
+        backup_dir = (
+            Path(backup_setting).expanduser()
+            if backup_setting
+            else source_dir.parent / ".mce-agent-backup"
+        ).resolve()
+        agent_backup = AgentBackup(
+            source_dir=source_dir,
+            backup_dir=backup_dir,
+            interval_minutes=backup_interval,
+        )
+        agent_backup.run_if_due()
+    ensure_config_exists()
 
     if args.shell_session_print_json is not None:
         return handle_shell_session_print_json(
@@ -14478,7 +14786,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         response_json_repair=response_json_repair,
     )
 
-    log_enabled = not args.estimate_only and (tree_mode or config["log"])
+    log_enabled = not args.estimate_only and config["log"]
     log_path = None
     session_timestamp = int(time.time())
     session_rand_part = "".join(random.choices(string.ascii_letters + string.digits, k=8))
@@ -14679,8 +14987,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         request_characters: int,
         request_tokens: int,
         request_cost_log: str,
-        request_system_prompt: str,
-        request_user_prompt: str,
+        request_text: str,
         include_model_settings: bool = False,
     ) -> None:
         request_stats = (
@@ -14696,26 +15003,18 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             )
         append_log(
             f"<request_stats>\n{request_stats}\n</request_stats>\n"
-            f"<request>\n"
-            f"<system_prompt>\n{request_system_prompt}\n</system_prompt>\n"
-            f"<user_prompt>\n{request_user_prompt}\n</user_prompt>\n"
-            "</request>\n"
+            f"<request>\n{request_text}\n</request>\n"
         )
 
     def log_model_response(
         response_text: str,
         reasoning: str,
-        statsline: str,
     ) -> None:
-        reasoning_block = (
-            f"<reasoning>\n{reasoning}\n</reasoning>\n"
-            if reasoning
-            else ""
-        )
+        append_log(format_model_response_log(response_text, reasoning))
+
+    def log_model_response_stats(statsline: str) -> None:
         timestamp = int(time.time())
         append_log(
-            f"{reasoning_block}"
-            f"<response>\n{response_text}\n</response>\n"
             f"<response_stats>\n{statsline}\n</response_stats>\n"
             f"<end_time>{time.ctime(timestamp)} [{timestamp}]</end_time>\n"
         )
@@ -14860,6 +15159,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             log_enabled=log_enabled,
             log_path=log_path,
             tree_session_stem=tree_session_stem,
+            agent_backup=agent_backup,
         )
 
     context_sections: list[tuple[str, str]] = []
@@ -14969,6 +15269,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         cumulative_stats.log_enabled = log_enabled
 
     if plan_mode:
+        if agent_backup is not None and not args.estimate_only:
+            agent_backup.run_if_due()
         plan_system_base = (
             agent_worker_system_prompt if agent_mode else system_prompt
         )
@@ -15000,7 +15302,10 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         if args.estimate_only:
             print(plan_request_tokens)
             return 0
-        plan_request_characters = len(plan_full_system_prompt + plan_user_prompt)
+        plan_request_text = format_request_text(
+            plan_full_system_prompt, plan_user_prompt
+        )
+        plan_request_characters = len(plan_request_text)
         plan_request_cost_log = request_cost_estimate_log(
             token_cost, plan_request_tokens
         )
@@ -15020,8 +15325,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         append_log(
             "<plan_request>\n"
             f"<plan_request_stats>\n{plan_turn_log}request_characters={plan_request_characters} request_tokens_estimate={plan_request_tokens}{plan_request_cost_log} model={model} reasoning={openai_reasoning} reasoning_mode={reasoning_mode}\n</plan_request_stats>\n"
-            f"<system_prompt>\n{plan_full_system_prompt}\n</system_prompt>\n"
-            f"<user_prompt>\n{plan_user_prompt}\n</user_prompt>\n"
+            f"<request>\n{plan_request_text}\n</request>\n"
             "</plan_request>\n"
         )
         if VERBOSE:
@@ -15037,6 +15341,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 response_format="text",
                 error_logger=append_log,
                 request_timer=plan_request_timer,
+                response_logger=lambda response_text, reasoning: append_log(
+                    format_model_response_log(
+                        response_text, reasoning, "plan_response"
+                    )
+                ),
                 reasoning_items=reasoning_items,
             )
             plan_result = response_output_text(plan_response_obj).strip()
@@ -15050,6 +15359,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             state_turn += 1
         except Exception as exc:
             append_state_response_error(plan_state_turn_path, exc)
+            append_log(
+                "<plan_response_error>\n"
+                f"{format_exception_message(exc)}\n"
+                "</plan_response_error>\n"
+            )
             report_request_error(exc)
             return 1
         finally:
@@ -15062,13 +15376,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             request_characters=plan_request_characters,
             request_tokens=plan_request_tokens,
             processing_time=plan_elapsed,
-            response_text=plan_result,
+            response_text=response_log_text(plan_response_obj),
             usage=plan_usage,
             response_cost=plan_response_cost,
             turn=int(plan_state_turn_path.name) if agent_mode else None,
         )
         append_log(
-            f"<plan_response>\n{plan_result}\n</plan_response>\n"
             f"<plan_response_stats>\n{plan_statsline}\n</plan_response_stats>\n"
         )
         if args.noninteractive:
@@ -15189,6 +15502,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             refresh_initial_file_contexts=(
                 args.files is not None or args.files_list is not None
             ),
+            agent_backup=agent_backup,
             cumulative_stats=cumulative_stats,
         )
         if args.estimate_only:
@@ -15242,15 +15556,18 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     ) -> tuple[str, str, str]:
         nonlocal state_turn, state_turn_path, response_obj, stream_output_emitted
         nonlocal reasoning_items
+        if agent_backup is not None:
+            agent_backup.run_if_due()
         if request_tokens is None:
             request_tokens = estimate_request_tokens(
                 model=model,
                 system_prompt=request_system_prompt,
                 user_prompt=request_user_prompt,
             )
-        request_characters = len(
-            request_system_prompt + request_user_prompt
+        request_text = format_request_text(
+            request_system_prompt, request_user_prompt
         )
+        request_characters = len(request_text)
         request_cost_log = request_cost_estimate_log(
             token_cost, request_tokens
         )
@@ -15263,8 +15580,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             request_characters=request_characters,
             request_tokens=request_tokens,
             request_cost_log=request_cost_log,
-            request_system_prompt=request_system_prompt,
-            request_user_prompt=request_user_prompt,
+            request_text=request_text,
             include_model_settings=include_model_settings,
         )
         if VERBOSE and print_request_stats:
@@ -15326,11 +15642,14 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     retry=0,
                     report_errors=False,
                     request_timer=request_timer,
+                    response_logger=log_model_response,
                     reasoning_items=reasoning_items if state_enabled else None,
                 )
                 if stream:
                     response, usage, response_obj = consume_response_stream(
-                        response_obj, stream_sink
+                        response_obj,
+                        stream_sink,
+                        response_logger=log_model_response,
                     )
                 else:
                     response = response_output_text(response_obj)
@@ -15408,6 +15727,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         except Exception as exc:
             if request_state_path is not None:
                 append_state_response_error(request_state_path, exc)
+            append_log(
+                "<response_error>\n"
+                f"{format_exception_message(exc)}\n"
+                "</response_error>\n"
+            )
             raise
         finally:
             elapsed = request_timer.elapsed()
@@ -15421,17 +15745,15 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             usage=usage,
             response_cost=response_cost_line(token_cost, usage),
         )
-        log_model_response(
-            response_text=response,
-            reasoning=reasoning,
-            statsline=statsline,
-        )
+        log_model_response_stats(statsline)
         return response, reasoning, statsline
 
     if resume_reused_shell_turn:
         result = reused_shell_turn.response
         reasoning = reused_shell_turn.reasoning
         try:
+            if agent_backup is not None:
+                agent_backup.run_if_due()
             state_turn_path = start_state_turn(
                 state_session_dir,
                 state_turn,
@@ -15467,12 +15789,37 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 file=sys.stderr,
             )
             return 1
+        reused_request_characters = (
+            len(reused_request) if reused_request is not None else 0
+        )
+        reused_request_tokens = (
+            len(token_encoding_for_model(model).encode(reused_request))
+            if reused_request is not None
+            else 0
+        )
+        append_log(
+            f"<resumed_shell_turn path={quote_tag_attribute(reused_shell_turn.turn_dir)}>\n"
+        )
+        if reused_request is not None:
+            log_model_request(
+                request_characters=reused_request_characters,
+                request_tokens=reused_request_tokens,
+                request_cost_log="",
+                request_text=reused_request,
+            )
+        else:
+            append_log(
+                "<request_unavailable>Saved shell turn has no request text.</request_unavailable>\n"
+            )
+        log_model_response(result, reasoning)
         statsline = print_stats(
-            request_characters=len(full_system_prompt + user_prompt),
-            request_tokens=request_tokens,
+            request_characters=reused_request_characters,
+            request_tokens=reused_request_tokens,
             processing_time=0.0,
             response_text=result,
         )
+        log_model_response_stats(statsline)
+        append_log("</resumed_shell_turn>\n")
     else:
         try:
             result, reasoning, statsline = request_model_turn(
@@ -15754,19 +16101,24 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     shell_trace=shell_trace,
                     turn_dir=state_turn_path,
                 )
-                if state_turn_path is not None:
-                    try:
-                        write_state_artifact(
-                            state_turn_path,
-                            "response_shell_output_0",
-                            shell_output,
-                        )
-                    except Exception as exc:
-                        print(f"ERROR: Failed to save shell output: {exc}", file=sys.stderr)
-                        return 1
             else:
                 shell_output = pending_reused_shell_output
                 pending_reused_shell_output = None
+            append_log(
+                f"<shell_execution reused='{str(not shell_output_is_new).lower()}'>\n"
+                f"{shell_output}\n"
+                "</shell_execution>\n"
+            )
+            if shell_output_is_new and state_turn_path is not None:
+                try:
+                    write_state_artifact(
+                        state_turn_path,
+                        "response_shell_output_0",
+                        shell_output,
+                    )
+                except Exception as exc:
+                    print(f"ERROR: Failed to save shell output: {exc}", file=sys.stderr)
+                    return 1
 
             if VERBOSE:
                 print("<shell_execution>", file=sys.stderr)
