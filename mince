@@ -3677,7 +3677,7 @@ class ConfigurationScreen(NcursesForm):
         "stream": "Stream text responses as they are generated.",
         "response_verbosity": "Verbosity level for text responses.",
         "llm_timeout": "API timeout in seconds; must be positive.",
-        "retry": "Number of additional transient API retries.",
+        "retry": "Maximum attempts for transient API failures; 0 or 1 disables retries.",
         "extra_body": "Custom model parameters as key=value pairs or a JSON object.",
         "log": "Log sessions to ~/.local/state/mince/logs.",
         "api_log": "Store logs within the OpenAI-compatible API.",
@@ -3775,7 +3775,8 @@ class ConfigurationScreen(NcursesForm):
 def init_config_interactive() -> None:
     if NONINTERACTIVE:
         raise ValueError(
-            "--init and --init-profile cannot be used with --noninteractive"
+            "--init, --init-profile, and --edit-profile cannot be used "
+            "with --noninteractive"
         )
     ensure_writable_config_path(CONFIG_FILE)
     screen = ConfigurationScreen(CONFIG_FILE)
@@ -3922,31 +3923,19 @@ def handle_show_profiles(
 def handle_session_view(view_type: str, session_name: str) -> int:
     view_specs = {
         "log": ("logs", ".txt"),
-        "patch": ("patches", ".patch"),
         "tree": ("trees", ".md"),
     }
     try:
         session_name = validate_session_name(session_name)
         directory, suffix = view_specs[view_type]
-        state_session_dir = STATE_DIR / session_name
-        if view_type == "patch" and state_session_dir.is_dir():
-            turn_dir = last_completed_state_turn(
-                state_session_dir,
-                required_file="response_diff_patch",
-            )
-            paths = state_turn_artifact_paths(turn_dir, "response_diff_patch")
-        else:
-            paths = [
-                APP_DIR / "trees" / session_name / f"{session_name}.md"
-                if view_type == "tree"
-                else APP_DIR / directory / f"{session_name}{suffix}"
-            ]
-        for path in paths:
-            if not path.is_file():
-                raise ValueError(f"session file does not exist: {path}")
-        page_or_print(
-            "\n".join(path.read_text(encoding="utf-8") for path in paths)
+        path = (
+            APP_DIR / directory / session_name / f"{session_name}{suffix}"
+            if view_type == "tree"
+            else APP_DIR / directory / f"{session_name}{suffix}"
         )
+        if not path.is_file():
+            raise ValueError(f"session file does not exist: {path}")
+        page_or_print(path.read_text(encoding="utf-8"))
     except Exception as exc:
         print(
             f"ERROR: Failed to view {view_type} session: {exc}",
@@ -5945,7 +5934,7 @@ def resolve_runtime_config(
     for name, default in DEFAULT_CONFIG.items():
         override = (
             getattr(args, name, None)
-            if name not in ("api_key", "files", "line_numbers", "api_log")
+            if name not in ("api_key", "files", "line_numbers")
             else None
         )
         resolved_config[name] = resolve_config_option(
@@ -5953,9 +5942,6 @@ def resolve_runtime_config(
         )
     if args.no_line_numbers is not None:
         resolved_config["line_numbers"] = not args.no_line_numbers
-    resolved_config["api_log"] = resolve_config_option(
-        args.no_api_log, config, "api_log", DEFAULT_CONFIG["api_log"]
-    )
     if args.model is not None and args.token_cost is None:
         resolved_config["token_cost"] = "off"
     if (
@@ -6835,7 +6821,7 @@ class ModelSettings:
     llm_timeout: int
     safety_identifier: Any
     api_log: bool
-    retry: int = 2
+    retry: int = DEFAULT_CONFIG["retry"]
     explicit_prompt_cache: bool = False
     response_json_repair: bool = False
  
@@ -11428,15 +11414,15 @@ def execute_openai_request(
     retry_if: Callable[[BaseException], bool] | None = None,
     report_errors: bool = True,
 ) -> Any:
-    retry_count = parse_retry_count(retry)
+    retry_count = max(1, parse_retry_count(retry))
     if retry_if is None:
         retry_if = _is_openai_temp_error
-    for failed_retries in range(retry_count + 1):
+    for failed_retries in range(retry_count):
         try:
             return operation()
         except Exception as exc:
             should_retry = (
-                failed_retries < retry_count and retry_if(exc)
+                failed_retries + 1 < retry_count and retry_if(exc)
             )
             delay_seconds = min(
                 2 ** (failed_retries - 1), API_RETRY_MAX_DELAY_SECONDS
@@ -11444,7 +11430,7 @@ def execute_openai_request(
             retry_delay = f" +{delay_seconds}s" if should_retry else ""
             failure_message = (
                 f"ERROR: {operation_name} failed "
-                f"({failed_retries + 1}/{retry_count + 1}{retry_delay}): "
+                f"({failed_retries + 1}/{retry_count}{retry_delay}): "
                 f"{format_exception_message(exc)}"
             )
             if report_errors:
@@ -11532,7 +11518,7 @@ def call_openai(
     reasoning_mode: str | None = None,
     extra_body: dict[str, Any] | None = None,
     llm_timeout: int | None = None,
-    retry: int = 2,
+    retry: int = DEFAULT_CONFIG["retry"],
     safety_identifier: str | None = None,
     store: bool = True,
     stream: bool = False,
@@ -12190,7 +12176,7 @@ def run_tree_mode(
     tree_session_stem: str = "",
     agent_backup: AgentBackup | None = None,
 ) -> int:
-    retry = parse_retry_count(model_settings.retry)
+    retry = max(1, parse_retry_count(model_settings.retry))
     model = model_settings.model
     log_lock = threading.Lock()
     db_lock = threading.Lock()
@@ -12309,11 +12295,11 @@ def run_tree_mode(
         failed_attempt = failed_retries[rel]
         failure_message = (
             f"ERROR: Tree file {rel} failed "
-            f"(attempt {failed_attempt}/{retry + 1}): {error_text}"
+            f"(attempt {failed_attempt}/{retry}): {error_text}"
         )
         print(failure_message, file=sys.stderr)
         _log_api_request_event(append_tree_log, failure_message)
-        if failed_attempt > retry:
+        if failed_attempt >= retry:
             set_status(rel, f"temp_error_exhausted:{error_text}")
             return False
         return True
@@ -13373,7 +13359,10 @@ def parse_args() -> argparse.Namespace:
         "--retry",
         metavar="COUNT",
         type=parse_retry_count,
-        help="Additional retries for transient API failures (default: 2)",
+        help=(
+            "Maximum attempts for transient API failures "
+            f"(default: {DEFAULT_CONFIG['retry']}; 0 or 1 disables retries)"
+        ),
     )
 
     parser.add_argument(
@@ -13468,13 +13457,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--no-api-log",
+        "--api-log",
         nargs="?",
-        const=False,
+        const=True,
         default=None,
         type=parse_bool,
         metavar="BOOL",
-        help="Do not store requests and responses in the OpenAI API",
+        help="Store requests and responses in the OpenAI API (default: on)",
     )
 
     parser.add_argument(
@@ -13502,6 +13491,7 @@ def parse_args() -> argparse.Namespace:
 
     profile_action_group.add_argument(
         "--init-profile",
+        "--edit-profile",
         metavar="NAME",
         help="Initialize or edit a configuration profile in the terminal interface",
     )
@@ -13705,8 +13695,11 @@ def parse_args() -> argparse.Namespace:
 
     session_view_group.add_argument(
         "--patch-view",
-        metavar="SESSION",
-        help="Display a saved patch session",
+        dest="patch_file_print",
+        nargs="+",
+        metavar=("SESSION|PATH", "TURN"),
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
     )
 
     session_view_group.add_argument(
@@ -13755,7 +13748,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.noninteractive and (args.init or args.init_profile is not None):
         parser.error(
-            "--init and --init-profile cannot be used with --noninteractive"
+            "--init, --init-profile, and --edit-profile cannot be used "
+            "with --noninteractive"
         )
     if args.apikey_from_fd is not None and args.apikey_from_fd < 0:
         parser.error("--apikey-from-fd requires a non-negative file descriptor")
@@ -13781,6 +13775,7 @@ def parse_args() -> argparse.Namespace:
         ("--reuse-session", "--resume-session"),
         ("--reuse-session-skip-verify", "--resume-session-skip-verify"),
         ("--tree-reuse-session", "--resume-session"),
+        ("--patch-view", "--patch-file-print"),
     ):
         if any(
             argument.split("=", 1)[0] == deprecated
@@ -14026,7 +14021,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             ("--patch-merge", args.patch_merge is not None),
             ("--remove-expired-data", args.remove_expired_data is not None),
             ("--log-view", args.log_view is not None),
-            ("--patch-view", args.patch_view is not None),
             ("--tree-view", args.tree_view is not None),
             ("--init", args.init),
             ("--init-profile", args.init_profile is not None),
@@ -14162,8 +14156,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
 
     if args.log_view is not None:
         return handle_session_view("log", args.log_view)
-    if args.patch_view is not None:
-        return handle_session_view("patch", args.patch_view)
     if args.tree_view is not None:
         return handle_session_view("tree", args.tree_view)
 
