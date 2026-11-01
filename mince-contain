@@ -75,7 +75,7 @@ class WrapperOptions:
 
 def print_usage() -> None:
     print(
-        "Usage: mince-contain [CONTAINMENT_OPTIONS...] [--] "
+        "Usage: mcec [CONTAINMENT_OPTIONS...] [--] "
         "[MINCE_ARGS...]\n\n"
         "Run mce through a transient systemd user service. "
         "ProtectSystem makes the host filesystem read-only, PrivateTmp "
@@ -639,11 +639,17 @@ def resolve_agent_backup_directory(
     source_directory = resolve_working_directory(
         chdir_value or None, working_directory
     )
-    backup_directory = (
-        absolute_path(backup_value, source_directory)
-        if backup_value
-        else source_directory.parent / ".mce-agent-backup"
-    )
+    if backup_value:
+        grant = resolve_existing_grant(
+            backup_value, source_directory, "agent backup directory"
+        )
+        if not grant.source.is_dir():
+            raise ValueError(
+                f"agent backup path is not a directory: {backup_value}"
+            )
+        backup_directory = grant.destination
+    else:
+        backup_directory = source_directory.parent / ".mce-agent-backup"
     if path_is_below(backup_directory.resolve(), source_directory):
         raise ValueError(
             "agent backup directory must be outside the working directory"
@@ -1075,7 +1081,7 @@ def main() -> int:
             trace_grant.source.touch(mode=0o600, exist_ok=False)
         os.execvpe(systemd_run, command, os.environ)
     except (OSError, ValueError) as exc:
-        print(f"mince-contain: {exc}", file=sys.stderr)
+        print(f"mcec: {exc}", file=sys.stderr)
         return 2
 
     return 0
