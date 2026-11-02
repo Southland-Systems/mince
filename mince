@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mince
+mce
 
 An assistant for turning local files into useful answers.
 """
@@ -180,12 +180,14 @@ AGENT_CONTEXT_ASSIST_SYSTEM_PROMPT = (
     "`summary` why the alternatives are untenable. Set "
     "`write_context_summary` to true when the controller should generate or "
     "refresh its durable context summary without requesting compaction; "
-    "otherwise set it to false. Existing compaction requirements still apply. Set "
+    "otherwise set it to false. Set "
     "`clear_stale_summary` to true when `<agent_context_summary>` contains "
     "obsolete or contradicted guidance that should be removed, and explain "
     "the evidence in `summary`; otherwise set it to false. This clears the "
     "reviewed context summary, not current files, history, or your new "
-    "assist guidance. Do not return ordinary text."
+    "assist guidance. A clear request cancels pending compaction and summary "
+    "requests and does not generate a replacement summary. Do not return "
+    "ordinary text."
 )
 AGENT_TASK_PRIORITY_SYSTEM_PROMPT = (
     "The `<meta_task_list>` defines the current work priorities. Prefer its "
@@ -6915,7 +6917,9 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
                     "Clear the reviewed agent_context_summary when it contains "
                     "obsolete or contradicted guidance. Explain the evidence in "
                     "summary; otherwise set false. Current files, history, and "
-                    "any newer context summary are retained."
+                    "any newer context summary are retained. A clear request cancels "
+                    "pending compaction and summary requests without generating a "
+                    "replacement."
                 ),
             },
         },
@@ -7690,20 +7694,32 @@ def append_agent_patch_readfile_tool_calls(
     tool_calls: list[AgentToolCall],
 ) -> list[AgentToolCall]:
     appended_tool_calls: list[AgentToolCall] = []
+    patch_paths: set[Path] = set()
     for index, tool_call in enumerate(tool_calls, start=1):
-        appended_tool_calls.append(tool_call)
         if tool_call.tool != AGENT_PATCH_TOOL:
+            appended_tool_calls.append(tool_call)
             continue
         try:
             paths = agent_patch_readfile_paths(tool_call)
-            manifest = tool_call.arguments
-            if manifest is not None:
-                for _, file_entry in patch_manifest_documents(manifest):
-                    validate_patch_contents(file_entry["patches"])
+            documents = patch_manifest_documents(tool_call.arguments or {})
+            for _, file_entry in documents:
+                validate_patch_contents(file_entry["patches"])
         except ValueError as exc:
             raise AgentControllerResponseError(
                 f"agent tool call {index}: {exc}"
             ) from exc
+        document_paths = {path for path, _ in documents}
+        overlapping_paths = patch_paths.intersection(document_paths)
+        if overlapping_paths:
+            print(
+                f"WARNING: Removed overlapping agent patch tool call {index}; "
+                "paths already targeted by an earlier patch call: "
+                + ", ".join(str(path) for path in sorted(overlapping_paths)),
+                file=sys.stderr,
+            )
+            continue
+        patch_paths.update(document_paths)
+        appended_tool_calls.append(tool_call)
         appended_tool_calls.append(
             AgentToolCall(
                 tool=AGENT_READFILE_TOOL,
@@ -10942,18 +10958,25 @@ class AgentContextAssist:
         try:
             result = future.result()
             assist = json.loads(result.response)
+            clear_stale_summary = assist["clear_stale_summary"]
             self.settings.context_assist_summary = assist["summary"]
             self.settings.context_assist_require_compaction = (
-                self.settings.context_assist_require_compaction
-                or assist["require_compaction"]
+                not clear_stale_summary
+                and (
+                    self.settings.context_assist_require_compaction
+                    or assist["require_compaction"]
+                )
             )
             self.settings.context_assist_write_context_summary = (
-                self.settings.context_assist_write_context_summary
-                or assist["write_context_summary"]
+                not clear_stale_summary
+                and (
+                    self.settings.context_assist_write_context_summary
+                    or assist["write_context_summary"]
+                )
             )
             summary = self.settings.context_summary
             summary_cleared = bool(
-                assist["clear_stale_summary"]
+                clear_stale_summary
                 and summary is not None
                 and summary.content
                 and summary.content == request_summary_content
@@ -10975,10 +10998,12 @@ class AgentContextAssist:
                 self.settings,
                 format_agent_context_assist_report(
                     assist["summary"],
-                    assist["require_compaction"],
+                    self.settings.context_assist_require_compaction,
                     self.request_turn,
                     clear_stale_summary=summary_cleared,
-                    write_context_summary=assist["write_context_summary"],
+                    write_context_summary=(
+                        self.settings.context_assist_write_context_summary
+                    ),
                 ),
             )
         except Exception as exc:
@@ -11400,6 +11425,22 @@ def prepare_agent_context(
     )
 
 
+def prepare_agent_context_summary_request(
+    settings: AgentRunSettings,
+) -> bool:
+    if (
+        settings.context_assist_require_compaction
+        or settings.context_assist_write_context_summary
+    ):
+        settings.context_assist_summary = ""
+    summary = settings.context_summary
+    return settings.context_assist_write_context_summary or (
+        summary is not None
+        and bool(summary.content)
+        and summary.expires_in_turns <= 0
+    )
+
+
 def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
     controller_tools = agent_tool_schemas(
         settings.agent_profiles,
@@ -11410,13 +11451,7 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
         turns, file_contexts, file_expires_in_turns, pinned_paths,
         pinned_turn_numbers, context_summary, meta_task_list,
     ) = prepare_agent_context(settings)
-    refresh_summary = (
-        settings.context_assist_write_context_summary
-        or (
-            bool(context_summary.content)
-            and context_summary.expires_in_turns <= 0
-        )
-    )
+    refresh_summary = prepare_agent_context_summary_request(settings)
     (
         request_system_prompt, user_prompt, summary_token_budget, _,
     ) = build_agent_context_window_prompts(
@@ -11517,13 +11552,7 @@ def run_agent_controller(
         advance_expirations = True
         while True:
             context_assist.collect()
-            refresh_summary = (
-                settings.context_assist_write_context_summary
-                or (
-                    bool(context_summary.content)
-                    and context_summary.expires_in_turns <= 0
-                )
-            )
+            refresh_summary = prepare_agent_context_summary_request(settings)
             if settings.agent_backup is not None:
                 settings.agent_backup.run_if_due()
             hook_contents = run_agent_hook_context_scripts(
