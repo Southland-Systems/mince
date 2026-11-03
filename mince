@@ -2755,9 +2755,22 @@ def resolve_optional_string_setting(value: Any, name: str) -> str | None:
     return parsed
 
 
-def split_config_values(value: Any, separators: str = ":") -> list[Any]:
+def split_config_values(
+    value: Any,
+    separators: str = ":",
+    *,
+    split_items: bool = False,
+) -> list[Any]:
     if isinstance(value, (list, tuple)):
-        return list(value)
+        return [
+            part
+            for item in value
+            for part in (
+                split_config_values(item, separators)
+                if split_items and isinstance(item, str)
+                else [item]
+            )
+        ]
     if not isinstance(value, str):
         raise ValueError("expected space- or colon-separated values")
     lexer = shlex.shlex(value, posix=True)
@@ -4944,10 +4957,12 @@ def execute_shell_commands(
             process = subprocess.Popen(
                 step.command if use_shell else command,
                 shell=use_shell,
-                stdin=subprocess.PIPE if script_input is not None else None,
+                stdin=subprocess.PIPE if script_input is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env={**os.environ, **SHELL_PAGER_ENVIRONMENT},
                 start_new_session=os.name == "posix",
                 preexec_fn=preexec_fn,
@@ -5755,7 +5770,7 @@ def limit_shell_output_for_context(
 def parse_token_cost(value: Any) -> tuple[float, float] | None:
     if value is None:
         return None
-    parts = split_config_values(value)
+    parts = split_config_values(value, split_items=True)
     if (
         len(parts) == 1
         and isinstance(parts[0], str)
@@ -7413,8 +7428,8 @@ def normalize_agent_prompt_assist(value: Any) -> int | str:
 
 
 def parse_agent_context_expires(value: Any) -> tuple[int, int, int]:
-    parts = split_config_values(value)
-    if not isinstance(parts, (list, tuple)) or not 1 <= len(parts) <= 3:
+    parts = split_config_values(value, split_items=True)
+    if not 1 <= len(parts) <= 3:
         raise ValueError(
             "agent_context_expires requires DEFAULT [MIN] [MAX]"
         )
@@ -9074,6 +9089,7 @@ def refresh_agent_file_contexts(
         add_line_numbers=True,
         missing_file_expires_in_turns=settings.agent_context_expires[1],
         model=settings.model_settings.model,
+        token_limit=settings.token_limit,
     ))
     if not refreshed_sections:
         return
@@ -9083,11 +9099,13 @@ def refresh_agent_file_contexts(
         refreshed_section = refreshed_sections[path]
         attributes = agent_file_context_attributes(section) or {}
         refreshed_attributes = agent_file_context_attributes(refreshed_section) or {}
-        if refreshed_attributes.get("error") and not attributes.get("error"):
+        if refreshed_attributes.get("error"):
             file_expires_in_turns[path] = min(
                 file_expires_in_turns[path],
                 settings.agent_context_expires[1],
             )
+        elif attributes.get("error"):
+            file_expires_in_turns[path] = settings.agent_context_expires[0]
         file_contexts[index] = (path, refreshed_section)
     for turn_index, turn in enumerate(turns):
         if turn.purge_in_turns is not None or not turn.readfile_contexts:
@@ -9095,15 +9113,24 @@ def refresh_agent_file_contexts(
         refreshed_contexts: list[tuple[str, str]] = []
         for path, section in turn.readfile_contexts:
             refreshed_section = refreshed_sections.get(path, section)
-            attributes = agent_file_context_attributes(section) or {}
-            if path in refreshed_sections and "expires_in_turns" in attributes:
-                refreshed_section = agent_file_context_section(
-                    refreshed_section,
-                    coerce_int(
-                        attributes["expires_in_turns"], turn.expires_in_turns
-                    ),
-                    model=settings.model_settings.model,
-                )
+            if path in refreshed_sections:
+                attributes = agent_file_context_attributes(section) or {}
+                refreshed_attributes = agent_file_context_attributes(refreshed_section) or {}
+                if refreshed_attributes.get("error") or (
+                    "expires_in_turns" in attributes and not attributes.get("error")
+                ):
+                    expires_in_turns = coerce_int(
+                        attributes.get("expires_in_turns"), turn.expires_in_turns
+                    )
+                    if refreshed_attributes.get("error"):
+                        expires_in_turns = min(
+                            expires_in_turns, settings.agent_context_expires[1]
+                        )
+                    refreshed_section = agent_file_context_section(
+                        refreshed_section,
+                        expires_in_turns,
+                        model=settings.model_settings.model,
+                    )
             refreshed_contexts.append((path, refreshed_section))
         turns[turn_index] = replace(
             turn, readfile_contexts=tuple(refreshed_contexts)
@@ -14011,7 +14038,11 @@ def parse_args() -> argparse.Namespace:
         "--agent-context-expires",
         nargs="+",
         metavar="TURNS",
-        help="Set agent context expiry DEFAULT [MIN] [MAX] in turns (default: 12 6 24)",
+        help=(
+            "Set agent context expiry DEFAULT [MIN] [MAX] in turns, "
+            "separated by spaces or colons "
+            f"(default: {DEFAULT_CONFIG['agent_context_expires']})"
+        ),
     )
 
     parser.add_argument(
@@ -14326,8 +14357,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tree-system-prompt-file",
         metavar="FILE",
+        nargs="+",
+        action="extend",
         type=Path,
-        help="Per-extension system prompts (.ext:prompt, *:prompt, or an overall prompt; can be repeated)",
+        help="Read and combine per-extension system prompts from one or more files (.ext:prompt, *:prompt, or an overall prompt; may be repeated)",
     )
 
     parser.add_argument(
@@ -14641,8 +14674,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         metavar=("INPUT", "OUTPUT"),
         help=(
-            "Input and output cost per million tokens as two values "
-            "(or 'off' to disable)"
+            "Input and output cost per million tokens as two space- or "
+            "colon-separated values (or 'off' to disable)"
         ),
     )
 
