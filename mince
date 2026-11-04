@@ -13,9 +13,11 @@ import errno
 import socket
 import hashlib
 import argparse
+import base64
 import getpass
 import json
 import math
+import mimetypes
 import locale
 import unicodedata
 import sys
@@ -201,11 +203,13 @@ AGENT_PROMPT_ASSIST_SYSTEM_PROMPT = (
     "`linenum_system_prompt`, `shell_system_prompt`, and `patch_system_prompt` "
     "are worker components. The `tool_call_*` prompts govern controller tool "
     "calls; `agent_profile_*` entries are selected worker instructions and "
-    "tool descriptions. Task-priority, context-assist, and context-summary "
-    "prompts are also editable. "
-    "Use `<original_agent_system_prompts>`, when present, as the session-start "
-    "reference for prompts that have changed; restore original text when useful "
-    "and avoid accumulating contradictory instructions. Preserve user "
+    "tool descriptions. Task-priority, context-assist, context-summary, and "
+    "prompt-assist prompts are also editable; `prompt_assist_system_prompt` "
+    "governs this reviewer. "
+    "Use `<historical_agent_system_prompts>`, when present, as a reference "
+    "for up to five recently replaced prompts, ordered oldest to newest; "
+    "restore previous text when useful and avoid accumulating contradictory "
+    "instructions. Preserve user "
     "requirements, tool-call protocol, schemas, context-retention rules, "
     "and review and execution safeguards. Keep replacements concise and evidence-based. "
     "Return exactly one native `prompt_assist` tool call with a concise Markdown "
@@ -423,6 +427,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_file_size_kb": 512,
     "chdir": "",
     "files": "",
+    "images": "",
     "response_format": "text",
     "response_json_repair": "off",
     "stream": "off",
@@ -1108,6 +1113,28 @@ def last_completed_state_turn(
         f"state session has no completed turns: {state_session_dir}"
     )
 
+def last_resumable_agent_state_turn(
+    state_session_dir: Path,
+    turn: int | None = None,
+) -> Path:
+    candidates = [
+        (number, turn_dir)
+        for number, turn_dir in resumed_state_turn_directories(state_session_dir)
+        if (turn is None or number == turn)
+        and any(
+            path.is_file() and not path.is_symlink()
+            for path in (
+                turn_dir / "response",
+                turn_dir / "response_agent_runtime_state",
+                turn_dir / "request_agent_runtime_state",
+            )
+        )
+    ]
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
+    return last_completed_state_turn(state_session_dir, turn)
+
+
 STATE_SESSION_ARTIFACT = "request_files"
 STATE_META_TASK_LIST_ARTIFACT = "meta_task_list"
 STATE_RESUME_SESSION_ARTIFACT = "resume_session"
@@ -1124,6 +1151,8 @@ STATE_TURN_ARTIFACTS = (
     "request_task",
     "request_agent_turn_metadata",
     "response_agent_turn_metadata",
+    "request_agent_runtime_state",
+    "response_agent_runtime_state",
     "request_agent_context_summary",
     "response_agent_context_summary",
     "request_agent_context_assist_summary",
@@ -1680,7 +1709,12 @@ def write_state_artifact(
     artifact_name: str,
     content: str,
 ) -> None:
-    (state_directory / artifact_name).write_text(content, encoding="utf-8")
+    temporary_path = state_directory / f".{artifact_name}"
+    try:
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(state_directory / artifact_name)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def append_state_response_error(
@@ -1721,12 +1755,7 @@ def complete_state_turn(
  ) -> None:
     write_state_artifact(turn_dir, "response_reasoning", reasoning)
     write_state_reasoning_items(turn_dir, reasoning_items)
-    temporary_path = turn_dir / ".response"
-    try:
-        write_state_artifact(turn_dir, temporary_path.name, response)
-        temporary_path.replace(turn_dir / "response")
-    finally:
-        temporary_path.unlink(missing_ok=True)
+    write_state_artifact(turn_dir, "response", response)
 
 
 def write_state_patch_artifacts(
@@ -1748,8 +1777,6 @@ def write_state_agent_context_assist(
     settings: AgentRunSettings,
     artifact_prefix: str = "response",
 ) -> None:
-    if settings.agent_context_assist is None:
-        return
     write_state_artifact(
         state_directory,
         f"{artifact_prefix}_agent_context_assist_summary",
@@ -3872,6 +3899,10 @@ class ConfigurationScreen(NcursesForm):
         "token_cost": "Input and output cost per million tokens, separated by spaces or a colon; off disables estimates.",
         "max_file_size_kb": "Maximum context file size in KB.",
         "files": "Context file paths separated by spaces, colons, or |; quote paths containing separators.",
+        "images": (
+            "Image file paths separated by spaces, colons, or |; quote paths "
+            "containing separators. Sent as base64 without image processing."
+        ),
         "response_format": "Response format: text, JSON, or JSON Schema.",
         "response_json_repair": "Repair malformed JSON responses.",
         "stream": "Stream text responses as they are generated.",
@@ -3953,7 +3984,7 @@ class ConfigurationScreen(NcursesForm):
         if (
             field.name in (
                 "agent_backup", "agent_context_assist", "agent_prompt_assist",
-                "files", "token_cost",
+                "files", "images", "token_cost",
             )
             and isinstance(value, (list, tuple))
         ):
@@ -5916,6 +5947,44 @@ class CumulativeStats:
     log_enabled: bool = False
     costs: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
 
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "processing_time": self.processing_time,
+            "usage": self.usage.copy(),
+            "costs": self.costs,
+        }
+
+    def restore(self, value: Any) -> None:
+        if not isinstance(value, dict) or set(value) != {
+            "processing_time", "usage", "costs",
+        }:
+            raise ValueError("invalid saved cumulative statistics")
+        processing_time = parse_optional_float(value["processing_time"])
+        if processing_time is None or processing_time < 0:
+            raise ValueError("invalid saved cumulative processing time")
+        usage = value["usage"]
+        if (
+            not isinstance(usage, dict)
+            or not set(usage).issubset(RESPONSE_TOKEN_KEYS)
+            or any(
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                for count in usage.values()
+            )
+        ):
+            raise ValueError("invalid saved cumulative token usage")
+        costs = value["costs"]
+        if costs is not None:
+            if not isinstance(costs, (list, tuple)) or len(costs) != 3:
+                raise ValueError("invalid saved cumulative costs")
+            costs = tuple(parse_optional_float(cost) for cost in costs)
+            if any(cost is None or cost < 0 for cost in costs):
+                raise ValueError("invalid saved cumulative costs")
+        self.processing_time = processing_time
+        self.usage = usage.copy()
+        self.costs = costs
+
     def _add(
         self,
         processing_time: float,
@@ -6144,7 +6213,7 @@ def parse_config_value(name: str, value: Any) -> Any:
                 )
         elif name == "token_cost":
             value = parse_token_cost(value)
-        elif name == "files":
+        elif name in ("files", "images"):
             value = parse_config_files(value)
             if any("\x00" in path for path in value):
                 raise ValueError("paths cannot contain a null byte")
@@ -6508,6 +6577,18 @@ def resolve_context_file_paths(file_names: list[str]) -> list[Path]:
         Path(file_name) if file_name == "-" else Path(file_name).expanduser().resolve()
         for file_name in file_names
     ]
+
+
+def load_image_urls(file_paths: list[Path]) -> tuple[str, ...]:
+    image_urls: list[str] = []
+    for path in file_paths:
+        try:
+            base64_image = base64.b64encode(path.read_bytes()).decode("ascii")
+        except Exception as exc:
+            raise ValueError(f"cannot read image {path} ({exc})") from exc
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/webp"
+        image_urls.append(f"data:{mime_type};base64,{base64_image}")
+    return tuple(image_urls)
 
 
 def build_context_sections(
@@ -7069,6 +7150,7 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+AGENT_PROMPT_ASSIST_MAX_HISTORY = 5
 AGENT_PROMPT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "prompt_assist",
@@ -7242,6 +7324,14 @@ class ModelRequestSettings:
     token_limit: int
     token_cost: tuple[float, float] | None
 
+AGENT_BASE_SYSTEM_PROMPT_NAMES = (
+    "agent_system_prompt",
+    "worker_system_prompt",
+    "linenum_system_prompt",
+    "shell_system_prompt",
+    "patch_system_prompt",
+)
+
 
 @dataclass
 class AgentRunSettings:
@@ -7271,6 +7361,7 @@ class AgentRunSettings:
     agent_auto: bool
     print_reasoning: bool
     suppress_response_output: bool
+    image_urls: tuple[str, ...] = ()
     shell_timeout: int = 0
     shell_trace: bool = False
     agent_profiles: tuple[AgentProfile, ...] = ()
@@ -7293,23 +7384,31 @@ class AgentRunSettings:
     agent_prompt_assist: int | None = DEFAULT_AGENT_PROMPT_ASSIST_INTERVAL
     agent_prompt_assist_settings: ModelRequestSettings | None = None
     system_prompt_overrides: dict[str, str] = field(default_factory=dict)
-    original_system_prompts: dict[str, str] = field(default_factory=dict)
+    system_prompt_history: list[dict[str, str]] = field(default_factory=list)
     context_assist_summary: str = ""
     context_assist_require_compaction: bool = False
     context_assist_write_context_summary: bool = False
     context_assist_skip_next_interval: bool = False
     cumulative_stats: CumulativeStats = field(default_factory=CumulativeStats)
+    prior_token_estimates: list[tuple[int, int]] = field(default_factory=list)
+    pending_revision_instruction: str = ""
+    advance_expirations: bool = True
+    assist_last_turns: dict[str, int] = field(default_factory=dict)
+    pending_assists: dict[str, dict[str, Any]] = field(default_factory=dict)
+    runtime_state_checkpoint: Callable[[], None] | None = field(
+        default=None, repr=False
+    )
 
 
 def agent_system_prompts(settings: AgentRunSettings) -> dict[str, str]:
     prompts = {
-        "agent_system_prompt": settings.agent_system_prompt,
-        "worker_system_prompt": settings.worker_system_prompt,
-        "linenum_system_prompt": settings.linenum_system_prompt,
-        "shell_system_prompt": settings.shell_system_prompt,
-        "patch_system_prompt": settings.patch_system_prompt,
+        **{
+            name: getattr(settings, name)
+            for name in AGENT_BASE_SYSTEM_PROMPT_NAMES
+        },
         "task_priority_system_prompt": AGENT_TASK_PRIORITY_SYSTEM_PROMPT,
         "context_assist_system_prompt": AGENT_CONTEXT_ASSIST_SYSTEM_PROMPT,
+        "prompt_assist_system_prompt": AGENT_PROMPT_ASSIST_SYSTEM_PROMPT,
         "context_summary_system_prompt": AGENT_SUMMARY_INSTRUCTIONS,
         **AGENT_TOOL_CALL_SYSTEM_PROMPTS,
     }
@@ -7322,6 +7421,266 @@ def agent_system_prompts(settings: AgentRunSettings) -> dict[str, str]:
     })
     prompts.update(settings.system_prompt_overrides)
     return prompts
+
+def write_state_agent_runtime_state(
+    turn_dir: Path,
+    settings: AgentRunSettings,
+    artifact_prefix: str = "response",
+    turn_metadata: dict[str, Any] | None = None,
+) -> None:
+    state = {
+        "version": 1,
+        "turn_metadata": turn_metadata,
+        "prior_token_estimates": settings.prior_token_estimates,
+        "pending_revision_instruction": settings.pending_revision_instruction,
+        "advance_expirations": settings.advance_expirations,
+        "base_system_prompts": {
+            name: getattr(settings, name)
+            for name in AGENT_BASE_SYSTEM_PROMPT_NAMES
+        },
+        "system_prompt_overrides": settings.system_prompt_overrides,
+        "system_prompt_history": settings.system_prompt_history,
+        "cumulative_stats": settings.cumulative_stats.as_dict(),
+        "agent_profiles": [vars(profile) for profile in settings.agent_profiles],
+        "agent_profile_default": (
+            vars(settings.agent_profile_default)
+            if settings.agent_profile_default is not None
+            else None
+        ),
+        "agent_hook_context_scripts": settings.agent_hook_context_scripts,
+        "assist_last_turns": settings.assist_last_turns,
+        "pending_assists": settings.pending_assists,
+        "context_summary": (
+            settings.context_summary.as_dict()
+            if settings.context_summary is not None
+            else None
+        ),
+        "context_assist_summary": settings.context_assist_summary,
+        "context_assist_require_compaction": settings.context_assist_require_compaction,
+        "context_assist_write_context_summary": settings.context_assist_write_context_summary,
+        "context_assist_skip_next_interval": settings.context_assist_skip_next_interval,
+    }
+    if settings.context_summary is not None:
+        write_state_artifact(
+            turn_dir,
+            f"{artifact_prefix}_agent_context_summary",
+            json.dumps(settings.context_summary.as_dict(), ensure_ascii=False),
+        )
+    write_state_agent_context_assist(turn_dir, settings, artifact_prefix)
+    write_state_artifact(
+        turn_dir,
+        f"{artifact_prefix}_agent_runtime_state",
+        json.dumps(state, ensure_ascii=False, allow_nan=False),
+    )
+
+
+def parse_state_agent_profile(value: Any) -> AgentProfile:
+    fields = {"name", "profile_type", "content", "description"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or any(not isinstance(value[name], str) for name in fields)
+    ):
+        raise ValueError("invalid saved agent profile")
+    profile = AgentProfile(
+        name=validate_agent_profile_name(value["name"]),
+        profile_type=normalize_agent_profile_type(value["profile_type"]),
+        content=value["content"],
+        description=value["description"],
+    )
+    agent_profile_response_schema(profile)
+    return profile
+
+
+def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
+    for artifact_prefix in ("response", "request"):
+        artifact_path = turn_dir / f"{artifact_prefix}_agent_runtime_state"
+        artifact_text = read_optional_state_artifact(artifact_path)
+        if artifact_text is not None:
+            break
+    else:
+        return None
+
+    def is_integer(value: Any) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        )
+
+    try:
+        state = json.loads(artifact_text)
+        expected_fields = {
+            "version", "turn_metadata", "prior_token_estimates",
+            "pending_revision_instruction", "advance_expirations",
+            "base_system_prompts", "system_prompt_overrides",
+            "system_prompt_history", "cumulative_stats",
+            "agent_profiles", "agent_profile_default",
+            "agent_hook_context_scripts", "assist_last_turns",
+            "pending_assists", "context_summary", "context_assist_summary",
+            "context_assist_require_compaction",
+            "context_assist_write_context_summary",
+            "context_assist_skip_next_interval",
+        }
+        if (
+            not isinstance(state, dict)
+            or set(state) != expected_fields
+            or not is_integer(state["version"])
+            or state["version"] != 1
+        ):
+            raise ValueError("invalid fields or version")
+        if state["turn_metadata"] is not None and not isinstance(
+            state["turn_metadata"], dict
+        ):
+            raise ValueError("turn metadata must be an object")
+        for name in ("pending_revision_instruction", "context_assist_summary"):
+            if not isinstance(state[name], str):
+                raise ValueError(f"{name} must be a string")
+        for name in (
+            "advance_expirations", "context_assist_require_compaction",
+            "context_assist_write_context_summary",
+            "context_assist_skip_next_interval",
+        ):
+            if not isinstance(state[name], bool):
+                raise ValueError(f"{name} must be a boolean")
+        estimates = state["prior_token_estimates"]
+        if (
+            not isinstance(estimates, list)
+            or len(estimates) > AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS
+            or any(
+                not isinstance(entry, list)
+                or len(entry) != 2
+                or any(not is_integer(value) for value in entry)
+                for entry in estimates
+            )
+        ):
+            raise ValueError("invalid token estimate history")
+        estimate_turns = [entry[0] for entry in estimates]
+        if estimate_turns != sorted(set(estimate_turns)):
+            raise ValueError("token estimate turns must be unique and ordered")
+        for name in ("base_system_prompts", "system_prompt_overrides"):
+            prompts = state[name]
+            if not isinstance(prompts, dict) or any(
+                not isinstance(key, str) or not key
+                or not isinstance(content, str)
+                for key, content in prompts.items()
+            ):
+                raise ValueError(f"invalid {name}")
+        if set(state["base_system_prompts"]) != set(AGENT_BASE_SYSTEM_PROMPT_NAMES):
+            raise ValueError("invalid base system prompt inventory")
+        history = state["system_prompt_history"]
+        if (
+            not isinstance(history, list)
+            or len(history) > AGENT_PROMPT_ASSIST_MAX_HISTORY
+            or any(
+                not isinstance(entry, dict)
+                or set(entry) != {"name", "content"}
+                or not isinstance(entry["name"], str) or not entry["name"]
+                or not isinstance(entry["content"], str)
+                for entry in history
+            )
+        ):
+            raise ValueError("invalid system prompt history")
+        profiles = state["agent_profiles"]
+        if not isinstance(profiles, list):
+            raise ValueError("agent profiles must be an array")
+        profile_names = [parse_state_agent_profile(profile).name for profile in profiles]
+        if len(set(profile_names)) != len(profile_names):
+            raise ValueError("saved agent profile names must be unique")
+        if state["agent_profile_default"] is not None:
+            parse_state_agent_profile(state["agent_profile_default"])
+        scripts = state["agent_hook_context_scripts"]
+        if not isinstance(scripts, list) or any(
+            not isinstance(script, str) or not script or "\x00" in script
+            for script in scripts
+        ):
+            raise ValueError("invalid agent hook context scripts")
+        last_turns = state["assist_last_turns"]
+        if (
+            not isinstance(last_turns, dict)
+            or not set(last_turns).issubset(("context", "prompt"))
+            or any(not is_integer(turn) for turn in last_turns.values())
+        ):
+            raise ValueError("invalid assist scheduling state")
+        pending = state["pending_assists"]
+        if not isinstance(pending, dict) or not set(pending).issubset(
+            ("context", "prompt")
+        ):
+            raise ValueError("invalid pending assists")
+        for entry in pending.values():
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"session_name", "turn"}
+                or not isinstance(entry["session_name"], str)
+                or not is_integer(entry["turn"])
+            ):
+                raise ValueError("invalid pending assist request")
+            if validate_session_name(entry["session_name"]) != entry["session_name"]:
+                raise ValueError("invalid pending assist session name")
+        if state["context_summary"] is not None:
+            parse_state_agent_context_summary(state["context_summary"], artifact_path)
+        CumulativeStats().restore(state["cumulative_stats"])
+        json.dumps(state, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError(
+            f"invalid saved agent runtime state: {artifact_path} ({exc})"
+        ) from exc
+    return state
+
+
+def restore_agent_runtime_state(
+    settings: AgentRunSettings,
+    state: dict[str, Any],
+    *,
+    restore_profiles: bool = True,
+    restore_default_profile: bool = True,
+    restore_hook_context_scripts: bool = True,
+    prompt_overrides: dict[str, str] | None = None,
+) -> None:
+    if restore_profiles:
+        settings.agent_profiles = tuple(
+            parse_state_agent_profile(profile)
+            for profile in state["agent_profiles"]
+        )
+    if restore_default_profile:
+        settings.agent_profile_default = (
+            parse_state_agent_profile(state["agent_profile_default"])
+            if state["agent_profile_default"] is not None
+            else None
+        )
+    agent_tool_schemas(
+        settings.agent_profiles,
+        default_profile=settings.agent_profile_default,
+    )
+    if restore_hook_context_scripts:
+        settings.agent_hook_context_scripts = tuple(state["agent_hook_context_scripts"])
+    for name, content in state["base_system_prompts"].items():
+        setattr(settings, name, content)
+    available_prompts = agent_system_prompts(
+        replace(settings, system_prompt_overrides={})
+    )
+    settings.system_prompt_overrides = {
+        name: content
+        for name, content in state["system_prompt_overrides"].items()
+        if name in available_prompts
+    }
+    settings.system_prompt_overrides.update(prompt_overrides or {})
+    settings.system_prompt_history = [
+        entry.copy() for entry in state["system_prompt_history"]
+    ]
+    settings.prior_token_estimates = [
+        tuple(entry) for entry in state["prior_token_estimates"]
+    ]
+    settings.pending_revision_instruction = state["pending_revision_instruction"]
+    settings.advance_expirations = state["advance_expirations"]
+    settings.assist_last_turns = state["assist_last_turns"].copy()
+    settings.pending_assists = {
+        name: entry.copy() for name, entry in state["pending_assists"].items()
+    }
+    saved_stats = CumulativeStats()
+    saved_stats.restore(state["cumulative_stats"])
+    settings.cumulative_stats.merge(saved_stats)
+
 
 
 def agent_controller_tool_call_instructions(settings: AgentRunSettings) -> str:
@@ -9309,6 +9668,29 @@ class ReusedAgentHistory:
     context_assist_write_context_summary: bool = False
     context_assist_skip_next_interval: bool = False
     turn_metadata: dict[str, Any] | None = None
+    runtime_state: dict[str, Any] | None = None
+
+
+def reused_agent_runtime_history(
+    history: ReusedAgentHistory,
+    runtime_state: dict[str, Any] | None,
+) -> ReusedAgentHistory:
+    if runtime_state is None:
+        return history
+    summary = runtime_state["context_summary"]
+    return replace(
+        history,
+        context_summary=(
+            parse_state_agent_context_summary(summary, Path("agent_runtime_state"))
+            if summary is not None
+            else None
+        ),
+        context_assist_summary=runtime_state["context_assist_summary"],
+        context_assist_require_compaction=runtime_state["context_assist_require_compaction"],
+        context_assist_write_context_summary=runtime_state["context_assist_write_context_summary"],
+        context_assist_skip_next_interval=runtime_state["context_assist_skip_next_interval"],
+        runtime_state=runtime_state,
+    )
 
 
 def agent_file_context_attributes(section: str) -> dict[str, str] | None:
@@ -9448,6 +9830,16 @@ def load_state_agent_context_summary(
         raise ValueError(
             f"agent context summary must contain JSON: {artifact_path}"
         ) from exc
+    return parse_state_agent_context_summary(
+        value, artifact_path, default_expires_in_turns
+    )
+
+
+def parse_state_agent_context_summary(
+    value: Any,
+    artifact_path: Path,
+    default_expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT,
+) -> AgentContextSummary:
     expected_fields = {
         "content", "removed_file_paths", "removed_turn_numbers",
         "active_context_checksum",
@@ -9599,10 +9991,14 @@ def load_state_agent_file_contexts(
         raise ValueError(
             f"agent file contexts must contain JSON: {artifact_path}"
         ) from exc
+    return normalize_state_agent_file_contexts(entries)
+
+
+def normalize_state_agent_file_contexts(
+    entries: Any,
+) -> tuple[tuple[str, str], ...]:
     if not isinstance(entries, list):
-        raise ValueError(
-            f"agent file contexts must contain an array: {artifact_path}"
-        )
+        raise ValueError("agent file contexts must contain an array")
     contexts: list[tuple[str, str]] = []
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict) or set(entry) != {"path", "section"}:
@@ -9799,6 +10195,8 @@ def build_agent_turn_metadata(
     active_task: str,
     active_context: str,
     meta_task_list: list[dict[str, Any]],
+    *,
+    file_contexts: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for number, turn in enumerate(turns):
@@ -9841,6 +10239,11 @@ def build_agent_turn_metadata(
         "active_task": active_task,
         "active_context": active_context,
         "meta_task_list": [task.copy() for task in meta_task_list],
+        "file_contexts": (
+            [{"path": path, "section": section} for path, section in file_contexts]
+            if file_contexts is not None
+            else None
+        ),
     }
 
 
@@ -9849,23 +10252,33 @@ def load_reused_agent_turn_metadata(
     selected_turn_dir: Path,
     expires_schema: dict[str, Any],
     response_json_repair: bool,
+    runtime_state: dict[str, Any] | None = None,
 ) -> ReusedAgentHistory | None:
-    artifact_text: str | None = None
-    for artifact_name in (
-        "response_agent_turn_metadata",
-        "request_agent_turn_metadata",
-    ):
-        artifact_path = selected_turn_dir / artifact_name
-        artifact_text = read_optional_state_artifact(artifact_path)
-        if artifact_text is not None:
-            break
-    if artifact_text is None:
-        return None
+    artifact_path = selected_turn_dir / "response_agent_runtime_state"
+    metadata = (
+        runtime_state["turn_metadata"]
+        if runtime_state is not None
+        else None
+    )
+    if metadata is None:
+        artifact_text: str | None = None
+        for artifact_name in (
+            "response_agent_turn_metadata",
+            "request_agent_turn_metadata",
+        ):
+            artifact_path = selected_turn_dir / artifact_name
+            artifact_text = read_optional_state_artifact(artifact_path)
+            if artifact_text is not None:
+                break
+        if artifact_text is None:
+            return None
+        try:
+            metadata = json.loads(artifact_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"invalid saved agent turn metadata: {artifact_path}"
+            ) from exc
     invalid_metadata = f"invalid saved agent turn metadata: {artifact_path}"
-    try:
-        metadata = json.loads(artifact_text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(invalid_metadata) from exc
 
     def is_integer(value: Any, minimum: int = 0) -> bool:
         return (
@@ -9883,7 +10296,7 @@ def load_reused_agent_turn_metadata(
     }
     if not isinstance(metadata, dict) or not (
         expected_fields <= set(metadata)
-        <= expected_fields | {"turn_number_base"}
+        <= expected_fields | {"turn_number_base", "file_contexts"}
     ):
         raise ValueError(invalid_metadata)
     turn_number_base = saved_agent_turn_number_base(metadata)
@@ -9900,6 +10313,14 @@ def load_reused_agent_turn_metadata(
         for path, expiry in file_expirations.items()
     ):
         raise ValueError(invalid_metadata)
+    if metadata.get("file_contexts") is not None:
+        saved_contexts = normalize_state_agent_file_contexts(metadata["file_contexts"])
+        saved_paths = [path for path, _ in saved_contexts]
+        if (
+            len(set(saved_paths)) != len(saved_paths)
+            or set(saved_paths) != set(file_expirations)
+        ):
+            raise ValueError(invalid_metadata)
     pinned_paths = metadata["pinned_file_paths"]
     if not isinstance(pinned_paths, list) or any(
         not isinstance(path, str) or not path
@@ -10059,19 +10480,22 @@ def load_reused_agent_turn_metadata(
         context_assist_summary, context_assist_require_compaction,
         context_assist_write_context_summary, context_assist_skip_next_interval,
     ) = load_state_agent_context_assist(selected_turn_dir)
-    return ReusedAgentHistory(
-        turns=tuple(turns),
-        active_task=metadata["active_task"],
-        active_context=metadata["active_context"],
-        meta_task_list=tuple(task_list),
-        context_summary=load_state_agent_context_summary(
-            selected_turn_dir, expires_schema["default"]
+    return reused_agent_runtime_history(
+        ReusedAgentHistory(
+            turns=tuple(turns),
+            active_task=metadata["active_task"],
+            active_context=metadata["active_context"],
+            meta_task_list=tuple(task_list),
+            context_summary=load_state_agent_context_summary(
+                selected_turn_dir, expires_schema["default"]
+            ),
+            context_assist_summary=context_assist_summary,
+            context_assist_require_compaction=context_assist_require_compaction,
+            context_assist_write_context_summary=context_assist_write_context_summary,
+            context_assist_skip_next_interval=context_assist_skip_next_interval,
+            turn_metadata=metadata,
         ),
-        context_assist_summary=context_assist_summary,
-        context_assist_require_compaction=context_assist_require_compaction,
-        context_assist_write_context_summary=context_assist_write_context_summary,
-        context_assist_skip_next_interval=context_assist_skip_next_interval,
-        turn_metadata=metadata,
+        runtime_state,
     )
 
 
@@ -10081,14 +10505,16 @@ def load_reused_session_agent_history(
     expires_schema: dict[str, Any] = AGENT_EXPIRES_IN_TURNS_SCHEMA,
     response_json_repair: bool = False,
 ) -> ReusedAgentHistory:
-    selected_turn_dir = last_completed_state_turn(
+    selected_turn_dir = last_resumable_agent_state_turn(
         state_session_dir, turn
     )
+    runtime_state = load_state_agent_runtime_state(selected_turn_dir)
     reused_history = load_reused_agent_turn_metadata(
         state_session_dir,
         selected_turn_dir,
         expires_schema,
         response_json_repair,
+        runtime_state=runtime_state,
     )
     if reused_history is not None:
         return reused_history
@@ -10250,16 +10676,19 @@ def load_reused_session_agent_history(
         context_assist_summary, context_assist_require_compaction,
         context_assist_write_context_summary, context_assist_skip_next_interval,
     ) = load_state_agent_context_assist(selected_turn_dir)
-    return ReusedAgentHistory(
-        turns=tuple(turns),
-        active_task=active_task,
-        active_context=active_context,
-        meta_task_list=tuple(task_list),
-        context_summary=context_summary,
-        context_assist_summary=context_assist_summary,
-        context_assist_require_compaction=context_assist_require_compaction,
-        context_assist_write_context_summary=context_assist_write_context_summary,
-        context_assist_skip_next_interval=context_assist_skip_next_interval,
+    return reused_agent_runtime_history(
+        ReusedAgentHistory(
+            turns=tuple(turns),
+            active_task=active_task,
+            active_context=active_context,
+            meta_task_list=tuple(task_list),
+            context_summary=context_summary,
+            context_assist_summary=context_assist_summary,
+            context_assist_require_compaction=context_assist_require_compaction,
+            context_assist_write_context_summary=context_assist_write_context_summary,
+            context_assist_skip_next_interval=context_assist_skip_next_interval,
+        ),
+        runtime_state,
     )
 
 def reused_agent_context_pins(
@@ -11116,23 +11545,16 @@ def request_agent_model(
             user_prompt=user_prompt,
             tools=tools,
         )
-        if (tools or summary_token_budget is not None) and settings.context_summary is not None:
-            write_state_artifact(
-                turn_dir,
-                "request_agent_context_summary",
-                json.dumps(
-                    settings.context_summary.as_dict(),
-                    ensure_ascii=False,
-                ),
-            )
         if turn_metadata is not None:
             write_state_artifact(
                 turn_dir,
                 "request_agent_turn_metadata",
                 json.dumps(turn_metadata, ensure_ascii=False),
             )
-        if not assist_type:
-            write_state_agent_context_assist(turn_dir, settings, "request")
+        write_state_reasoning_items(turn_dir, reasoning_items)
+        write_state_agent_runtime_state(
+            turn_dir, settings, "request", turn_metadata
+        )
     append_log(
         f"<{request_name}_request>\n"
         f"<request_stats>\nturn={current_turn} request_characters={request_characters} "
@@ -11150,10 +11572,12 @@ def request_agent_model(
             file=sys.stderr,
         )
     model_settings = settings.model_settings
+    log_tool_schema = True
 
     def request_response() -> tuple[
         Any, dict[str, Any] | None, str, tuple[AgentToolCall, ...], float
     ]:
+        nonlocal log_tool_schema
         request_timer = ModelRequestTimer()
         usage: dict[str, Any] | None = None
         try:
@@ -11161,11 +11585,12 @@ def request_agent_model(
                 model_settings,
                 system_prompt,
                 user_prompt,
+                image_urls=settings.image_urls,
                 response_format=("schema" if json_schema is not None else "text"),
                 json_schema=json_schema,
                 retry=0,
                 report_errors=False,
-                request_logger=append_log,
+                request_logger=append_log if log_tool_schema else None,
                 response_logger=log_response,
                 tools=tools,
                 tool_choice="required" if tools else None,
@@ -11176,10 +11601,17 @@ def request_agent_model(
                 reasoning_items=reasoning_items,
             )
         finally:
+            log_tool_schema = False
             elapsed = request_timer.elapsed()
             settings.cumulative_stats.add(
                 request_timer.elapsed(total=True), usage
             )
+            if turn_dir is not None:
+                write_state_agent_runtime_state(
+                    turn_dir, settings, turn_metadata=turn_metadata
+                )
+            elif settings.runtime_state_checkpoint is not None:
+                settings.runtime_state_checkpoint()
         parsed_tool_calls: tuple[AgentToolCall, ...] = ()
         if context_assist:
             response = parse_agent_context_assist_response(
@@ -11267,6 +11699,16 @@ def request_agent_model(
             response_obj
         )
         if turn_dir is not None:
+            if not assist_type:
+                settings.prior_token_estimates.append(
+                    (current_turn, request_tokens)
+                )
+                del settings.prior_token_estimates[
+                    :-AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS
+                ]
+            write_state_agent_runtime_state(
+                turn_dir, settings, turn_metadata=turn_metadata
+            )
             complete_state_turn(
                 turn_dir, reasoning, response, response_reasoning_items
             )
@@ -11320,7 +11762,53 @@ class AgentAssist:
     request_turn: int = 0
     request_summary: AgentContextSummary | None = None
 
-    def is_due(self) -> bool:
+
+    def restore_pending(self) -> None:
+        pending = self.settings.pending_assists.get(self.assist_type)
+        if pending is None:
+            return
+        self.request_turn = pending["turn"]
+        session_dir = STATE_DIR / pending["session_name"]
+        assist_dir = session_dir / f"{self.assist_type}_assist"
+        turn_dir = assist_dir / str(self.request_turn)
+        self.request_settings = replace(
+            self.settings,
+            state_session_dir=assist_dir,
+            state_turn=self.request_turn,
+            log_path=turn_dir / "log" if self.settings.log_enabled else None,
+            cumulative_stats=CumulativeStats(),
+            runtime_state_checkpoint=None,
+        )
+        self.request_summary = AgentContextSummary()
+        future: Future[AgentModelResult] = Future()
+        self.future = future
+        try:
+            if any(path.is_symlink() for path in (session_dir, assist_dir, turn_dir)):
+                raise ValueError("saved assist directories cannot be symbolic links")
+            runtime_state = load_state_agent_runtime_state(turn_dir)
+            if runtime_state is not None:
+                self.request_settings.cumulative_stats.restore(
+                    runtime_state["cumulative_stats"]
+                )
+            self.request_summary = (
+                load_state_agent_context_summary(turn_dir)
+                or AgentContextSummary()
+            )
+            response = read_optional_state_artifact(turn_dir / "response")
+            if response is None:
+                raise ValueError("interrupted assist request has no saved response")
+            future.set_result(
+                AgentModelResult(
+                    response=response,
+                    reasoning=read_optional_state_artifact(
+                        turn_dir / "response_reasoning"
+                    ) or "",
+                    turn_dir=turn_dir,
+                )
+            )
+        except Exception as exc:
+            future.set_exception(exc)
+
         interval = getattr(self.settings, f"agent_{self.assist_type}_assist")
         current_turn = self.settings.state_turn
         return (
@@ -11328,6 +11816,7 @@ class AgentAssist:
             and interval > 0
             and current_turn > 0
             and current_turn % interval == 0
+            and current_turn > self.settings.assist_last_turns.get(self.assist_type, -1)
         )
 
     def start_if_due(
@@ -11347,6 +11836,9 @@ class AgentAssist:
             and self.settings.context_assist_skip_next_interval
         ):
             self.settings.context_assist_skip_next_interval = False
+            self.settings.assist_last_turns[self.assist_type] = current_turn
+            if self.settings.runtime_state_checkpoint is not None:
+                self.settings.runtime_state_checkpoint()
             return
         summary = self.settings.context_summary
         request_summary = (
@@ -11358,11 +11850,9 @@ class AgentAssist:
         prompts = agent_system_prompts(self.settings)
         prompt_inventory = ""
         if self.assist_type == "prompt":
-            original_prompts = {
-                name: content
-                for name, content in self.settings.original_system_prompts.items()
-                if prompts.get(name) != content
-            }
+            prompt_history = self.settings.system_prompt_history[
+                -AGENT_PROMPT_ASSIST_MAX_HISTORY:
+            ]
             prompt_inventory = join_prompt_sections(
                 format_context_entry(
                     "agent_system_prompts",
@@ -11370,15 +11860,13 @@ class AgentAssist:
                     include_token_count=False,
                 ),
                 format_context_entry(
-                    "original_agent_system_prompts",
-                    f"{json.dumps(original_prompts, indent=2, ensure_ascii=False)}\n",
+                    "historical_agent_system_prompts",
+                    f"{json.dumps(prompt_history, indent=2, ensure_ascii=False)}\n",
                     include_token_count=False,
-                ) if original_prompts else "",
+                ) if prompt_history else "",
             )
         assist_system_prompt = join_prompt_sections(
-            prompts["context_assist_system_prompt"]
-            if self.assist_type == "context"
-            else AGENT_PROMPT_ASSIST_SYSTEM_PROMPT,
+            prompts[f"{self.assist_type}_assist_system_prompt"],
             f"The configured {self.assist_type} assist interval is {interval} "
             f"agent turns. This review is for turn {current_turn}.",
         )
@@ -11438,13 +11926,19 @@ class AgentAssist:
                 if self.settings.log_enabled
                 else None
             ),
-            context_summary=None,
+            context_summary=replace(request_summary),
             system_prompt_overrides=self.settings.system_prompt_overrides.copy(),
-            original_system_prompts=self.settings.original_system_prompts.copy(),
+            system_prompt_history=self.settings.system_prompt_history.copy(),
             context_assist_summary="",
             context_assist_require_compaction=False,
             context_assist_write_context_summary=False,
             context_assist_skip_next_interval=False,
+            prior_token_estimates=[],
+            pending_revision_instruction="",
+            advance_expirations=True,
+            assist_last_turns={},
+            pending_assists={},
+            runtime_state_checkpoint=None,
             cumulative_stats=CumulativeStats(token_cost=request_profile.token_cost),
         )
         if self.executor is None:
@@ -11452,6 +11946,13 @@ class AgentAssist:
         self.request_settings = request_settings
         self.request_turn = current_turn
         self.request_summary = request_summary
+        self.settings.assist_last_turns[self.assist_type] = current_turn
+        self.settings.pending_assists[self.assist_type] = {
+            "session_name": self.settings.state_session_dir.name,
+            "turn": current_turn,
+        }
+        if self.settings.runtime_state_checkpoint is not None:
+            self.settings.runtime_state_checkpoint()
         self.future = self.executor.submit(
             request_agent_model,
             request_settings,
@@ -11463,6 +11964,8 @@ class AgentAssist:
         )
 
     def collect(self) -> None:
+        if self.future is None:
+            self.restore_pending()
         if self.future is None or self.request_settings is None:
             return
         future = self.future
@@ -11481,16 +11984,20 @@ class AgentAssist:
                 updates = normalize_agent_prompt_assist_updates(
                     assist["prompts"], prompts
                 )
-                changed_names = [
-                    update["name"]
-                    for update in updates
-                    if prompts[update["name"]] != update["content"]
-                ]
-                self.settings.system_prompt_overrides.update({
+                changed_prompts = {
                     update["name"]: update["content"]
                     for update in updates
-                })
-                updated_prompt_text = ", ".join(changed_names) or "none"
+                    if prompts[update["name"]] != update["content"]
+                }
+                self.settings.system_prompt_history.extend(
+                    {"name": name, "content": prompts[name]}
+                    for name in changed_prompts
+                )
+                del self.settings.system_prompt_history[
+                    :-AGENT_PROMPT_ASSIST_MAX_HISTORY
+                ]
+                self.settings.system_prompt_overrides.update(changed_prompts)
+                updated_prompt_text = ", ".join(changed_prompts) or "none"
                 emit_agent_output(
                     self.settings,
                     format_agent_turn_report(
@@ -11507,9 +12014,12 @@ class AgentAssist:
                 file=sys.stderr,
             )
         finally:
+            self.settings.pending_assists.pop(self.assist_type, None)
             self.settings.cumulative_stats.merge(
                 request_settings.cumulative_stats
             )
+            if self.settings.runtime_state_checkpoint is not None:
+                self.settings.runtime_state_checkpoint()
         if request_settings.log_path is not None:
             try:
                 log_text = read_optional_state_artifact(request_settings.log_path)
@@ -11580,15 +12090,6 @@ class AgentAssist:
             summary.content = ""
             summary.expires_in_turns = self.settings.agent_context_expires[0]
             summary.generated_turn = None
-        turn_dir = self.settings.state_session_dir / str(self.request_turn)
-        if turn_dir.is_dir():
-            if summary_cleared:
-                write_state_artifact(
-                    turn_dir,
-                    "response_agent_context_summary",
-                    json.dumps(summary.as_dict(), ensure_ascii=False),
-                )
-            write_state_agent_context_assist(turn_dir, self.settings)
         emit_agent_output(
             self.settings,
             format_agent_context_assist_report(
@@ -11621,10 +12122,6 @@ class AgentContextAssist(AgentAssist):
 @dataclass
 class AgentPromptAssist(AgentAssist):
     assist_type: str = field(default="prompt", init=False)
-
-    def __post_init__(self) -> None:
-        if not self.settings.original_system_prompts:
-            self.settings.original_system_prompts = agent_system_prompts(self.settings)
 
 
 def run_agent_profile_tool(
@@ -11978,6 +12475,10 @@ def prepare_agent_context(
     else:
         metadata = settings.initial_turn_metadata
         if not settings.refresh_initial_file_contexts:
+            if metadata.get("file_contexts") is not None:
+                file_contexts = list(
+                    normalize_state_agent_file_contexts(metadata["file_contexts"])
+                )
             saved_expirations = metadata["file_expires_in_turns"]
             file_contexts[:] = [
                 context for context in file_contexts
@@ -12062,10 +12563,12 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
         file_expires_in_turns=file_expires_in_turns,
         controller_tools=controller_tools,
         meta_task_list=meta_task_list,
+        revision_instruction=settings.pending_revision_instruction,
+        prior_token_estimates=settings.prior_token_estimates,
         context_summary=context_summary,
         context_assist_summary=settings.context_assist_summary,
         require_compaction=settings.context_assist_require_compaction,
-        advance_expirations=not refresh_summary,
+        advance_expirations=settings.advance_expirations and not refresh_summary,
         refresh_summary=refresh_summary,
         current_turn=settings.state_turn,
         tool_call_instructions=agent_controller_tool_call_instructions(settings),
@@ -12087,9 +12590,16 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
         return run_agent_controller(settings, context_assist, prompt_assist)
     finally:
         try:
-            context_assist.close()
+            try:
+                context_assist.close()
+            finally:
+                prompt_assist.close()
         finally:
-            prompt_assist.close()
+            try:
+                if settings.runtime_state_checkpoint is not None:
+                    settings.runtime_state_checkpoint()
+            finally:
+                settings.runtime_state_checkpoint = None
 
 
 def run_agent_controller(
@@ -12104,9 +12614,9 @@ def run_agent_controller(
     active_task = settings.task
     active_context = settings.initial_active_context
     write_state_meta_task_list(settings.state_session_dir, meta_task_list)
-    prior_token_estimates: list[tuple[int, int]] = []
-    pending_revision_instruction = ""
+    prior_token_estimates = settings.prior_token_estimates
     reasoning_items = settings.initial_reasoning_items
+    checkpoint_turn_dir: Path | None = None
 
     def current_file_context() -> str:
         return build_agent_files_context(
@@ -12128,23 +12638,47 @@ def run_agent_controller(
             active_task,
             active_context,
             meta_task_list,
+            file_contexts=file_contexts,
         )
 
-    def save_turn_metadata(turn_dir: Path) -> None:
+    def save_turn_metadata(
+        turn_dir: Path,
+        artifact_prefix: str = "response",
+    ) -> None:
+        metadata = current_turn_metadata()
         write_state_artifact(
             turn_dir,
-            "response_agent_turn_metadata",
-            json.dumps(current_turn_metadata(), ensure_ascii=False),
+            f"{artifact_prefix}_agent_turn_metadata",
+            json.dumps(metadata, ensure_ascii=False),
         )
+        write_state_agent_runtime_state(
+            turn_dir, settings, artifact_prefix, metadata
+        )
+
+    def checkpoint_runtime_state() -> None:
+        if checkpoint_turn_dir is not None:
+            save_turn_metadata(checkpoint_turn_dir)
+
+    settings.runtime_state_checkpoint = checkpoint_runtime_state
 
     def request_next(
         revision_instruction: str = "",
     ) -> AgentModelResult:
-        nonlocal active_context, pending_revision_instruction, reasoning_items
+        nonlocal active_context, reasoning_items, checkpoint_turn_dir
         if revision_instruction:
-            pending_revision_instruction = revision_instruction
-        advance_expirations = True
+            settings.pending_revision_instruction = revision_instruction
+        advance_expirations = settings.advance_expirations
         while True:
+            checkpoint_turn_dir = start_state_turn(
+                settings.state_session_dir,
+                settings.state_turn,
+                agent_system_prompts(settings)["agent_system_prompt"],
+                active_task,
+                settings.file_paths,
+                skip_missing_files=True,
+            )
+            write_state_reasoning_items(checkpoint_turn_dir, reasoning_items)
+            save_turn_metadata(checkpoint_turn_dir, "request")
             context_assist.collect()
             prompt_assist.collect()
             prompts = agent_system_prompts(settings)
@@ -12177,7 +12711,7 @@ def run_agent_controller(
                     pinned_paths=pinned_paths,
                     pinned_turn_numbers=pinned_turn_numbers,
                     file_expires_in_turns=file_expires_in_turns,
-                    revision_instruction=pending_revision_instruction,
+                    revision_instruction=settings.pending_revision_instruction,
                     controller_tools=controller_tools,
                     hook_contents=hook_contents,
                     meta_task_list=meta_task_list,
@@ -12198,10 +12732,14 @@ def run_agent_controller(
                     summary_system_prompt=prompts["context_summary_system_prompt"],
                 )
 
-            (
-                request_system_prompt, user_prompt,
-                summary_token_budget, compaction,
-            ) = build_context_prompts(limit_context=True)
+            try:
+                (
+                    request_system_prompt, user_prompt,
+                    summary_token_budget, compaction,
+                ) = build_context_prompts(limit_context=True)
+            finally:
+                if advance_expirations and not refresh_summary:
+                    settings.advance_expirations = False
             if active_context and (
                 agent_context_checksum(active_context) == context_summary.active_context_checksum
             ):
@@ -12240,25 +12778,15 @@ def run_agent_controller(
                 meta_task_list,
                 "response_agent_meta_task_list",
             )
-            prior_token_estimates.append(
-                (int(result.turn_dir.name), result.request_tokens)
-            )
-            del prior_token_estimates[
-                :-AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS
-            ]
             if summary_token_budget is None:
                 context_summary.expires_in_turns = max(
                     0, context_summary.expires_in_turns - 1
                 )
-                write_state_artifact(
-                    result.turn_dir,
-                    "response_agent_context_summary",
-                    json.dumps(context_summary.as_dict(), ensure_ascii=False),
-                )
                 settings.context_assist_require_compaction = False
                 settings.context_assist_write_context_summary = False
-                write_state_agent_context_assist(result.turn_dir, settings)
-                pending_revision_instruction = ""
+                settings.pending_revision_instruction = ""
+                settings.advance_expirations = True
+                save_turn_metadata(result.turn_dir)
                 return result
 
             active_context = update_agent_context_summary(
@@ -12274,14 +12802,10 @@ def run_agent_controller(
                 expires_in_turns=settings.agent_context_expires[0],
                 compaction=compaction,
             )
-            write_state_artifact(
-                result.turn_dir,
-                "response_agent_context_summary",
-                json.dumps(context_summary.as_dict(), ensure_ascii=False),
-            )
             settings.context_assist_require_compaction = False
             settings.context_assist_write_context_summary = False
-            write_state_agent_context_assist(result.turn_dir, settings)
+            advance_expirations = refresh_summary
+            settings.advance_expirations = advance_expirations
             save_turn_metadata(result.turn_dir)
             emit_agent_output(
                 settings,
@@ -12292,7 +12816,6 @@ def run_agent_controller(
                     int(result.turn_dir.name),
                 ),
             )
-            advance_expirations = refresh_summary
 
     try:
         model_result = request_next()
@@ -12354,7 +12877,7 @@ def run_agent_controller(
         encoding = token_encoding_for_model(settings.model_settings.model)
         file_context_tokens = len(encoding.encode(settings.context))
 
-        def save_tool_outputs() -> bool:
+        def save_tool_outputs(*, log_outputs: bool = True) -> bool:
             try:
                 write_state_meta_task_list(
                     model_result.turn_dir,
@@ -12374,21 +12897,17 @@ def run_agent_controller(
                         "response_agent_tool_output",
                         tool_output_text,
                     )
-                    append_session_log(
-                        settings.log_path,
-                        "<agent_tool_output>\n"
-                        f"{tool_output_text}\n"
-                        "</agent_tool_output>\n",
-                        settings.log_enabled,
-                    )
+                    if log_outputs:
+                        append_session_log(
+                            settings.log_path,
+                            "<agent_tool_output>\n"
+                            f"{tool_output_text}\n"
+                            "</agent_tool_output>\n",
+                            settings.log_enabled,
+                        )
                 write_state_reasoning_items(
                     model_result.turn_dir,
                     reasoning_items,
-                )
-                write_state_artifact(
-                    model_result.turn_dir,
-                    "response_agent_context_summary",
-                    json.dumps(context_summary.as_dict(), ensure_ascii=False),
                 )
                 if readfile_contexts_for_turn is not None:
                     write_state_agent_file_contexts(
@@ -12597,8 +13116,12 @@ def run_agent_controller(
                 + len(encoding.encode(context_output)),
             )
             file_context_tokens = updated_file_context_tokens
-        if not save_tool_outputs():
-            return 1
+            if tool_revision_instruction:
+                settings.pending_revision_instruction = tool_revision_instruction
+            if not save_tool_outputs(
+                log_outputs=tool_call_index + 1 == len(tool_calls)
+            ):
+                return 1
         try:
             model_result = request_next(tool_revision_instruction)
         except Exception as exc:
@@ -12864,6 +13387,7 @@ def call_openai(
     request_timer: ModelRequestTimer | None = None,
     reasoning_items: tuple[dict[str, Any], ...] | None = None,
     report_errors: bool = True,
+    image_urls: tuple[str, ...] = (),
 ) -> tuple[Any, dict[str, Any] | None]:
     kwargs: dict[str, Any] = {
         "model": model,
@@ -12875,10 +13399,17 @@ def call_openai(
 
     if reasoning_items is not None:
         kwargs["include"] = ["reasoning.encrypted_content"]
-    if reasoning_items:
+    if reasoning_items or image_urls:
+        user_content: str | list[dict[str, Any]] = user_prompt
+        if image_urls:
+            user_content = [{"type": "input_text", "text": user_prompt}]
+            user_content.extend(
+                {"type": "input_image", "detail": "original", "image_url": image_url}
+                for image_url in image_urls
+            )
         kwargs["input"] = [
-            *reasoning_items,
-            {"role": "user", "content": user_prompt},
+            *(reasoning_items or ()),
+            {"role": "user", "content": user_content},
         ]
 
     if explicit_prompt_cache:
@@ -13012,6 +13543,7 @@ def call_model(
     request_timer: ModelRequestTimer | None = None,
     reasoning_items: tuple[dict[str, Any], ...] | None = None,
     report_errors: bool = True,
+    image_urls: tuple[str, ...] = (),
 ) -> tuple[Any, dict[str, Any] | None]:
     return call_openai(
         api_key=settings.api_key,
@@ -13022,6 +13554,7 @@ def call_model(
         model=settings.model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
+        image_urls=image_urls,
         response_format=response_format,
         json_schema=json_schema,
         response_verbosity=settings.response_verbosity,
@@ -13514,6 +14047,7 @@ def run_tree_mode(
     log_path: Path | None,
     tree_session_stem: str = "",
     agent_backup: AgentBackup | None = None,
+    image_urls: tuple[str, ...] = (),
 ) -> int:
     retry = max(1, parse_retry_count(model_settings.retry))
     model = model_settings.model
@@ -13728,6 +14262,7 @@ def run_tree_mode(
                 model_settings,
                 full_system_prompt,
                 user_prompt,
+                image_urls=image_urls,
                 response_format=response_format,
                 json_schema=json_schema,
                 retry=0,
@@ -14154,6 +14689,17 @@ def parse_args() -> argparse.Namespace:
         action="extend",
         type=Path,
         help="Read context file paths from one or more list files",
+    )
+
+    parser.add_argument(
+        "--images",
+        nargs="+",
+        action="extend",
+        metavar="PATH",
+        help=(
+            "Attach one or more images as base64 without processing "
+            "(compatible with --task, --patch, and --tree-task; may be repeated)"
+        ),
     )
 
     parser.add_argument(
@@ -15362,6 +15908,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             ("--task-file", args.task_file is not None),
             ("--files", args.files is not None),
             ("--files-list", args.files_list is not None),
+            ("--images", args.images is not None),
             ("--patch", args.patch is not None),
             ("--plan", args.plan is not None),
             ("--agent", args.agent),
@@ -16012,8 +16559,14 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     ):
         if args.files is None and args.files_list is None:
             file_names = config["files"]
-        if not file_names and not (patch_mode or shell_mode or agent_mode):
-            print("ERROR: --files or --files-list required (--help for help)", file=sys.stderr)
+        if not file_names and not (
+            config["images"] or patch_mode or shell_mode or agent_mode
+        ):
+            print(
+                "ERROR: --files, --files-list, or --images required "
+                "(--help for help)",
+                file=sys.stderr,
+            )
             return 1
 
     prompt_expansion_enabled = config["prompt_expansion"]
@@ -16259,6 +16812,14 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             from_fd=args.apikey_from_fd,
         )
 
+    try:
+        image_urls = load_image_urls(
+            resolve_context_file_paths(config["images"])
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: Could not load images: {exc}", file=sys.stderr)
+        return 1
+
     model_settings = model_settings_from_config(config, api_key)
     assist_settings: dict[str, ModelRequestSettings | None] = {
         "context": None,
@@ -16322,9 +16883,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             resume_state_session_dir = STATE_DIR / resume_session_name
             try:
                 resume_turn_dir = (
-                    last_completed_state_turn(
-                        resume_state_session_dir, resume_session_turn
-                    )
+                    (
+                        last_resumable_agent_state_turn
+                        if agent_mode
+                        else last_completed_state_turn
+                    )(resume_state_session_dir, resume_session_turn)
                     if not tree_mode
                     else None
                 )
@@ -16665,6 +17228,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             log_path=log_path,
             tree_session_stem=tree_session_stem,
             agent_backup=agent_backup,
+            image_urls=image_urls,
         )
 
     context_sections: list[tuple[str, str]] = []
@@ -16841,6 +17405,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 model_settings,
                 plan_full_system_prompt,
                 plan_user_prompt,
+                image_urls=image_urls,
                 response_format="text",
                 error_logger=append_log,
                 request_timer=plan_request_timer,
@@ -16938,6 +17503,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             state_session_dir=state_session_dir,
             state_turn=state_turn,
             file_paths=file_paths,
+            image_urls=image_urls,
             log_enabled=log_enabled,
             log_path=log_path,
             task=task,
@@ -16998,25 +17564,21 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             context_assist_summary=(
                 reused_agent_history.context_assist_summary
                 if reused_agent_history is not None
-                and agent_context_assist is not None
                 else ""
             ),
             context_assist_require_compaction=(
                 reused_agent_history.context_assist_require_compaction
                 if reused_agent_history is not None
-                and agent_context_assist is not None
                 else False
             ),
             context_assist_write_context_summary=(
                 reused_agent_history.context_assist_write_context_summary
                 if reused_agent_history is not None
-                and agent_context_assist is not None
                 else False
             ),
             context_assist_skip_next_interval=(
                 reused_agent_history.context_assist_skip_next_interval
                 if reused_agent_history is not None
-                and agent_context_assist is not None
                 else False
             ),
             initial_reasoning_items=reasoning_items,
@@ -17037,6 +17599,29 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             agent_backup=agent_backup,
             cumulative_stats=cumulative_stats,
         )
+        if reused_agent_history is not None and reused_agent_history.runtime_state is not None:
+            current_prompts = agent_system_prompts(agent_settings)
+            overridden_prompts: set[str] = set()
+            if args.system_prompt is not None or args.system_prompt_file is not None:
+                overridden_prompts.update(("agent_system_prompt", "worker_system_prompt"))
+            if args.agent_system_prompt is not None:
+                overridden_prompts.add("agent_system_prompt")
+            if args.linenum_system_prompt is not None:
+                overridden_prompts.update(("agent_system_prompt", "linenum_system_prompt"))
+            if args.shell_system_prompt is not None:
+                overridden_prompts.add("shell_system_prompt")
+            if args.patch_system_prompt is not None:
+                overridden_prompts.add("patch_system_prompt")
+            restore_agent_runtime_state(
+                agent_settings,
+                reused_agent_history.runtime_state,
+                restore_profiles=args.agent_profiles is None,
+                restore_default_profile=args.agent_profile_default is None,
+                restore_hook_context_scripts=args.agent_hook_context is None,
+                prompt_overrides={
+                    name: current_prompts[name] for name in overridden_prompts
+                },
+            )
         if args.estimate_only:
             print(estimate_agent_request_tokens(agent_settings))
             return 0
@@ -17160,6 +17745,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     model_settings,
                     request_system_prompt,
                     request_user_prompt,
+                    image_urls=image_urls,
                     response_format=(
                         response_format
                         if response_format_override is None
