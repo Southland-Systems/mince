@@ -4903,6 +4903,7 @@ def execute_shell_commands(
         script_input = None
         if step.lines:
             script_input = "\n".join(step.lines) + "\n"
+        command_start_time = time.perf_counter()
         try:
             command = ["/bin/sh", "-c", step.command]
             paths = contain
@@ -4999,7 +5000,18 @@ def execute_shell_commands(
             stderr = f"{type(exc).__name__}: {exc}"
 
         if VERBOSE and print_exit_status:
-            print(f"[{index}] exit_status={status}", file=sys.stderr)
+            elapsed = time.perf_counter() - command_start_time
+            status_text = (
+                "timed out" if status == "timeout"
+                else "execution error" if status == "error"
+                else f"exit status {status}"
+            )
+            print(
+                f"Shell command {index}/{len(commands)}: {status_text} "
+                f"({elapsed:.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
 
         stdout = "\n" + stdout if stdout != "" else stdout
         stderr = "\n" + stderr if stderr != "" else stderr
@@ -8478,16 +8490,15 @@ def format_agent_patch_manifest(manifest: dict[str, Any]) -> str:
             patch_blocks.append(
                 f"  Change {patch_index}: lines {patch['start_line']}-"
                 f"{patch['end_line']}\n"
-                "  Summary: "
-                f"{patch['summary_message']}\n"
+                f"    Summary: {patch['summary_message']}"
             )
         file_blocks.append(
             f"[{file_index}] {document['path']}\n"
             + "\n".join(patch_blocks)
         )
     return (
-        "\n\n".join(file_blocks) +
-        f"Patch summary: {manifest['commit_message']}\n"
+        f"Patch summary: {manifest['commit_message']}\n\n"
+        + "\n\n".join(file_blocks)
     )
 
 
@@ -8510,7 +8521,10 @@ def format_agent_tool_call_for_output(
         and tool_call.arguments is not None
     ):
         commands = _parse_shell_manifest_value(tool_call.arguments)
-        return f"Tool: {tool_name}\nCommands:\n{format_shell_commands(commands)}"
+        return (
+            f"Tool: {tool_name}\n"
+            f"Commands ({len(commands)}):\n{format_shell_commands(commands)}"
+        )
     if (
         tool_call.tool == AGENT_META_TASK_LIST_TOOL
         and tool_call.arguments is not None
@@ -8528,7 +8542,19 @@ def format_agent_tool_call_for_output(
             f"[{index}] {path}"
             for index, path in enumerate(paths, start=1)
         )
-        return f"Tool: {tool_name}\nPaths:\n{path_text}"
+        return f"Tool: {tool_name}\nPaths ({len(paths)}):\n{path_text}"
+    if tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL:
+        action = "Pin" if call["action"] == "pin" else "Set expiry"
+        sections = [
+            f"Tool: {tool_name}",
+            f"Action: {action}",
+            f"Context: {call['context_id']}",
+        ]
+        if call["action"] == "set_expires_in_turns":
+            sections.append(f"Expires in: {call['expires_in_turns']} turns")
+        if call["reason"]:
+            sections.append(f"Reason:\n{call['reason']}")
+        return "\n".join(sections)
     if tool_call.tool == AGENT_SESSION_TOOL:
         return (
             f"Tool: {tool_name}\n"
@@ -8583,20 +8609,22 @@ def format_agent_tool_call_report(
     tool_calls: list[AgentToolCall],
     current_turn: int | None = None,
     meta_task_list: list[dict[str, Any]] | None = None,
+    *,
+    tool_call_number_start: int = 1,
+    tool_call_count: int | None = None,
 ) -> str:
     normalized_tool_calls = normalize_agent_tool_calls(tool_calls)
-    if current_turn is not None and len(normalized_tool_calls) == 1:
-        return format_agent_turn_report(
-            format_agent_tool_call_for_output(
-                normalized_tool_calls[0], meta_task_list
-            ),
-            current_turn,
-        )
+    if tool_call_count is None:
+        tool_call_count = tool_call_number_start + len(normalized_tool_calls) - 1
     tool_blocks: list[str] = []
-    for index, tool_call in enumerate(normalized_tool_calls, start=1):
-        tool_blocks.append(
-            f"[{index}] {format_agent_tool_call_for_output(tool_call, meta_task_list)}"
-        )
+    for index, tool_call in enumerate(
+        normalized_tool_calls,
+        start=tool_call_number_start,
+    ):
+        tool_text = format_agent_tool_call_for_output(tool_call, meta_task_list)
+        if tool_call_count > 1:
+            tool_text = f"[{index}/{tool_call_count}] {tool_text}"
+        tool_blocks.append(tool_text)
         if (
             tool_call.tool == AGENT_META_TASK_LIST_TOOL
             and isinstance(tool_call.arguments, dict)
@@ -8607,7 +8635,6 @@ def format_agent_tool_call_report(
                     tool_call.arguments.get("operations"),
                 )
             except ValueError:
-                # Rejected batches leave the task list unchanged.
                 pass
     tool_text = "\n\n".join(tool_blocks)
     if current_turn is not None:
@@ -10908,19 +10935,24 @@ def emit_agent_output(
     if OUTPUT_FILE is not None:
         write_output_file(output_text, append=True)
     elif not settings.suppress_response_output:
-        print(output_text)
+        print(output_text, flush=True)
 
 
 def emit_agent_auto_tool_call(
     settings: AgentRunSettings,
-    tool_calls: list[AgentToolCall],
+    tool_call: AgentToolCall,
     current_turn: int,
     task_list: list[dict[str, Any]] | None = None,
+    *,
+    tool_call_number: int = 1,
+    tool_call_count: int = 1,
 ) -> None:
     output_text = format_agent_tool_call_report(
-        tool_calls,
+        [tool_call],
         current_turn=current_turn,
         meta_task_list=task_list,
+        tool_call_number_start=tool_call_number,
+        tool_call_count=tool_call_count,
     )
     emit_agent_output(settings, output_text)
 
@@ -12315,21 +12347,6 @@ def run_agent_controller(
                 return 1
             continue
 
-        if settings.agent_auto:
-            try:
-                emit_agent_auto_tool_call(
-                    settings,
-                    tool_calls,
-                    int(model_result.turn_dir.name),
-                    meta_task_list,
-                )
-            except Exception as exc:
-                print(
-                    f"ERROR: Failed to write agent tool call output: {exc}",
-                    file=sys.stderr,
-                )
-                return 1
-        executed_tool_calls: list[AgentToolCall] = []
         tool_outputs: list[str] = []
         tool_revision_instruction = ""
         readfile_contexts_for_turn: tuple[tuple[str, str], ...] | None = None
@@ -12344,10 +12361,13 @@ def run_agent_controller(
                     meta_task_list,
                     "response_agent_meta_task_list",
                 )
-                if executed_tool_calls:
+                if tool_outputs:
+                    pending_outputs = ["Tool call was not executed."] * (
+                        len(tool_calls) - len(tool_outputs)
+                    )
                     tool_output_text = format_agent_tool_outputs(
-                        executed_tool_calls,
-                        tool_outputs,
+                        tool_calls,
+                        tool_outputs + pending_outputs,
                     )
                     write_state_artifact(
                         model_result.turn_dir,
@@ -12392,6 +12412,23 @@ def run_agent_controller(
                     tool_call,
                 )
             )
+            if settings.agent_auto:
+                try:
+                    emit_agent_auto_tool_call(
+                        settings,
+                        tool_call,
+                        int(model_result.turn_dir.name),
+                        meta_task_list,
+                        tool_call_number=tool_call_index + 1,
+                        tool_call_count=len(tool_calls),
+                    )
+                except Exception as exc:
+                    save_tool_outputs()
+                    print(
+                        f"ERROR: Failed to write agent tool call output: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 1
             if tool_call.tool == AGENT_SESSION_TOOL:
                 if not save_tool_outputs():
                     return 1
@@ -12532,7 +12569,6 @@ def run_agent_controller(
                     else None
                 ),
             )
-            executed_tool_calls.append(tool_call)
             tool_outputs.append(tool_output)
             settings.context = current_file_context()
             updated_file_context_tokens = len(encoding.encode(settings.context))
