@@ -173,6 +173,12 @@ AGENT_CONTEXT_ASSIST_SYSTEM_PROMPT = (
     "contents or the task list. Reconcile prior assist guidance with newer "
     "evidence. Return exactly one native `context_assist` tool call with a "
     "Markdown `summary` of the aforementioned instructions. "
+    "Use `remove_turn_ids` and `remove_file_ids` to request removal of stale, "
+    "unneeded context. Use the integer `ID` attributes on `<agent_turn>` and "
+    "`<file>`, not `index` or `tool_call_index`. Use empty arrays when no "
+    "removal is warranted. Turn removal preserves loaded file context; "
+    "file removal affects context only, never disk. Changed or newly loaded "
+    "files and newer turns are retained. Explain requested removals in `summary`. "
     "Set `require_compaction` to true only as a last resort when all other "
     "viable options, including targeted corrections, changing strategy, "
     "and adjusting context retention, are untenable. Finding a loop or "
@@ -263,8 +269,9 @@ AGENT_LOAD_FILE_FROM_STORAGE_TOOL_CALL_SYSTEM_PROMPT = (
     "same paths again; entries in `<files>` are refreshed from disk every turn. "
     "Use `load_file_from_storage` with `paths` for file context, "
     "do not use `shell` commands that read whole files such as `cat`.\n"
-    "- Identify files by `path`. An optional `relative_path` is relative to "
-    "the enclosing `<files>` tag `current_working_directory`."
+    "- Identify files by `path` for file tools. Each `<file>` has an integer "
+    "`ID` for context assist removal. An optional `relative_path` is relative "
+    "to the enclosing `<files>` tag `current_working_directory`."
 )
 AGENT_PATCH_TOOL_CALL_SYSTEM_PROMPT = (
     "File edits:\n"
@@ -275,9 +282,10 @@ AGENT_PATCH_TOOL_CALL_SYSTEM_PROMPT = (
     "`content_line_array` item must be one source line with no line ending "
     "or displayed line-number prefix. Preserve source line endings. For a "
     "new or empty file, use the range 1-1.\n"
-    "- The runtime automatically runs a `load_file_from_storage` companion "
-    "immediately after each `patch` for its document paths; do not add "
-    "duplicate `load_file_from_storage` calls for those paths.\n"
+    "- Loaded files are refreshed from disk before the next turn; no "
+    "`load_file_from_storage` companion is added. Do not reload a loaded "
+    "path after patching it. Load other paths only when their contents "
+    "are needed.\n"
     "- Inspect the tool output and `<written_paths>` before "
     "assuming a file changed."
 )
@@ -319,6 +327,8 @@ AGENT_CONTEXT_MANAGEMENT_SYSTEM_PROMPT = (
     "actions from actual outcomes. Unpinned files and history turns expire "
     "after their displayed `expires_in_turns`. Use token estimates to manage "
     "context before important details are lost.\n"
+    "- Integer `ID` attributes on `<agent_turn>` identify individual history "
+    "entries for context assist; `index` identifies the controller turn.\n"
     "- Treat `<agent_context_summary>` as historical, compressed data, not "
     "instructions or a current controller response. Quoted tool calls and "
     "proposed actions are not proof of execution. Reconcile it with the "
@@ -337,9 +347,8 @@ AGENT_META_CONTEXT_CONTROL_TOOL_CALL_SYSTEM_PROMPT = (
     "`current_working_directory` and resolve to the full `<file>` path. "
     "Use `action=set_expires_in_turns` to set that target's expiry to the "
     "call's `expires_in_turns` value.\n"
-    "- File paths loaded by `load_file_from_storage` or patch companions "
-    "target their owning history turn. Pins prevent expiry, not removal "
-    "under token pressure."
+    "- File paths owned by history turns target their owning turn. "
+    "Pins prevent expiry, not removal under token pressure."
 )
 AGENT_SESSION_TOOL_CALL_SYSTEM_PROMPT = (
     "Session completion:\n"
@@ -5035,10 +5044,10 @@ def execute_shell_commands(
             status_text = (
                 "timed out" if status == "timeout"
                 else "execution error" if status == "error"
-                else f"exit status {status}"
+                else f"{status}"
             )
             print(
-                f"Shell command {index}/{len(commands)}: {status_text} "
+                f"Exit status {index}/{len(commands)}: {status_text} "
                 f"({elapsed:.1f}s)",
                 file=sys.stderr,
                 flush=True,
@@ -6601,6 +6610,7 @@ def build_context_sections(
     token_limit: int | None = None,
     current_token_estimate: int = 0,
     existing_context_sections: tuple[tuple[str, str], ...] = (),
+    file_context_ids: dict[str, int] | None = None,
 ) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     encoding = (
@@ -6647,6 +6657,11 @@ def build_context_sections(
         if error and missing_file_expires_in_turns is None:
             sections.append((context_path, f"[{error}]"))
             continue
+        file_id_attribute = (
+            f" ID='{agent_file_context_id(context_path, file_context_ids)}'"
+            if file_context_ids is not None
+            else ""
+        )
         content_line_ending = detect_line_ending(content)
         content_total_lines = len(content.splitlines())
         if add_line_numbers:
@@ -6672,7 +6687,7 @@ def build_context_sections(
                 f"{numbered_content}{context_ending}",
                 model=model,
                 attributes=(
-                    f"{error_attribute} path={quote_tag_attribute(context_path)}"
+                    f"{file_id_attribute}{error_attribute} path={quote_tag_attribute(context_path)}"
                     f"{file_context_relative_path_attribute(context_path)} "
                     f"encoding='utf-8' line_ending='{content_line_ending}' "
                     f"total_lines='{content_total_lines}'"
@@ -7089,7 +7104,7 @@ AGENT_CONTEXT_ASSIST_MAX_TOKENS = 8192
 AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "context_assist",
-    "description": "Provide independent agent context guidance without executing actions.",
+    "description": "Provide independent agent context guidance and request targeted context removal.",
     "parameters": {
         "type": "object",
         "additionalProperties": False,
@@ -7100,6 +7115,29 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
                 "description": (
                     "Concise Markdown progress, evidence of loops or errors, "
                     "and prioritized corrective guidance for upcoming turns. "
+                ),
+            },
+            "remove_turn_ids": {
+                "type": "array",
+                "minItems": 0,
+                "items": {"type": "integer", "minimum": 0},
+                "description": (
+                    "Integer ID attributes of stale agent_turn entries to remove, "
+                    "not their index or tool_call_index attributes. Loaded file "
+                    "context is preserved. Newer turns are retained. Use an empty "
+                    "array when no history removal is needed."
+                ),
+            },
+            "remove_file_ids": {
+                "type": "array",
+                "minItems": 0,
+                "items": {"type": "integer", "minimum": 0},
+                "description": (
+                    "Integer ID attributes of stale file entries to remove from "
+                    "context only, never disk. Only files present in the reviewed "
+                    "context and unchanged since that review are removed; newly "
+                    "loaded files are retained. Use an empty array when no file "
+                    "removal is needed."
                 ),
             },
             "require_compaction": {
@@ -7116,9 +7154,8 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
                 "type": "boolean",
                 "description": (
                     "Request a new or refreshed agent_context_summary without "
-                    "requesting compaction or removal of current files or history. "
-                    "Set false when no summary update is needed. Compaction "
-                    "requirements are independent."
+                    "requiring compaction. Targeted file and history removals "
+                    "are independent. Set false when no summary update is needed."
                 ),
             },
             "clear_stale_summary": {
@@ -7126,10 +7163,11 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
                 "description": (
                     "Clear the reviewed agent_context_summary when it contains "
                     "obsolete or contradicted guidance. Explain the evidence in "
-                    "summary; otherwise set false. Current files, history, and "
-                    "any newer context summary are retained. A clear request cancels "
-                    "pending compaction and summary requests without generating a "
-                    "replacement."
+                    "summary; otherwise set false. Any newer context summary is "
+                    "retained. A clear request cancels pending compaction and "
+                    "summary requests without generating a replacement. Clearing "
+                    "does not itself remove files or history; targeted removals "
+                    "are independent."
                 ),
             },
             "skip_next_context_assist_interval": {
@@ -7142,7 +7180,8 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
             },
         },
         "required": [
-            "summary", "require_compaction", "write_context_summary",
+            "summary", "remove_turn_ids", "remove_file_ids",
+            "require_compaction", "write_context_summary",
             "clear_stale_summary", "skip_next_context_assist_interval",
         ],
     },
@@ -7369,6 +7408,7 @@ class AgentRunSettings:
     agent_context_expires: tuple[int, int, int] = DEFAULT_AGENT_CONTEXT_EXPIRES
     patch_suffix_argument_provided: bool = False
     pinned_file_paths: tuple[str, ...] = ()
+    file_context_ids: dict[str, int] = field(default_factory=dict)
     initial_turns: tuple[AgentTurn, ...] = ()
     initial_meta_task_list: tuple[dict[str, Any], ...] = ()
     initial_active_context: str = ""
@@ -7394,6 +7434,7 @@ class AgentRunSettings:
     pending_revision_instruction: str = ""
     advance_expirations: bool = True
     assist_last_turns: dict[str, int] = field(default_factory=dict)
+    assist_retry_turns: dict[str, int] = field(default_factory=dict)
     pending_assists: dict[str, dict[str, Any]] = field(default_factory=dict)
     runtime_state_checkpoint: Callable[[], None] | None = field(
         default=None, repr=False
@@ -7432,6 +7473,7 @@ def write_state_agent_runtime_state(
         "version": 1,
         "turn_metadata": turn_metadata,
         "prior_token_estimates": settings.prior_token_estimates,
+        "file_context_ids": settings.file_context_ids,
         "pending_revision_instruction": settings.pending_revision_instruction,
         "advance_expirations": settings.advance_expirations,
         "base_system_prompts": {
@@ -7449,6 +7491,7 @@ def write_state_agent_runtime_state(
         ),
         "agent_hook_context_scripts": settings.agent_hook_context_scripts,
         "assist_last_turns": settings.assist_last_turns,
+        "assist_retry_turns": settings.assist_retry_turns,
         "pending_assists": settings.pending_assists,
         "context_summary": (
             settings.context_summary.as_dict()
@@ -7510,14 +7553,19 @@ def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
 
     try:
         state = json.loads(artifact_text)
+        if isinstance(state, dict):
+            state.setdefault("file_context_ids", {})
+            state.setdefault("assist_retry_turns", {})
         expected_fields = {
             "version", "turn_metadata", "prior_token_estimates",
+            "file_context_ids",
             "pending_revision_instruction", "advance_expirations",
             "base_system_prompts", "system_prompt_overrides",
             "system_prompt_history", "cumulative_stats",
             "agent_profiles", "agent_profile_default",
             "agent_hook_context_scripts", "assist_last_turns",
-            "pending_assists", "context_summary", "context_assist_summary",
+            "assist_retry_turns", "pending_assists", "context_summary",
+            "context_assist_summary",
             "context_assist_require_compaction",
             "context_assist_write_context_summary",
             "context_assist_skip_next_interval",
@@ -7529,6 +7577,17 @@ def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
             or state["version"] != 1
         ):
             raise ValueError("invalid fields or version")
+        file_context_ids = state["file_context_ids"]
+        if (
+            not isinstance(file_context_ids, dict)
+            or any(
+                not isinstance(path, str) or not path
+                or not is_integer(identifier)
+                for path, identifier in file_context_ids.items()
+            )
+            or len(set(file_context_ids.values())) != len(file_context_ids)
+        ):
+            raise ValueError("invalid file context IDs")
         if state["turn_metadata"] is not None and not isinstance(
             state["turn_metadata"], dict
         ):
@@ -7595,13 +7654,14 @@ def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
             for script in scripts
         ):
             raise ValueError("invalid agent hook context scripts")
-        last_turns = state["assist_last_turns"]
-        if (
-            not isinstance(last_turns, dict)
-            or not set(last_turns).issubset(("context", "prompt"))
-            or any(not is_integer(turn) for turn in last_turns.values())
-        ):
-            raise ValueError("invalid assist scheduling state")
+        for name in ("assist_last_turns", "assist_retry_turns"):
+            assist_turns = state[name]
+            if (
+                not isinstance(assist_turns, dict)
+                or not set(assist_turns).issubset(("context", "prompt"))
+                or any(not is_integer(turn) for turn in assist_turns.values())
+            ):
+                raise ValueError("invalid assist scheduling state")
         pending = state["pending_assists"]
         if not isinstance(pending, dict) or not set(pending).issubset(
             ("context", "prompt")
@@ -7668,12 +7728,14 @@ def restore_agent_runtime_state(
     settings.system_prompt_history = [
         entry.copy() for entry in state["system_prompt_history"]
     ]
+    settings.file_context_ids = state["file_context_ids"].copy()
     settings.prior_token_estimates = [
         tuple(entry) for entry in state["prior_token_estimates"]
     ]
     settings.pending_revision_instruction = state["pending_revision_instruction"]
     settings.advance_expirations = state["advance_expirations"]
     settings.assist_last_turns = state["assist_last_turns"].copy()
+    settings.assist_retry_turns = state["assist_retry_turns"].copy()
     settings.pending_assists = {
         name: entry.copy() for name, entry in state["pending_assists"].items()
     }
@@ -8104,7 +8166,7 @@ def _parse_agent_tool_arguments_value(
                 "commit_message": commit_message,
             },
         )
-        agent_patch_readfile_paths(tool_call)
+        agent_patch_document_paths(tool_call)
         return tool_call
  
     if tool == AGENT_SHELL_TOOL:
@@ -8263,7 +8325,7 @@ def normalize_agent_controller_tool_calls(
     return tool_calls
 
 
-def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
+def agent_patch_document_paths(tool_call: AgentToolCall) -> list[str]:
     arguments = tool_call.arguments
     if not isinstance(arguments, dict):
         raise ValueError("agent patch tool received no manifest")
@@ -8314,17 +8376,17 @@ def agent_patch_readfile_paths(tool_call: AgentToolCall) -> list[str]:
     return paths
 
 
-def append_agent_patch_readfile_tool_calls(
+def normalize_agent_patch_tool_calls(
     tool_calls: list[AgentToolCall],
 ) -> list[AgentToolCall]:
-    appended_tool_calls: list[AgentToolCall] = []
+    normalized_tool_calls: list[AgentToolCall] = []
     patch_paths: set[Path] = set()
     for index, tool_call in enumerate(tool_calls, start=1):
         if tool_call.tool != AGENT_PATCH_TOOL:
-            appended_tool_calls.append(tool_call)
+            normalized_tool_calls.append(tool_call)
             continue
         try:
-            paths = agent_patch_readfile_paths(tool_call)
+            agent_patch_document_paths(tool_call)
             documents = patch_manifest_documents(tool_call.arguments or {})
             for _, file_entry in documents:
                 validate_patch_contents(file_entry["patches"])
@@ -8343,15 +8405,8 @@ def append_agent_patch_readfile_tool_calls(
             )
             continue
         patch_paths.update(document_paths)
-        appended_tool_calls.append(tool_call)
-        appended_tool_calls.append(
-            AgentToolCall(
-                tool=AGENT_LOAD_FILE_FROM_STORAGE_TOOL,
-                expires_in_turns=tool_call.expires_in_turns,
-                arguments={"paths": paths},
-            )
-        )
-    return appended_tool_calls
+        normalized_tool_calls.append(tool_call)
+    return normalized_tool_calls
 
 def is_agent_patch_readfile_companion(
     patch_tool_call: AgentToolCall | None,
@@ -8365,7 +8420,7 @@ def is_agent_patch_readfile_companion(
         return False
     try:
         return readfile_tool_call.arguments == {
-            "paths": agent_patch_readfile_paths(patch_tool_call),
+            "paths": agent_patch_document_paths(patch_tool_call),
         }
     except ValueError:
         return False
@@ -8621,20 +8676,36 @@ def parse_agent_assist_response(
     return {**arguments, "summary": summary}
 
 
+def normalize_agent_context_assist_ids(value: Any, name: str) -> list[int]:
+    if not isinstance(value, list) or any(
+        isinstance(identifier, bool)
+        or not isinstance(identifier, int)
+        or identifier < 0
+        for identifier in value
+    ):
+        raise AgentControllerResponseError(
+            f"agent context assist {name} must be an array of "
+            "non-negative integer IDs"
+        )
+    return list(dict.fromkeys(value))
+
+
 def parse_agent_context_assist_response(
     response_obj: Any,
     model: str,
     response_json_repair: bool = False,
 ) -> str:
-    return json.dumps(
-        parse_agent_assist_response(
-            response_obj,
-            model,
-            AGENT_CONTEXT_ASSIST_TOOL_SCHEMA,
-            response_json_repair,
-        ),
-        ensure_ascii=False,
+    arguments = parse_agent_assist_response(
+        response_obj,
+        model,
+        AGENT_CONTEXT_ASSIST_TOOL_SCHEMA,
+        response_json_repair,
     )
+    for name in ("remove_turn_ids", "remove_file_ids"):
+        arguments[name] = normalize_agent_context_assist_ids(
+            arguments[name], name
+        )
+    return json.dumps(arguments, ensure_ascii=False)
 
 
 def normalize_agent_prompt_assist_updates(
@@ -8746,7 +8817,7 @@ def response_agent_tool_calls(
                 f"Agent returned an unknown function call: {tool}"
             )
         tool_calls.append(tool_call)
-    return append_agent_patch_readfile_tool_calls(
+    return normalize_agent_patch_tool_calls(
         normalize_agent_controller_tool_calls(tool_calls)
     )
 
@@ -8951,12 +9022,22 @@ def format_agent_context_assist_report(
     clear_stale_summary: bool = False,
     write_context_summary: bool = False,
     skip_next_context_assist_interval: bool = False,
+    removed_turn_ids: list[int] | None = None,
+    removed_file_ids: list[int] | None = None,
 ) -> str:
+    removed_turns = ", ".join(
+        str(identifier) for identifier in removed_turn_ids or ()
+    ) or "none"
+    removed_files = ", ".join(
+        str(identifier) for identifier in removed_file_ids or ()
+    ) or "none"
     return format_agent_turn_report(
         "Context assist:\n"
         f"Compaction required: {'yes' if require_compaction else 'no'}\n"
         f"Context summary requested: {'yes' if write_context_summary else 'no'}\n"
         f"Stale summary cleared: {'yes' if clear_stale_summary else 'no'}\n"
+        f"Removed turn IDs: {removed_turns}\n"
+        f"Removed file IDs: {removed_files}\n"
         "Skip next context assist interval: "
         f"{'yes' if skip_next_context_assist_interval else 'no'}\n"
         f"Summary:\n{summary}",
@@ -9141,19 +9222,34 @@ def agent_history_tool_content(turn: AgentTurn) -> str:
     return turn.output
 
 
+def agent_file_context_id(
+    path: str,
+    file_context_ids: dict[str, int],
+) -> int:
+    if path not in file_context_ids:
+        file_context_ids[path] = max(file_context_ids.values(), default=-1) + 1
+    return file_context_ids[path]
+
+
 def agent_file_context_section(
     section: str,
     expires_in_turns: int,
     model: str = "",
+    file_id: int | None = None,
 ) -> str:
     attributes = agent_file_context_attributes(section)
     if attributes is None:
         return section
+    if file_id is None:
+        identifier = attributes.get("ID", "")
+        if identifier.isascii() and identifier.isdigit():
+            file_id = int(identifier)
+    file_id_attribute = f" ID='{file_id}'" if file_id is not None else ""
     attribute_text = " ".join(
         f"{name}={quote_tag_attribute(value)}"
         for name, value in attributes.items()
         if name not in (
-            "turn", "last_refreshed_time", "last_modified_time",
+            "ID", "turn", "last_refreshed_time", "last_modified_time",
             "expires_in_turns", "token_count", "relative_path",
         )
     )
@@ -9162,7 +9258,7 @@ def agent_file_context_section(
         section.split("\n", 1)[1].removesuffix("</file>"),
         model=model,
         attributes=(
-            f" expires_in_turns='{expires_in_turns}' {attribute_text}"
+            f"{file_id_attribute} expires_in_turns='{expires_in_turns}' {attribute_text}"
             f"{file_context_relative_path_attribute(attributes.get('path', ''))}"
         ),
     )
@@ -9177,7 +9273,10 @@ def format_agent_readfile_contexts(
     turn_numbers: list[int],
     visible_turn_numbers: set[int],
     model: str = "",
+    file_context_ids: dict[str, int] | None = None,
 ) -> str:
+    if file_context_ids is None:
+        file_context_ids = {}
     sections: list[str] = []
     for turn_number, turn in zip(turn_numbers, turns):
         if turn_number not in visible_turn_numbers:
@@ -9192,6 +9291,7 @@ def format_agent_readfile_contexts(
                     section,
                     file_expires_in_turns[path],
                     model=model,
+                    file_id=agent_file_context_id(path, file_context_ids),
                 )
             )
     return "\n".join(sections)
@@ -9205,7 +9305,16 @@ def build_agent_files_context(
     turn_numbers: list[int],
     visible_turn_numbers: set[int],
     model: str = "",
+    file_context_ids: dict[str, int] | None = None,
 ) -> str:
+    if file_context_ids is None:
+        file_context_ids = {}
+    for path, _ in file_contexts:
+        agent_file_context_id(path, file_context_ids)
+    for turn in turns:
+        if turn.purge_in_turns is None:
+            for path, _ in turn.readfile_contexts or ():
+                agent_file_context_id(path, file_context_ids)
     refreshed_paths = {
         path
         for turn_number, turn in zip(turn_numbers, turns)
@@ -9217,6 +9326,7 @@ def build_agent_files_context(
             file_contexts[index][1],
             file_expires_in_turns[file_contexts[index][0]],
             model=model,
+            file_id=file_context_ids[file_contexts[index][0]],
         )
         for index in sorted(visible_file_indexes)
         if file_contexts[index][0] not in refreshed_paths
@@ -9226,6 +9336,7 @@ def build_agent_files_context(
         turn_numbers,
         visible_turn_numbers,
         model=model,
+        file_context_ids=file_context_ids,
     )
     return "\n".join(
         value for value in (*initial_sections, readfile_context) if value
@@ -9419,6 +9530,7 @@ def format_agent_history(
                 model=model,
                 attributes=(
                     f"{turn_unix_time_attribute}{pinned_attribute} "
+                    f"ID='{turn_number}' "
                     f"index='{agent_controller_turn_number(turn, turn_number)}' "
                     f"tool_call_index='{turn.tool_call_index}' "
                     f"expires_in_turns='{turn.expires_in_turns}'{purge_attribute}"
@@ -9476,6 +9588,7 @@ def refresh_agent_file_contexts(
         missing_file_expires_in_turns=settings.agent_context_expires[1],
         model=settings.model_settings.model,
         token_limit=settings.token_limit,
+        file_context_ids=settings.file_context_ids,
     ))
     if not refreshed_sections:
         return
@@ -10799,6 +10912,101 @@ def apply_agent_context_summary(
     pinned_turn_numbers.difference_update(summary.removed_turn_numbers)
 
 
+def apply_agent_context_assist_removals(
+    remove_turn_ids: list[int],
+    remove_file_ids: list[int],
+    reviewed_context: str,
+    reviewed_turn: int,
+    *,
+    file_context_ids: dict[str, int],
+    file_contexts: list[tuple[str, str]],
+    turns: list[AgentTurn],
+    file_expires_in_turns: dict[str, int],
+    pinned_paths: set[str],
+    pinned_turn_numbers: set[int],
+) -> tuple[list[int], list[int]]:
+    reviewed_files: dict[int, tuple[str, str]] = {}
+    for path, section in parse_agent_readfile_contexts(reviewed_context) or ():
+        attributes = agent_file_context_attributes(section) or {}
+        identifier = attributes.get("ID", "")
+        if identifier.isascii() and identifier.isdigit():
+            reviewed_files[int(identifier)] = (path, section)
+    current_files = dict(file_contexts)
+    newer_paths: set[str] = set()
+    for turn in turns:
+        if turn.purge_in_turns is not None:
+            continue
+        current_files.update(turn.readfile_contexts or ())
+        if turn.state_turn is not None and turn.state_turn >= reviewed_turn:
+            newer_paths.update(path for path, _ in turn.readfile_contexts or ())
+
+    def file_content(section: str) -> tuple[str, ...]:
+        attributes = agent_file_context_attributes(section) or {}
+        return (
+            attributes.get("error", ""),
+            attributes.get("encoding", ""),
+            attributes.get("line_ending", ""),
+            attributes.get("total_lines", ""),
+            section.partition("\n")[2],
+        )
+
+    removed_paths: set[str] = set()
+    removed_file_ids: list[int] = []
+    for identifier in dict.fromkeys(remove_file_ids):
+        reviewed_file = reviewed_files.get(identifier)
+        if reviewed_file is None:
+            continue
+        path, section = reviewed_file
+        if (
+            file_context_ids.get(path) != identifier
+            or path not in current_files
+            or path in newer_paths
+            or file_content(current_files[path]) != file_content(section)
+        ):
+            continue
+        removed_paths.add(path)
+        removed_file_ids.append(identifier)
+    if removed_paths:
+        file_contexts[:] = [
+            context for context in file_contexts
+            if context[0] not in removed_paths
+        ]
+        for path in removed_paths:
+            file_expires_in_turns.pop(path, None)
+        pinned_paths.difference_update(removed_paths)
+        remove_duplicate_agent_history_context_files(
+            turns,
+            tuple((path, current_files[path]) for path in sorted(removed_paths)),
+        )
+
+    available_turn_ids = set(agent_history_turn_numbers(turns))
+    retained_files = dict(file_contexts)
+    removed_turn_ids: list[int] = []
+    for identifier in dict.fromkeys(remove_turn_ids):
+        if identifier not in available_turn_ids:
+            continue
+        turn = turns[identifier]
+        if turn.state_turn is not None and turn.state_turn >= reviewed_turn:
+            continue
+        contexts = list(turn.readfile_contexts or ())
+        expirations = agent_file_context_expirations(
+            contexts, turn.expires_in_turns
+        )
+        for path, section in contexts:
+            retained_files[path] = section
+            file_expires_in_turns[path] = expirations[path]
+            if identifier in pinned_turn_numbers:
+                pinned_paths.add(path)
+        remove_agent_history_turn(
+            turns, identifier, "This agent turn was removed by context assist."
+        )
+        turns[identifier] = replace(turns[identifier], readfile_contexts=())
+        pinned_turn_numbers.discard(identifier)
+        removed_turn_ids.append(identifier)
+    file_contexts[:] = list(retained_files.items())
+    return removed_turn_ids, removed_file_ids
+
+
 def agent_context_removal_candidates(
     file_contexts: list[tuple[str, str]],
     turns: list[AgentTurn],
@@ -10905,6 +11113,7 @@ def build_agent_context_window_prompts(
     pinned_paths: set[str],
     pinned_turn_numbers: set[int],
     file_expires_in_turns: dict[str, int] | None = None,
+    file_context_ids: dict[str, int] | None = None,
     revision_instruction: str = "",
     controller_tools: list[dict[str, Any]] | None = None,
     hook_contents: tuple[str, ...] = (),
@@ -10927,6 +11136,8 @@ def build_agent_context_window_prompts(
         file_expires_in_turns = agent_file_context_expirations(
             file_contexts
         )
+    if file_context_ids is None:
+        file_context_ids = {}
     if context_summary is None:
         context_summary = AgentContextSummary()
     if advance_expirations:
@@ -10967,6 +11178,7 @@ def build_agent_context_window_prompts(
             turn_numbers,
             visible_turn_numbers,
             model=model,
+            file_context_ids=file_context_ids,
         )
         full_system_prompt, user_prompt = build_agent_followup_prompts(
             system_prompt=system_prompt,
@@ -11761,6 +11973,10 @@ class AgentAssist:
     request_settings: AgentRunSettings | None = None
     request_turn: int = 0
     request_summary: AgentContextSummary | None = None
+    context_removal_handler: Callable[
+        [list[int], list[int], str, int],
+        tuple[list[int], list[int]],
+    ] | None = field(default=None, repr=False)
 
 
     def restore_pending(self) -> None:
@@ -11775,6 +11991,8 @@ class AgentAssist:
             self.settings,
             state_session_dir=assist_dir,
             state_turn=self.request_turn,
+            context="",
+            file_context_ids=self.settings.file_context_ids.copy(),
             log_path=turn_dir / "log" if self.settings.log_enabled else None,
             cumulative_stats=CumulativeStats(),
             runtime_state_checkpoint=None,
@@ -11790,6 +12008,11 @@ class AgentAssist:
                 self.request_settings.cumulative_stats.restore(
                     runtime_state["cumulative_stats"]
                 )
+                self.request_settings.file_context_ids = runtime_state["file_context_ids"].copy()
+                metadata = runtime_state["turn_metadata"] or {}
+                reviewed_context = metadata.get("reviewed_file_context", "")
+                if isinstance(reviewed_context, str):
+                    self.request_settings.context = reviewed_context
             self.request_summary = (
                 load_state_agent_context_summary(turn_dir)
                 or AgentContextSummary()
@@ -11809,14 +12032,21 @@ class AgentAssist:
         except Exception as exc:
             future.set_exception(exc)
 
+    def is_due(self) -> bool:
         interval = getattr(self.settings, f"agent_{self.assist_type}_assist")
         current_turn = self.settings.state_turn
+        last_turn = self.settings.assist_last_turns.get(self.assist_type, 0)
+        retry_turn = self.settings.assist_retry_turns.get(self.assist_type)
         return (
             interval is not None
             and interval > 0
             and current_turn > 0
-            and current_turn % interval == 0
-            and current_turn > self.settings.assist_last_turns.get(self.assist_type, -1)
+            and (
+                current_turn >= retry_turn
+                if retry_turn is not None
+                else (current_turn - last_turn) % interval == 0
+            )
+            and current_turn > last_turn
         )
 
     def start_if_due(
@@ -11826,14 +12056,15 @@ class AgentAssist:
         tools: list[dict[str, Any]] | None,
         task: str,
     ) -> None:
+        self.collect()
         if not self.is_due():
             return
         interval = getattr(self.settings, f"agent_{self.assist_type}_assist")
         current_turn = self.settings.state_turn
-        self.collect()
         if (
             self.assist_type == "context"
             and self.settings.context_assist_skip_next_interval
+            and self.assist_type not in self.settings.assist_retry_turns
         ):
             self.settings.context_assist_skip_next_interval = False
             self.settings.assist_last_turns[self.assist_type] = current_turn
@@ -11903,6 +12134,9 @@ class AgentAssist:
             marker="\n[... agent request truncated to fit the assist token limit ...]\n",
         )
         if not request_text:
+            self.settings.assist_retry_turns[self.assist_type] = current_turn + 1
+            if self.settings.runtime_state_checkpoint is not None:
+                self.settings.runtime_state_checkpoint()
             print(
                 f"WARNING: Agent {self.assist_type} assist request cannot fit "
                 f"within its token limit ({request_profile.token_limit}).",
@@ -11927,6 +12161,7 @@ class AgentAssist:
                 else None
             ),
             context_summary=replace(request_summary),
+            file_context_ids=self.settings.file_context_ids.copy(),
             system_prompt_overrides=self.settings.system_prompt_overrides.copy(),
             system_prompt_history=self.settings.system_prompt_history.copy(),
             context_assist_summary="",
@@ -11937,6 +12172,7 @@ class AgentAssist:
             pending_revision_instruction="",
             advance_expirations=True,
             assist_last_turns={},
+            assist_retry_turns={},
             pending_assists={},
             runtime_state_checkpoint=None,
             cumulative_stats=CumulativeStats(token_cost=request_profile.token_cost),
@@ -11961,6 +12197,11 @@ class AgentAssist:
             task,
             context_assist=self.assist_type == "context",
             prompt_assist=self.assist_type == "prompt",
+            turn_metadata=(
+                {"reviewed_file_context": request_settings.context}
+                if self.assist_type == "context"
+                else None
+            ),
         )
 
     def collect(self) -> None:
@@ -11978,7 +12219,9 @@ class AgentAssist:
             result = future.result()
             assist = json.loads(result.response)
             if self.assist_type == "context":
-                self.apply_context_result(assist, request_summary)
+                self.apply_context_result(
+                    assist, request_summary, request_settings.context
+                )
             else:
                 prompts = agent_system_prompts(self.settings)
                 updates = normalize_agent_prompt_assist_updates(
@@ -12008,11 +12251,14 @@ class AgentAssist:
                     ),
                 )
         except Exception as exc:
+            self.settings.assist_retry_turns[self.assist_type] = self.request_turn + 1
             print(
                 f"WARNING: Agent {self.assist_type} assist failed: "
                 f"{format_exception_message(exc)}",
                 file=sys.stderr,
             )
+        else:
+            self.settings.assist_retry_turns.pop(self.assist_type, None)
         finally:
             self.settings.pending_assists.pop(self.assist_type, None)
             self.settings.cumulative_stats.merge(
@@ -12039,7 +12285,14 @@ class AgentAssist:
         self,
         assist: dict[str, Any],
         request_summary: AgentContextSummary,
+        reviewed_context: str = "",
     ) -> None:
+        remove_turn_ids = normalize_agent_context_assist_ids(
+            assist.get("remove_turn_ids", []), "remove_turn_ids"
+        )
+        remove_file_ids = normalize_agent_context_assist_ids(
+            assist.get("remove_file_ids", []), "remove_file_ids"
+        )
         clear_stale_summary = assist["clear_stale_summary"]
         summary = self.settings.context_summary
         summary_updated = bool(
@@ -12090,6 +12343,14 @@ class AgentAssist:
             summary.content = ""
             summary.expires_in_turns = self.settings.agent_context_expires[0]
             summary.generated_turn = None
+        removed_turn_ids: list[int] = []
+        removed_file_ids: list[int] = []
+        if self.context_removal_handler is not None and (
+            remove_turn_ids or remove_file_ids
+        ):
+            removed_turn_ids, removed_file_ids = self.context_removal_handler(
+                remove_turn_ids, remove_file_ids, reviewed_context, self.request_turn
+            )
         emit_agent_output(
             self.settings,
             format_agent_context_assist_report(
@@ -12103,6 +12364,8 @@ class AgentAssist:
                 skip_next_context_assist_interval=(
                     self.settings.context_assist_skip_next_interval
                 ),
+                removed_turn_ids=removed_turn_ids,
+                removed_file_ids=removed_file_ids,
             ),
         )
 
@@ -12220,6 +12483,7 @@ def run_agent_load_file_from_storage_tool(
             existing_context_sections=(
                 parse_agent_readfile_contexts(settings.context) or ()
             ),
+            file_context_ids=settings.file_context_ids,
         )
     except Exception as exc:
         return AgentToolExecution(
@@ -12561,6 +12825,7 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
         pinned_paths=pinned_paths,
         pinned_turn_numbers=pinned_turn_numbers,
         file_expires_in_turns=file_expires_in_turns,
+        file_context_ids=settings.file_context_ids,
         controller_tools=controller_tools,
         meta_task_list=meta_task_list,
         revision_instruction=settings.pending_revision_instruction,
@@ -12627,7 +12892,35 @@ def run_agent_controller(
             list(range(len(turns))),
             set(agent_history_turn_numbers(turns)),
             model=settings.model_settings.model,
+            file_context_ids=settings.file_context_ids,
         )
+
+    def remove_stale_context(
+        remove_turn_ids: list[int],
+        remove_file_ids: list[int],
+        reviewed_context: str,
+        reviewed_turn: int,
+    ) -> tuple[list[int], list[int]]:
+        if remove_file_ids:
+            refresh_agent_file_contexts(
+                settings, file_contexts, turns, file_expires_in_turns
+            )
+        removed_ids = apply_agent_context_assist_removals(
+            remove_turn_ids,
+            remove_file_ids,
+            reviewed_context,
+            reviewed_turn,
+            file_context_ids=settings.file_context_ids,
+            file_contexts=file_contexts,
+            turns=turns,
+            file_expires_in_turns=file_expires_in_turns,
+            pinned_paths=pinned_paths,
+            pinned_turn_numbers=pinned_turn_numbers,
+        )
+        settings.context = current_file_context()
+        return removed_ids
+
+    context_assist.context_removal_handler = remove_stale_context
 
     def current_turn_metadata() -> dict[str, Any]:
         return build_agent_turn_metadata(
@@ -12711,6 +13004,7 @@ def run_agent_controller(
                     pinned_paths=pinned_paths,
                     pinned_turn_numbers=pinned_turn_numbers,
                     file_expires_in_turns=file_expires_in_turns,
+                    file_context_ids=settings.file_context_ids,
                     revision_instruction=settings.pending_revision_instruction,
                     controller_tools=controller_tools,
                     hook_contents=hook_contents,
@@ -12924,13 +13218,6 @@ def run_agent_controller(
             return True
  
         for tool_call_index, tool_call in enumerate(tool_calls):
-            patch_readfile_companion = (
-                tool_call_index > 0
-                and is_agent_patch_readfile_companion(
-                    tool_calls[tool_call_index - 1],
-                    tool_call,
-                )
-            )
             if settings.agent_auto:
                 try:
                     emit_agent_auto_tool_call(
@@ -13082,11 +13369,6 @@ def run_agent_controller(
                 state_turn=int(model_result.turn_dir.name),
                 tool_call_index=tool_call_index,
                 readfile_contexts=readfile_contexts,
-                preceding_patch_tool_call=(
-                    tool_calls[tool_call_index - 1]
-                    if patch_readfile_companion
-                    else None
-                ),
             )
             tool_outputs.append(tool_output)
             settings.context = current_file_context()
@@ -17231,6 +17513,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             image_urls=image_urls,
         )
 
+    agent_file_context_ids: dict[str, int] = {}
     context_sections: list[tuple[str, str]] = []
     if ask_mode:
         context = ""
@@ -17262,6 +17545,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     agent_context_expires[1] if agent_mode else None
                 ),
                 model=model,
+                file_context_ids=agent_file_context_ids if agent_mode else None,
             )
             context = "\n".join(
                 section for _, section in context_sections
@@ -17534,6 +17818,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             agent_prompt_assist=agent_prompt_assist,
             agent_prompt_assist_settings=assist_settings["prompt"],
             patch_suffix_argument_provided=args.patch_suffix is not None,
+            file_context_ids=agent_file_context_ids,
             pinned_file_paths=(
                 tuple(
                     path for path, section in context_sections
