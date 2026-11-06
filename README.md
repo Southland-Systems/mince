@@ -1,4 +1,4 @@
-![mce logo](mce.webp)
+![mce logo](mce.svg)
 
 ## What it does
 

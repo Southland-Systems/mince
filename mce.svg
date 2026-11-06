@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" role="img" aria-labelledby="mce-title mce-desc">
+  <title id="mce-title">MCE</title>
+  <desc id="mce-desc">A futuristic graphite cube with a luminous four-point star, animated electric-blue seams, teal cooling vents and beveled rear and bottom armor. Cyan, violet and mint light pulses across a sculpted lowercase mce wordmark. The background is transparent.</desc>
+  <style>
+    /* Keep metal and strip cores steady; animate bloom opacity and highlights. */
+    .mce-neon-bloom,
+    .mce-word-glow {
+      opacity: .75;
+      animation: mce-light-breathe 6s ease-in-out infinite;
+    }
+    .mce-neon-flow {
+      fill: none;
+      stroke: #d9ffff;
+      stroke-width: 2.4;
+      stroke-dasharray: 12 88;
+      stroke-dashoffset: 0;
+      opacity: .9;
+      animation: mce-strip-flow 6s linear infinite;
+    }
+    .mce-channel-phase { animation-delay: -1.5s; }
+    .mce-vent-phase { animation-delay: -3s; }
+    .mce-lid-phase { animation-delay: -4.5s; }
+    .mce-word-glow { animation-delay: -.75s; }
+    @keyframes mce-light-breathe {
+      0%, 100% { opacity: .55; }
+      50% { opacity: 1; }
+    }
+    @keyframes mce-strip-flow {
+      to { stroke-dashoffset: -100; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .mce-neon-bloom,
+      .mce-word-glow {
+        animation: none;
+        opacity: .8;
+      }
+      .mce-neon-flow {
+        animation: none;
+        display: none;
+      }
+    }
+  </style>
+  <defs>
+    <linearGradient id="mce-left-shell" x1="219" y1="280" x2="494" y2="675" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#384353"/><stop offset=".48" stop-color="#182331"/><stop offset="1" stop-color="#080e1c"/>
+    </linearGradient>
+    <linearGradient id="mce-left-armor" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#515b6b"/><stop offset=".38" stop-color="#323b4a"/><stop offset="1" stop-color="#141d2a"/>
+    </linearGradient>
+    <linearGradient id="mce-rail-metal" x1="0" y1="0" x2="1" y2=".3">
+      <stop stop-color="#788391"/><stop offset=".13" stop-color="#4c5766"/><stop offset=".55" stop-color="#303b4b"/><stop offset="1" stop-color="#17202e"/>
+    </linearGradient>
+    <linearGradient id="mce-right-shell" x1="510" y1="425" x2="787" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#073045"/><stop offset=".48" stop-color="#07505b"/><stop offset="1" stop-color="#166e53"/>
+    </linearGradient>
+    <linearGradient id="mce-teal-armor" x1="521" y1="674" x2="735" y2="307" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#066482"/><stop offset=".38" stop-color="#078a9b"/><stop offset=".72" stop-color="#1ab7ad"/><stop offset="1" stop-color="#65d6a6"/>
+    </linearGradient>
+    <linearGradient id="mce-teal-bevel" x1="514" y1="435" x2="703" y2="395" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#13dfff"/><stop offset=".34" stop-color="#0bb6cb"/><stop offset="1" stop-color="#a0ffda"/>
+    </linearGradient>
+    <linearGradient id="mce-jade" x1="724" y1="319" x2="784" y2="398" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8cebc3"/><stop offset=".36" stop-color="#4abd91"/><stop offset="1" stop-color="#187b5e"/>
+    </linearGradient>
+    <linearGradient id="mce-steel" x1="0" y1="0" x2=".8" y2="1">
+      <stop stop-color="#a4afc1"/><stop offset=".23" stop-color="#748096"/><stop offset=".65" stop-color="#434d63"/><stop offset="1" stop-color="#2a3145"/>
+    </linearGradient>
+    <linearGradient id="mce-steel-top" x1="0" y1="0" x2=".7" y2="1">
+      <stop stop-color="#e1f1ed"/><stop offset=".4" stop-color="#9eafaf"/><stop offset="1" stop-color="#516770"/>
+    </linearGradient>
+    <linearGradient id="mce-lid-rim" x1="281" y1="137" x2="727" y2="305" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#06d9f5"/><stop offset=".36" stop-color="#087fff"/><stop offset=".7" stop-color="#4339f4"/><stop offset="1" stop-color="#b032fa"/>
+    </linearGradient>
+    <linearGradient id="mce-lid-depth" x1="256" y1="265" x2="754" y2="281" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#075fe5"/><stop offset=".3" stop-color="#102b9c"/><stop offset=".58" stop-color="#1b39bd"/><stop offset=".83" stop-color="#2524ae"/><stop offset="1" stop-color="#812de5"/>
+    </linearGradient>
+    <linearGradient id="mce-lid-light" x1="256" y1="262" x2="754" y2="272" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#36efff"/><stop offset=".38" stop-color="#009dff"/><stop offset=".6" stop-color="#367cff"/><stop offset="1" stop-color="#f078ff"/>
+    </linearGradient>
+    <linearGradient id="mce-front-metal" x1="433" y1="327" x2="575" y2="379" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#a29bd1"/><stop offset=".32" stop-color="#767dab"/><stop offset=".7" stop-color="#414b75"/><stop offset="1" stop-color="#7160c6"/>
+    </linearGradient>
+    <linearGradient id="mce-panel-blue" x1="354" y1="143" x2="659" y2="304" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00c9ff"/><stop offset=".3" stop-color="#137fff"/><stop offset=".7" stop-color="#343dff"/><stop offset="1" stop-color="#6028f5"/>
+    </linearGradient>
+    <linearGradient id="mce-panel-edge" x1="342" y1="150" x2="654" y2="306" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7affff"/><stop offset=".45" stop-color="#3596ff"/><stop offset="1" stop-color="#a987ff"/>
+    </linearGradient>
+    <radialGradient id="mce-panel-sheen" cx=".28" cy=".12" r=".85">
+      <stop stop-color="#c2ffff" stop-opacity=".24"/><stop offset=".65" stop-color="#8ecbff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="mce-star-light" cx=".48" cy=".4" r=".7">
+      <stop stop-color="#ffffff"/><stop offset=".65" stop-color="#f3ffff"/><stop offset="1" stop-color="#d5faff"/>
+    </radialGradient>
+    <linearGradient id="mce-vent-metal" x1="0" y1="0" x2=".42" y2="1">
+      <stop stop-color="#a3b5b7"/><stop offset=".17" stop-color="#71858a"/><stop offset=".5" stop-color="#435b65"/><stop offset="1" stop-color="#233b47"/>
+    </linearGradient>
+    <radialGradient id="mce-bolt-metal" cx=".28" cy=".18" r=".9">
+      <stop stop-color="#a8b5bf"/><stop offset=".38" stop-color="#536471"/><stop offset=".74" stop-color="#202c39"/><stop offset="1" stop-color="#080e18"/>
+    </radialGradient>
+    <linearGradient id="mce-word-metal" x1="465" y1="711" x2="503" y2="906" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#344151"/><stop offset=".28" stop-color="#273342"/><stop offset=".68" stop-color="#192332"/><stop offset="1" stop-color="#0d1521"/>
+    </linearGradient>
+    <linearGradient id="mce-word-edge" x1="278" y1="710" x2="543" y2="912" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8293aa"/><stop offset=".28" stop-color="#4b5e79"/><stop offset=".62" stop-color="#26354d"/><stop offset="1" stop-color="#0c1420"/>
+    </linearGradient>
+    <!-- Reflected seam and vent light fades across the upper letter faces. -->
+    <linearGradient id="mce-word-light" x1="154" y1="748" x2="845" y2="853" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#aad9ff"/><stop offset=".2" stop-color="#55e6ff"/><stop offset=".43" stop-color="#777cff"/><stop offset=".68" stop-color="#48e6f0"/><stop offset="1" stop-color="#a0ffda"/>
+    </linearGradient>
+    <radialGradient id="mce-word-cyan-cast" cx="300" cy="704" r="245" gradientUnits="userSpaceOnUse" gradientTransform="translate(0 704) scale(1 .82) translate(0 -704)">
+      <stop stop-color="#26d7ff" stop-opacity=".62"/><stop offset=".42" stop-color="#129fe7" stop-opacity=".36"/><stop offset="1" stop-color="#0879d0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="mce-word-violet-cast" cx="494" cy="720" r="188" gradientUnits="userSpaceOnUse" gradientTransform="translate(0 720) scale(1 .85) translate(0 -720)">
+      <stop stop-color="#6965ff" stop-opacity=".58"/><stop offset=".5" stop-color="#3c4cff" stop-opacity=".25"/><stop offset="1" stop-color="#3437bd" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="mce-word-teal-cast" cx="708" cy="714" r="250" gradientUnits="userSpaceOnUse" gradientTransform="translate(0 714) scale(1 .8) translate(0 -714)">
+      <stop stop-color="#70ffd0" stop-opacity=".62"/><stop offset=".45" stop-color="#21d9c9" stop-opacity=".34"/><stop offset="1" stop-color="#078a9b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="mce-aura">
+      <stop stop-color="#0988ff" stop-opacity=".17"/><stop offset=".58" stop-color="#00d9d6" stop-opacity=".07"/><stop offset="1" stop-color="#00cfe0" stop-opacity="0"/>
+    </radialGradient>
+
+    <filter id="mce-cube-shadow" x="-25%" y="-20%" width="150%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="19" stdDeviation="19" flood-color="#000811" flood-opacity=".5"/>
+    </filter>
+    <filter id="mce-word-shadow" x="-15%" y="-25%" width="130%" height="170%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="10" flood-color="#00050c" flood-opacity=".55"/>
+    </filter>
+    <!-- Fixed user-space regions prevent clipping on thin seams and letter halos. -->
+    <filter id="mce-neon-glow" filterUnits="userSpaceOnUse" x="190" y="200" width="630" height="540" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="halo"/>
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="bloom"/>
+      <feMerge><feMergeNode in="halo"/><feMergeNode in="bloom"/></feMerge>
+    </filter>
+    <filter id="mce-star-glow" x="-35%" y="-40%" width="170%" height="180%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="6" result="glow"/>
+      <feMerge><feMergeNode in="glow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="mce-ground-blur" x="-25%" y="-150%" width="150%" height="400%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+    <!-- Shared blur-only bloom for the outer halo and clipped letter reflections. -->
+    <filter id="mce-word-bloom" filterUnits="userSpaceOnUse" x="110" y="665" width="780" height="285" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="7" result="halo"/>
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="bloom"/>
+      <feMerge><feMergeNode in="halo"/><feMergeNode in="bloom"/></feMerge>
+    </filter>
+
+    <!-- Reuse contours for bloom, steady cores and normalized moving highlights. -->
+    <path id="mce-front-seam" pathLength="100" d="M501 410v253q0 16 12 25v7"/>
+    <path id="mce-channel-strip" pathLength="100" d="M263 394v19l71 79v21l88 49"/>
+    <path id="mce-lid-seam" pathLength="100" d="M258 248q0 12 12 19l216 125q19 11 38 0l218-125q9-5 10-15"/>
+    <g id="mce-vent-strips">
+      <path d="m574 500 135-48-6 13-128 47Z"/>
+      <path d="m574 551 135-48-6 13-128 47Z"/>
+      <path d="m574 608 153-55-1 4-152 55Z" fill="#20e5db" opacity=".75"/>
+    </g>
+
+    <path id="mce-panel" d="M336 201 483 116Q489 112 495 112H523Q530 112 536 116L681 200Q690 205 690 215V232Q690 239 681 244L538 326Q532 330 525 330H491Q485 330 479 326L336 245Q327 240 327 233V214Q327 206 336 201Z"/>
+    <path id="mce-spark" d="M508 147C514 147 514 165 523 184 533 205 551 211 594 218 602 219 602 226 594 228 553 236 534 241 524 262 515 281 514 297 508 297 502 297 501 281 492 262 482 241 463 235 422 228 414 226 414 220 422 218 464 210 482 205 492 184 501 165 502 147 508 147Z"/>
+    <g id="mce-side-bolt">
+      <ellipse rx="9" ry="12" fill="url(#mce-bolt-metal)" stroke="#b1c7cf" stroke-width=".8"/>
+      <ellipse rx="5.5" ry="7.5" fill="#050b12" stroke="#465968" stroke-width="1"/>
+      <path d="m-1.8-2.8 3.6 5.6" stroke="#82949d" stroke-width="1" opacity=".65"/>
+    </g>
+    <g id="mce-top-bolt">
+      <ellipse rx="11.5" ry="8.3" fill="url(#mce-bolt-metal)" stroke="#c0cad7" stroke-width="1"/>
+      <ellipse rx="7.5" ry="5.1" fill="#070c17" stroke="#4b5b72" stroke-width=".9"/>
+      <path d="m-3-1.5 6 3" stroke="#91a1b5" stroke-width=".9" opacity=".55"/>
+    </g>
+    <!-- Shared letter contours keep fills, reflections and clipping aligned. -->
+    <path id="mce-word-shape" fill-rule="evenodd" clip-rule="evenodd"
+      d="M154 900V791C154 744 186 710 232 710 258 710 280 720 293 739 310 720 332 710 357 710 403 710 433 744 433 791V900H381V795C381 773 369 760 350 760S318 773 318 795V900H265V795C265 773 253 760 234 760S204 773 204 795V900Z
+         M639 757l-46 23C582 765 568 758 551 758 524 758 504 779 504 807 504 835 523 856 551 856 564 856 577 850 585 840L634 863C616 890 585 905 550 905 492 905 447 865 447 807 447 750 493 709 550 709 588 709 620 727 639 757Z
+         M845 826H701C707 846 725 858 750 858 769 858 786 852 798 841L838 862C818 890 785 905 750 905 689 905 647 866 647 808 647 752 690 709 749 709 807 709 845 750 845 807ZM702 790H797C792 769 775 756 749 756 726 756 709 770 702 790Z"/>
+    <clipPath id="mce-word-clip" clipPathUnits="userSpaceOnUse">
+      <use href="#mce-word-shape" fill="#fff"/>
+    </clipPath>
+    <g id="mce-word-rim" fill="none" stroke-linecap="round">
+      <path d="M155 790c0-46 31-79 77-79 26 0 48 10 61 29 17-19 39-29 64-29 45 0 75 33 75 80v108" opacity=".9"/>
+      <path d="M203 795c0-23 12-36 31-36s32 13 32 36" opacity=".55"/>
+      <path d="M317 899V795c0-23 13-36 33-36s32 13 32 36" opacity=".6"/>
+      <path d="M638 756c-19-29-50-46-88-46-57 0-102 41-102 97" opacity=".85"/>
+      <path d="M503 807c0 29 20 50 48 50 14 0 27-6 35-16l47 22" opacity=".85"/>
+      <path d="M648 807c0-55 42-97 101-97 58 0 95 40 95 97" opacity=".9"/>
+      <path d="M702 827c6 20 24 32 48 32 19 0 36-6 48-17l39 20" opacity=".9"/>
+      <path d="M704 791h91" opacity=".7"/>
+    </g>
+  </defs>
+
+  <!-- Restrained ambient light; no raster image or background rectangle. -->
+  <ellipse cx="514" cy="421" rx="340" ry="349" fill="url(#mce-aura)"/>
+  <ellipse cx="509" cy="693" rx="216" ry="23" fill="#020a16" opacity=".42" filter="url(#mce-ground-blur)"/>
+
+  <g id="mce-cube" stroke-linejoin="round" stroke-linecap="round" filter="url(#mce-cube-shadow)">
+    <!-- Closed structural shell and recessed corner. -->
+    <path d="M238 254 504 395 759 254 784 282V555Q784 572 769 585L537 697Q521 705 505 688L483 699Q469 704 455 696L228 565Q214 557 214 539L216 291Q216 273 231 263Z" fill="#09131f"/>
+    <path d="m236 264 268 143v273l-23 14q-12 7-25-1L229 562q-11-7-11-23V290q0-16 18-26Z" fill="url(#mce-left-shell)" stroke="#495568" stroke-width=".8"/>
+    <path d="m504 407 255-139 23 17v267q0 16-14 28L535 692q-16 7-31-12Z" fill="url(#mce-right-shell)" stroke="#257268" stroke-width=".8"/>
+
+    <!-- Rear returns join the lid shoulders to the outside vertical edges. -->
+    <g id="mce-rear-returns">
+      <path d="M256 225 278 238 249 274 231 298V534L247 551 237 565 225 557Q214 550 214 535V291Q214 275 229 263Z" fill="url(#mce-left-armor)" stroke="#0a1423" stroke-width="1.8"/>
+      <path d="M256 225 278 238 249 274 231 298 216 290Q216 275 229 263Z" fill="url(#mce-steel)" stroke="#0a1423" stroke-width="1.2"/>
+      <path d="M253 232 231 265Q222 274 221 286" stroke="#b9c9dc" stroke-width="1.1" opacity=".68"/>
+      <path d="M754 225 732 238 761 274 769 291V535L752 555 763 578 774 569Q784 560 784 546V285Q784 274 772 263Z" fill="url(#mce-right-shell)" stroke="#0b2230" stroke-width="1.8"/>
+      <path d="M754 225 732 238 761 274 769 291 784 285Q784 274 772 263Z" fill="url(#mce-steel-top)" stroke="#0b2230" stroke-width="1.2"/>
+      <path d="M756 232 775 272 780 284M779 407v132q0 14-12 25" stroke="#87e6c2" stroke-width="1" opacity=".55"/>
+    </g>
+
+    <!-- Continuous base rails and a front end cap close the lower shell gaps. -->
+    <g id="mce-base-returns">
+      <path d="M218 528 240 548 455 672 478 684 496 673 507 682 483 698Q471 705 456 696L229 565Q214 557 214 539V528Z" fill="#0a1321" stroke="#070f1b" stroke-width="1.6"/>
+      <path d="M218 528 240 548 455 672 478 684 496 673 501 679 483 690Q470 697 456 688L229 557Q218 550 218 539Z" fill="url(#mce-rail-metal)"/>
+      <path d="M234 550 456 678Q470 687 482 680L493 674" stroke="#8ca4c2" stroke-width="1.1" opacity=".5"/>
+      <path d="M513 663 532 676Q537 680 543 677L744 584 762 566Q775 555 782 538L784 545V555Q784 572 769 585L537 697Q521 705 505 688Z" fill="#06232e" stroke="#07131d" stroke-width="1.6"/>
+      <path d="M513 663 532 676Q537 680 543 677L744 584 762 566Q775 555 782 538L780 553Q777 567 766 576L535 688Q521 695 510 683Z" fill="url(#mce-right-shell)"/>
+      <path d="M538 687 750 585 767 570" stroke="#49cbb2" stroke-width="1" opacity=".65"/>
+      <path d="m483 675 22 12 21-11 13 12-20 15q-8 5-17 0l-22-12Z" fill="url(#mce-rail-metal)" stroke="#07111f" stroke-width="1.6"/>
+      <path d="m483 686 22 13q6 4 12 0l18-13 4 2-20 15q-8 5-17 0l-22-12Z" fill="#081421"/>
+      <path d="m487 680 19 11 18-10" stroke="#93cce5" stroke-width="1" opacity=".5"/>
+    </g>
+
+    <path d="M228 289v245l13 14V294Z" fill="#0b1320"/>
+    <path d="M222 296v234" stroke="#60708a" stroke-width=".8" opacity=".45"/>
+    <use href="#mce-front-seam" class="mce-neon-bloom" stroke="#1548f6" stroke-width="14" filter="url(#mce-neon-glow)"/>
+    <use href="#mce-front-seam" stroke="#00c5ff" stroke-width="5"/>
+    <path d="M503 415v247q0 13 10 24v7" stroke="#8cffff" stroke-width="1.4" opacity=".9"/>
+    <use href="#mce-front-seam" class="mce-neon-flow"/>
+
+    <!-- Graphite armor and the angular illuminated channel. -->
+    <path d="m245 374 30 17v14l72 80v18l85 48v28l-107-60v-24l-80-85Z" fill="#020812" stroke="#40536a" stroke-width="1.2"/>
+    <use href="#mce-channel-strip" class="mce-neon-bloom mce-channel-phase" stroke="#006bff" stroke-width="13" filter="url(#mce-neon-glow)"/>
+    <use href="#mce-channel-strip" stroke="#20e9ff" stroke-width="6" stroke-linejoin="bevel"/>
+    <path d="M264 398v13l71 79v22l85 48" stroke="#c0ffff" stroke-width="1.5" opacity=".9"/>
+    <use href="#mce-channel-strip" class="mce-neon-flow mce-channel-phase"/>
+    <path d="m242 263 40 23v59l93 106v43l-17-9-92-96-24-12-17-10v-82q0-14 17-22Z" fill="url(#mce-left-armor)" stroke="#070e1a" stroke-width="2.3"/>
+    <path d="m294 292 141 79v156l-52-30v-43l-89-102Z" fill="url(#mce-left-armor)" stroke="#070e19" stroke-width="3"/>
+    <path d="m296 294 137 78v150M284 292v54l93 106v39" stroke="#8390a3" stroke-width="1" opacity=".62"/>
+    <path d="m245 429 50 53v88q0 11-9 14l-47-27q-7-4-7-14v-97q0-11 13-17Z" fill="url(#mce-left-armor)" stroke="#080f1c" stroke-width="2"/>
+    <path d="m245 431 47 51v87" stroke="#a4b1c4" stroke-width="1.2" opacity=".8"/>
+    <path d="m307 509 115 66v88l-115-64q-8-5-8-15v-67Z" fill="url(#mce-left-armor)" stroke="#080f1a" stroke-width="2"/>
+    <path d="m308 512 111 64" stroke="#a7b6c8" stroke-width="1.4" opacity=".85"/>
+    <path d="m451 382 31 18q11 7 11 20v236q0 13-11 20l-16 10q-6 4-12 0l-33-19v-83l14-13V398q0-9 16-16Z" fill="url(#mce-rail-metal)" stroke="#070d18" stroke-width="2.2"/>
+    <path d="m451 384 25 26q3 3 3 10v237q0 12-14 21" stroke="#bac5d5" stroke-width="1.1" opacity=".7"/>
+    <path d="m480 410 10 6v240q0 10-10 17Z" fill="#111b2b" opacity=".88"/>
+    <path d="m423 586 12-13V402" stroke="#8491a5" stroke-width="1" opacity=".55"/>
+    <use href="#mce-side-bolt" transform="translate(245 294) rotate(-17)"/>
+    <use href="#mce-side-bolt" transform="translate(244 530) rotate(-17)"/>
+    <use href="#mce-side-bolt" transform="translate(450 423) rotate(-16)"/>
+    <use href="#mce-side-bolt" transform="translate(449 648) rotate(-16)"/>
+
+    <!-- Teal front armor, green corner bracket and machined vent recess. -->
+    <path d="m744 565 15-14q14-10 14-21V414l9-12v149q0 13-11 23l-26 25Z" fill="url(#mce-right-shell)" stroke="#2fbd93" stroke-width=".8"/>
+    <path d="m532 395 158-86q9-5 12 6v67l53 29q13 7 13 20v104q0 13-10 21l-14 12v29l-203 89q-9 4-15-2l-12-11V423q0-18 18-28Z" fill="url(#mce-teal-armor)" stroke="#6be6d2" stroke-width=".9"/>
+    <path d="m532 395 158-86q6-3 10 2l-162 97q-10 6-10 18v250l9 10q-6 2-11-2l-12-11V423q0-18 18-28Z" fill="url(#mce-teal-bevel)"/>
+    <path d="M529 429v246M541 678l194-85" stroke="#56e8e0" stroke-width=".9" opacity=".58"/>
+    <path d="m707 306 49-27q11-5 22 8l5 6v105q0 10-10 16l-55-29Z" fill="#102a31" stroke="#07131d" stroke-width="2"/>
+    <path d="m707 306 49-27 22 12-52 30Z" fill="url(#mce-steel-top)" stroke="#d6eee2" stroke-width=".7"/>
+    <path d="m707 306 19 15v63l-11 6-12-7v-71Z" fill="url(#mce-rail-metal)" stroke="#07131c" stroke-width="1.3"/>
+    <path d="m726 321 51-29v106q0 8-7 11l-44-25Z" fill="url(#mce-jade)" stroke="#a2f3ce" stroke-width=".9"/>
+    <path d="m730 324 43-25v94" stroke="#dcffe8" stroke-width=".8" opacity=".65"/>
+    <path d="M744 569v26" stroke="#042b34" stroke-width="2"/>
+    <path d="m568 461 154-54q17-6 19 11v128q0 14-12 20l-159 58q-16 6-16-10V480q0-13 14-19Z" fill="#031018" stroke="#053b42" stroke-width="4"/>
+    <path d="M559 484v129q0 10 11 6l158-57" stroke="#52bebd" stroke-width="1" opacity=".65"/>
+    <path d="m563 469 161-57q11-4 12 6" stroke="#01080e" stroke-width="4"/>
+    <use href="#mce-vent-strips" class="mce-neon-bloom mce-vent-phase" fill="#2ffff0" filter="url(#mce-neon-glow)"/>
+    <use href="#mce-vent-strips" fill="#2ffff0"/>
+    <g fill="url(#mce-vent-metal)" stroke="#06141d" stroke-width="1.6">
+      <path d="m568 474 159-57q8-3 8 5v17q0 6-7 9l-158 56q-8 3-8-5v-15q0-7 6-10Z"/>
+      <path d="m568 525 159-57q8-3 8 5v17q0 6-7 9l-158 56q-8 3-8-5v-15q0-7 6-10Z"/>
+      <path d="m568 576 159-57q8-3 8 5v17q0 6-7 9l-158 56q-8 3-8-5v-15q0-7 6-10Z"/>
+    </g>
+    <g fill="url(#mce-steel-top)">
+      <path d="m568 474 159-57q5-2 8 2l-164 59q-6 2-6 9l-3-3q0-7 6-10Z"/>
+      <path d="m568 525 159-57q5-2 8 2l-164 59q-6 2-6 9l-3-3q0-7 6-10Z"/>
+      <path d="m568 576 159-57q5-2 8 2l-164 59q-6 2-6 9l-3-3q0-7 6-10Z"/>
+    </g>
+    <path d="m570 475 159-56m-159 107 159-56m-159 107 159-56" stroke="#e0fff6" stroke-width="1" opacity=".8"/>
+    <use href="#mce-side-bolt" transform="translate(549 423) rotate(18)"/>
+    <use href="#mce-side-bolt" transform="translate(549 656) rotate(18)"/>
+    <use href="#mce-side-bolt" transform="translate(767 314) scale(.76) rotate(17)"/>
+    <use href="#mce-side-bolt" transform="translate(767 371) scale(.76) rotate(17)"/>
+    <use href="#mce-side-bolt" transform="translate(758 565) scale(.8) rotate(17)"/>
+
+    <!-- Raised lid: luminous gasket, segmented metal frame and inset blue panel. -->
+    <path d="m256 225 249 140 249-140v29q0 11-11 18L526 398q-21 12-42 0L267 273q-11-6-11-18Z" fill="url(#mce-lid-depth)" stroke="#103e96" stroke-width="1.2"/>
+    <use href="#mce-lid-seam" class="mce-neon-bloom mce-lid-phase" stroke="url(#mce-lid-light)" stroke-width="10" filter="url(#mce-neon-glow)"/>
+    <use href="#mce-lid-seam" stroke="url(#mce-lid-light)" stroke-width="4"/>
+    <use href="#mce-lid-seam" class="mce-neon-flow mce-lid-phase"/>
+    <path d="m269 208 216-124q20-12 40 0l216 124q13 7 13 18t-13 18L525 369q-20 12-40 0L269 244q-13-7-13-18t13-18Z" fill="url(#mce-lid-rim)" stroke="url(#mce-lid-light)" stroke-width="1.6"/>
+    <path d="m282 209 204-117q19-11 38 0l204 117q11 7 11 16t-11 16L524 359q-19 11-38 0L282 241q-11-7-11-16t11-16Z" fill="url(#mce-steel)" stroke="#111a30" stroke-width="2.4"/>
+    <path d="m270 208 215-124q20-12 40 0l32 18-27 15-8-4h-28q-6 0-12 4l-128 74-28-6-42 24Z" fill="url(#mce-panel-blue)"/>
+    <path d="M269 215 484 92q21-12 42 0l26 15" stroke="#46edff" stroke-width="1.8" opacity=".7"/>
+    <path d="m559 130 28-9 44 25-27 9Z" fill="#6c77bc" stroke="#9db6ff" stroke-width="1"/>
+    <path d="m607 157 27-8 51 29-26 12Z" fill="#6464a1" stroke="#a4a4f3" stroke-width=".8"/>
+    <path d="m274 212 46-27 34 5-22 13q-7 4-7 12v17q0 6 7 10l43 25-18 14-75-43q-9-5-9-12v-8q0-4 1-6Z" fill="url(#mce-steel)" stroke="#070e1b" stroke-width="2.4"/>
+    <path d="m736 212-46-27-34 5 22 13q7 4 7 12v17q0 6-7 10l-43 25 18 14 75-43q9-5 9-12v-8q0-4-1-6Z" fill="url(#mce-steel)" stroke="#070e1b" stroke-width="2.4"/>
+    <path d="m276 215 45-26 25 4m343-4 41 24q5 3 5 11" stroke="#d4dbea" stroke-width=".9" opacity=".7"/>
+    <path d="m363 278 17-10 67 39-17 10Z" fill="url(#mce-steel)" stroke="#080e1a" stroke-width="2.2"/>
+    <path d="m363 278 67 39v29l-67-39Z" fill="url(#mce-rail-metal)" stroke="#080e1a" stroke-width="2.2"/>
+    <path d="m647 278-17-10-67 39 17 10Z" fill="url(#mce-steel)" stroke="#080e1a" stroke-width="2.2"/>
+    <path d="m580 317 67-39v29l-67 39Z" fill="url(#mce-rail-metal)" stroke="#080e1a" stroke-width="2.2"/>
+    <path d="m433 321 53 31q19 11 38 0l53-29v25l-53 31q-19 11-38 0l-53-31Z" fill="#263354" stroke="#090e20" stroke-width="2"/>
+    <path d="m433 321 18-10 27 16q6 4 13 4h33q6 0 12-4l23-14 18 10-53 31q-19 11-38 0Z" fill="url(#mce-front-metal)" stroke="#0b1330" stroke-width="2"/>
+    <path d="m435 347 52 30q18 11 37 0l51-29" stroke="#7068ff" stroke-width="1.3" opacity=".8"/>
+    <use href="#mce-top-bolt" transform="translate(297 220)"/>
+    <use href="#mce-top-bolt" transform="translate(715 220)"/>
+    <use href="#mce-top-bolt" transform="translate(503 351)"/>
+    <use href="#mce-panel" fill="#050d26" stroke="#030916" stroke-width="7"/>
+    <use href="#mce-panel" fill="url(#mce-panel-blue)" stroke="url(#mce-panel-edge)" stroke-width="2.2"/>
+    <use href="#mce-panel" fill="url(#mce-panel-sheen)"/>
+    <use href="#mce-spark" fill="#68edff" stroke="#3bcfff" stroke-width="9" opacity=".65" filter="url(#mce-star-glow)"/>
+    <use href="#mce-spark" fill="url(#mce-star-light)" stroke="#95caff" stroke-width="2.3"/>
+  </g>
+
+  <!-- Font-independent lettering with a breathing halo and clipped face reflections. -->
+  <g id="mce-wordmark" stroke-linejoin="round" filter="url(#mce-word-shadow)">
+    <use href="#mce-word-shape" class="mce-word-glow" fill="none" stroke="url(#mce-word-light)" stroke-width="7" filter="url(#mce-word-bloom)"/>
+    <use href="#mce-word-shape" transform="translate(0 4)" fill="#070e19"/>
+    <use href="#mce-word-shape" fill="url(#mce-word-metal)" stroke="url(#mce-word-edge)" stroke-width="1.4"/>
+    <g id="mce-word-cast" class="mce-word-glow">
+      <use href="#mce-word-shape" fill="url(#mce-word-cyan-cast)"/>
+      <use href="#mce-word-shape" fill="url(#mce-word-violet-cast)"/>
+      <use href="#mce-word-shape" fill="url(#mce-word-teal-cast)"/>
+    </g>
+    <g class="mce-word-glow" clip-path="url(#mce-word-clip)" stroke="url(#mce-word-light)">
+      <use href="#mce-word-rim" stroke-width="11" opacity=".68" filter="url(#mce-word-bloom)"/>
+      <use href="#mce-word-rim" stroke-width="1.8"/>
+    </g>
+  </g>
+</svg>
