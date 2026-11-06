@@ -6480,6 +6480,23 @@ def expand_prompt_names(value: str, enabled: bool = False) -> str:
 
     return expand(value, frozenset())
 
+
+@dataclass
+class TaskFilePrompt:
+    text: str
+    paths: tuple[Path, ...]
+    prompt_expansion_enabled: bool = False
+
+    def read(self) -> str:
+        return expand_prompt_names(
+            join_prompt_sections(
+                self.text,
+                read_prompt_files(list(self.paths)),
+            ),
+            self.prompt_expansion_enabled,
+        )
+
+
 def resolve_configured_prompt(value: Any, default: str) -> str:
     prompt = str(value if value is not None else default).strip()
     parsed = parse_prompt_file_definitions(prompt)
@@ -7423,6 +7440,7 @@ class AgentRunSettings:
     print_reasoning: bool
     suppress_response_output: bool
     image_urls: tuple[str, ...] = ()
+    task_file_prompt: TaskFilePrompt | None = None
     shell_timeout: int = 0
     shell_trace: bool = False
     agent_profiles: tuple[AgentProfile, ...] = ()
@@ -12858,7 +12876,11 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
         model=settings.model_settings.model,
         token_limit=settings.token_limit,
         system_prompt=prompts["agent_system_prompt"],
-        task=settings.task,
+        task=(
+            settings.task_file_prompt.read()
+            if settings.task_file_prompt is not None
+            else settings.task
+        ),
         file_contexts=file_contexts,
         turns=turns,
         active_context=settings.initial_active_context,
@@ -13001,7 +13023,8 @@ def run_agent_controller(
     def request_next(
         revision_instruction: str = "",
     ) -> AgentModelResult:
-        nonlocal active_context, reasoning_items, checkpoint_turn_dir
+        nonlocal active_task, active_context, reasoning_items
+        nonlocal checkpoint_turn_dir
         if revision_instruction:
             settings.pending_revision_instruction = revision_instruction
         advance_expirations = settings.advance_expirations
@@ -13031,6 +13054,8 @@ def run_agent_controller(
             hook_contents = run_agent_hook_context_scripts(
                 settings.agent_hook_context_scripts
             )
+            if settings.task_file_prompt is not None:
+                active_task = settings.task_file_prompt.read()
             refresh_agent_file_contexts(
                 settings, file_contexts, turns, file_expires_in_turns
             )
@@ -13384,6 +13409,8 @@ def run_agent_controller(
                     reasoning_items = execution.reasoning_items
                 else:
                     active_task = tool_call.task
+                    if settings.task_file_prompt is not None:
+                        settings.task_file_prompt.text = active_task
                     active_context = tool_call.context
                     context_summary.active_context_checksum = ""
                     tool_output = (
@@ -14868,7 +14895,10 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         action="extend",
         type=Path,
-        help="Read and combine task prompts from one or more files, after --task text",
+        help=(
+            "Read and combine task prompts from one or more files, after --task text; "
+            "reread before each agent or shell turn"
+        ),
     )
 
     parser.add_argument(
@@ -16769,6 +16799,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         )
     ) or args.tree_show_only
     file_names: list[str] = []
+    task_text = ""
     tree_task_prompts: tuple[dict[str, str], str | None, str | None] = ({}, None, None)
 
     if tree_mode:
@@ -16794,8 +16825,9 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         return 1
     elif not ask_mode and not args.list_models:
         if args.task or args.task_file:
+            task_text = read_prompt_arguments(args.task) if args.task else ""
             task = join_prompt_sections(
-                read_prompt_arguments(args.task) if args.task else "",
+                task_text,
                 read_prompt_files(args.task_file) if args.task_file else "",
             )
         elif args.resume_session is not None:
@@ -16899,6 +16931,15 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
 
     prompt_expansion_enabled = config["prompt_expansion"]
     task = expand_prompt_names(task, prompt_expansion_enabled)
+    task_file_prompt: TaskFilePrompt | None = (
+        TaskFilePrompt(
+            text=task_text,
+            paths=tuple(args.task_file),
+            prompt_expansion_enabled=prompt_expansion_enabled,
+        )
+        if (agent_mode or shell_mode) and args.task_file
+        else None
+    )
     tree_task_prompts = expand_tree_prompt_values(
         tree_task_prompts, prompt_expansion_enabled
     )
@@ -17241,7 +17282,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                                 raise ValueError(
                                     "resumed session revision task cannot be empty"
                                 )
-                            shell_revision_task = task
+                            shell_revision_task = (
+                                task_file_prompt.text
+                                if task_file_prompt is not None
+                                else task
+                            )
                         task = expand_prompt_names(
                             reused_task,
                             prompt_expansion_enabled,
@@ -17606,6 +17651,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 file=sys.stderr,
             )
             return 1
+        if (
+            shell_mode
+            and task_file_prompt is not None
+            and shell_revision_task is None
+        ):
+            task = task_file_prompt.read()
         base_full_system_prompt = join_prompt_sections(
             system_prompt,
             linenum_system_prompt if add_line_numbers or patch_mode else "",
@@ -17668,6 +17719,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     if plan_mode:
         if agent_backup is not None and not args.estimate_only:
             agent_backup.run_if_due()
+        if task_file_prompt is not None:
+            task = task_file_prompt.read()
         plan_system_base = (
             agent_worker_system_prompt if agent_mode else system_prompt
         )
@@ -17816,7 +17869,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         if VERBOSE:
             print(plan_statsline, file=sys.stderr)
         print()
-        task = expand_prompt_names(plan_result, prompt_expansion_enabled)
+        if task_file_prompt is None:
+            task = expand_prompt_names(plan_result, prompt_expansion_enabled)
+        else:
+            task_file_prompt.text = plan_result
+            task = task_file_prompt.read()
         full_system_prompt, user_prompt = build_request_prompts(
             system_prompt=base_full_system_prompt,
             task=task,
@@ -17837,6 +17894,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             log_enabled=log_enabled,
             log_path=log_path,
             task=task,
+            task_file_prompt=task_file_prompt,
             context=context,
             context_sections=context_sections,
             agent_system_prompt=base_full_system_prompt,
@@ -18302,7 +18360,11 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     ) -> tuple[str, str, str]:
         nonlocal task, full_system_prompt
         previous_task = task
-        task = revision_task
+        if task_file_prompt is None:
+            task = expand_prompt_names(revision_task, prompt_expansion_enabled)
+        else:
+            task_file_prompt.text = revision_task
+            task = task_file_prompt.read()
         full_system_prompt, revision_user_prompt = build_request_prompts(
             system_prompt=base_full_system_prompt,
             task=task,
@@ -18336,6 +18398,9 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         shell_output: str,
         shell_commands: list[ShellStep],
     ) -> tuple[str, str]:
+        nonlocal task
+        if task_file_prompt is not None:
+            task = task_file_prompt.read()
         followup_schema = SHELL_FOLLOWUP_SCHEMA
         shell_turn_history.append(
             ShellTurn(
@@ -18458,7 +18523,8 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         shell_response_reasoning = reasoning
         pending_shell_revision_task = shell_revision_task
         while True:
-            if pending_shell_revision_task is not None:
+            pending_revision = pending_shell_revision_task is not None
+            if pending_revision:
                 review_action = 'edit'
                 revision_task = pending_shell_revision_task
                 pending_shell_revision_task = None
@@ -18481,12 +18547,10 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                             file=sys.stderr,
                         )
                         continue
-                if not revision_task:
+                if not revision_task and not (
+                    pending_revision and task_file_prompt is not None
+                ):
                     continue
-                revision_task = expand_prompt_names(
-                    revision_task,
-                    prompt_expansion_enabled,
-                )
                 try:
                     result, shell_response_reasoning, statsline = request_shell_revision(
                         revision_task,
