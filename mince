@@ -185,9 +185,6 @@ AGENT_CONTEXT_ASSIST_SYSTEM_PROMPT = (
     "error alone is not sufficient; normally set it to false. Compaction "
     "discards context details. If compaction is required, explain in "
     "`summary` why the alternatives are untenable. Set "
-    "`write_context_summary` to true when the controller should generate or "
-    "refresh its durable context summary without requesting compaction; "
-    "otherwise set it to false. Set "
     "`clear_stale_summary` to true when `<agent_context_summary>` contains "
     "obsolete or contradicted guidance that should be removed, and explain "
     "the evidence in `summary`. Set "
@@ -1166,8 +1163,6 @@ STATE_TURN_ARTIFACTS = (
     "response_agent_context_assist_summary",
     "request_agent_context_assist_require_compaction",
     "response_agent_context_assist_require_compaction",
-    "request_agent_context_assist_write_context_summary",
-    "response_agent_context_assist_write_context_summary",
     "request_agent_context_assist_skip_next_interval",
     "response_agent_context_assist_skip_next_interval",
     "response_reasoning",
@@ -1791,7 +1786,6 @@ def write_state_agent_context_assist(
     )
     for name, value in (
         ("require_compaction", settings.context_assist_require_compaction),
-        ("write_context_summary", settings.context_assist_write_context_summary),
         ("skip_next_interval", settings.context_assist_skip_next_interval),
     ):
         write_state_artifact(
@@ -6622,6 +6616,11 @@ def load_image_urls(file_paths: list[Path]) -> tuple[str, ...]:
     return tuple(image_urls)
 
 
+FILE_CONTEXT_TOKEN_LIMIT_ERROR = (
+    "TOKEN LIMIT EXCEEDED: file could not be loaded"
+)
+
+
 def build_context_sections(
     file_paths: list[Path],
     max_file_size_kb: int,
@@ -6633,24 +6632,106 @@ def build_context_sections(
     current_token_estimate: int = 0,
     existing_context_sections: tuple[tuple[str, str], ...] = (),
     file_context_ids: dict[str, int] | None = None,
+    estimate_context_tokens: Callable[
+        [tuple[tuple[str, str], ...]], int
+    ] | None = None,
 ) -> list[tuple[str, str]]:
-    sections: list[tuple[str, str]] = []
+    paths = {
+        ("/proc/self/stdin" if path == Path("-") else str(path)): path
+        for path in file_paths
+    }
     encoding = (
         token_encoding_for_model(model)
         if token_limit is not None
         else None
     )
     existing_sections = dict(existing_context_sections)
+    base_token_estimate = current_token_estimate
+    if encoding is not None:
+        base_token_estimate = max(
+            0,
+            current_token_estimate - len(
+                encoding.encode("\n".join(existing_sections.values()))
+            ),
+        )
     max_bytes = max_file_size_kb * 1024
 
-    for path in file_paths:
-        context_path = "/proc/self/stdin" if path == Path("-") else str(path)
-        if encoding is not None and context_path in existing_sections:
-            current_token_estimate = max(
-                0,
-                current_token_estimate
-                - len(encoding.encode(existing_sections.pop(context_path))),
+    def build_section(
+        context_path: str,
+        content: str = "",
+        error: str = "",
+    ) -> str:
+        if (
+            error
+            and error != FILE_CONTEXT_TOKEN_LIMIT_ERROR
+            and missing_file_expires_in_turns is None
+        ):
+            return f"[{error}]"
+        file_id_attribute = (
+            f" ID='{agent_file_context_id(context_path, file_context_ids)}'"
+            if file_context_ids is not None
+            else ""
+        )
+        content_line_ending = detect_line_ending(content)
+        content_total_lines = len(content.splitlines())
+        numbered_content = ""
+        if not error:
+            numbered_content = (
+                number_lines(content) if add_line_numbers else content
             )
+        context_ending = (
+            ""
+            if error or numbered_content.endswith(("\r", "\n"))
+            else "\n"
+        )
+        error_attribute = (
+            f" error={quote_tag_attribute(error)}" if error else ""
+        )
+        if error and missing_file_expires_in_turns is not None:
+            error_attribute += (
+                f" expires_in_turns='{missing_file_expires_in_turns}'"
+            )
+        return format_context_entry(
+            "file",
+            f"{numbered_content}{context_ending}",
+            model=model,
+            attributes=(
+                f"{file_id_attribute}{error_attribute} path={quote_tag_attribute(context_path)}"
+                f"{file_context_relative_path_attribute(context_path)} "
+                f"encoding='utf-8' line_ending='{content_line_ending}' "
+                f"total_lines='{content_total_lines}'"
+            ),
+        )
+
+    sections: list[tuple[str, str]] = [
+        (
+            context_path,
+            (
+                build_section(
+                    context_path, error=FILE_CONTEXT_TOKEN_LIMIT_ERROR
+                )
+                if token_limit is not None
+                else ""
+            ),
+        )
+        for context_path in paths
+    ]
+
+    def estimate_sections_tokens() -> int:
+        if estimate_context_tokens is not None:
+            return estimate_context_tokens(tuple(sections))
+        if encoding is None:
+            return base_token_estimate
+        contexts = existing_sections.copy()
+        contexts.update(sections)
+        return base_token_estimate + len(
+            encoding.encode("\n".join(contexts.values()))
+        )
+
+    token_limit_reached = False
+    for index, (context_path, path) in enumerate(paths.items()):
+        if token_limit_reached:
+            break
         content = ""
         error = ""
         try:
@@ -6676,61 +6757,24 @@ def build_context_sections(
                     content = read_file(path, raise_errors=True)
         except Exception as exc:
             error = f"ERROR: cannot read file {context_path} ({exc})"
-        if error and missing_file_expires_in_turns is None:
-            sections.append((context_path, f"[{error}]"))
-            continue
-        file_id_attribute = (
-            f" ID='{agent_file_context_id(context_path, file_context_ids)}'"
-            if file_context_ids is not None
-            else ""
-        )
-        content_line_ending = detect_line_ending(content)
-        content_total_lines = len(content.splitlines())
-        if add_line_numbers:
-            numbered_content = number_lines(content)
-        else:
-            numbered_content = content
-
-        def build_section() -> str:
-            context_ending = (
-                ""
-                if error or numbered_content.endswith(("\r", "\n"))
-                else "\n"
-            )
-            error_attribute = (
-                f" error={quote_tag_attribute(error)}" if error else ""
-            )
-            if error and missing_file_expires_in_turns is not None:
-                error_attribute += (
-                    f" expires_in_turns='{missing_file_expires_in_turns}'"
-                )
-            return format_context_entry(
-                "file",
-                f"{numbered_content}{context_ending}",
-                model=model,
-                attributes=(
-                    f"{file_id_attribute}{error_attribute} path={quote_tag_attribute(context_path)}"
-                    f"{file_context_relative_path_attribute(context_path)} "
-                    f"encoding='utf-8' line_ending='{content_line_ending}' "
-                    f"total_lines='{content_total_lines}'"
+        previous_section = sections[index]
+        section = build_section(context_path, content, error)
+        sections[index] = (context_path, section)
+        if encoding is not None and token_limit is not None and (
+            len(encoding.encode(section)) > token_limit
+            or estimate_sections_tokens() > token_limit
+        ):
+            sections[index] = (
+                context_path,
+                build_section(
+                    context_path,
+                    content,
+                    FILE_CONTEXT_TOKEN_LIMIT_ERROR,
                 ),
             )
-
-        section = build_section()
-        if encoding is not None and token_limit is not None:
-            section_tokens = len(encoding.encode(section))
-            if (
-                not error
-                and current_token_estimate + section_tokens > token_limit
-            ):
-                error = (
-                    "TOKEN LIMIT EXCEEDED: file could not be loaded"
-                )
-                numbered_content = ""
-                section = build_section()
-                section_tokens = len(encoding.encode(section))
-            current_token_estimate += section_tokens
-        sections.append((context_path, section))
+            if estimate_sections_tokens() > token_limit:
+                sections[index] = previous_section
+            token_limit_reached = True
 
     return sections
 
@@ -7175,24 +7219,15 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
                     "otherwise set false."
                 ),
             },
-            "write_context_summary": {
-                "type": "boolean",
-                "description": (
-                    "Request a new or refreshed agent_context_summary without "
-                    "requiring compaction. Targeted file and history removals "
-                    "are independent. Set false when no summary update is needed."
-                ),
-            },
             "clear_stale_summary": {
                 "type": "boolean",
                 "description": (
                     "Clear the reviewed agent_context_summary when it contains "
                     "obsolete or contradicted guidance. Explain the evidence in "
                     "summary; otherwise set false. Any newer context summary is "
-                    "retained. A clear request cancels pending compaction and "
-                    "summary requests without generating a replacement. Clearing "
-                    "does not itself remove files or history; targeted removals "
-                    "are independent."
+                    "retained. A clear request cancels pending compaction without "
+                    "generating a replacement. Clearing does not itself remove "
+                    "files or history; targeted removals are independent."
                 ),
             },
             "skip_next_context_assist_interval": {
@@ -7206,8 +7241,8 @@ AGENT_CONTEXT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
         },
         "required": [
             "summary", "remove_turn_ids", "remove_file_ids",
-            "require_compaction", "write_context_summary",
-            "clear_stale_summary", "skip_next_context_assist_interval",
+            "require_compaction", "clear_stale_summary",
+            "skip_next_context_assist_interval",
         ],
     },
     "strict": True,
@@ -7253,6 +7288,9 @@ AGENT_PROMPT_ASSIST_TOOL_SCHEMA: dict[str, Any] = {
 
 
 AGENT_CONTEXT_SUMMARY_TOKEN_RESERVE = 2048
+AGENT_FILE_CONTEXT_TOKEN_RESERVE = (
+    AGENT_CONTEXT_SUMMARY_TOKEN_RESERVE + 256
+)
 AGENT_CONTEXT_SUMMARY_MAX_TOKENS = 8192
 AGENT_CONTEXT_COMPACTION_TOKEN_FRACTION = 0.7
 AGENT_SUMMARY_INSTRUCTIONS = (
@@ -7480,7 +7518,6 @@ class AgentRunSettings:
     system_prompt_history: list[dict[str, str]] = field(default_factory=list)
     context_assist_summary: str = ""
     context_assist_require_compaction: bool = False
-    context_assist_write_context_summary: bool = False
     context_assist_skip_next_interval: bool = False
     cumulative_stats: CumulativeStats = field(default_factory=CumulativeStats)
     prior_token_estimates: list[tuple[int, int]] = field(default_factory=list)
@@ -7553,7 +7590,6 @@ def write_state_agent_runtime_state(
         ),
         "context_assist_summary": settings.context_assist_summary,
         "context_assist_require_compaction": settings.context_assist_require_compaction,
-        "context_assist_write_context_summary": settings.context_assist_write_context_summary,
         "context_assist_skip_next_interval": settings.context_assist_skip_next_interval,
     }
     if settings.context_summary is not None:
@@ -7607,6 +7643,7 @@ def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
     try:
         state = json.loads(artifact_text)
         if isinstance(state, dict):
+            state.pop("context_assist_write_context_summary", None)
             state.setdefault("file_context_ids", {})
             state.setdefault("assist_retry_turns", {})
         expected_fields = {
@@ -7620,7 +7657,6 @@ def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
             "assist_retry_turns", "pending_assists", "context_summary",
             "context_assist_summary",
             "context_assist_require_compaction",
-            "context_assist_write_context_summary",
             "context_assist_skip_next_interval",
         }
         if (
@@ -7650,7 +7686,6 @@ def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
                 raise ValueError(f"{name} must be a string")
         for name in (
             "advance_expirations", "context_assist_require_compaction",
-            "context_assist_write_context_summary",
             "context_assist_skip_next_interval",
         ):
             if not isinstance(state[name], bool):
@@ -9075,7 +9110,6 @@ def format_agent_context_assist_report(
     require_compaction: bool,
     current_turn: int,
     clear_stale_summary: bool = False,
-    write_context_summary: bool = False,
     skip_next_context_assist_interval: bool = False,
     removed_turn_ids: list[int] | None = None,
     removed_file_ids: list[int] | None = None,
@@ -9089,7 +9123,6 @@ def format_agent_context_assist_report(
     return format_agent_turn_report(
         "Context assist:\n"
         f"Compaction required: {'yes' if require_compaction else 'no'}\n"
-        f"Context summary requested: {'yes' if write_context_summary else 'no'}\n"
         f"Stale summary cleared: {'yes' if clear_stale_summary else 'no'}\n"
         f"Removed turn IDs: {removed_turns}\n"
         f"Removed file IDs: {removed_files}\n"
@@ -9637,12 +9670,17 @@ def refresh_agent_file_contexts(
             for path, section in contexts.items()
             if path != "/proc/self/stdin"
             and agent_file_context_path(section) is not None
+            and (
+                (agent_file_context_attributes(section) or {}).get("error")
+                != FILE_CONTEXT_TOKEN_LIMIT_ERROR
+            )
         ],
         max_file_size_kb=settings.max_file_size_kb,
         add_line_numbers=True,
         missing_file_expires_in_turns=settings.agent_context_expires[1],
         model=settings.model_settings.model,
         token_limit=settings.token_limit,
+        existing_context_sections=tuple(contexts.items()),
         file_context_ids=settings.file_context_ids,
     ))
     if not refreshed_sections:
@@ -9833,7 +9871,6 @@ class ReusedAgentHistory:
     context_summary: AgentContextSummary | None = None
     context_assist_summary: str = ""
     context_assist_require_compaction: bool = False
-    context_assist_write_context_summary: bool = False
     context_assist_skip_next_interval: bool = False
     turn_metadata: dict[str, Any] | None = None
     runtime_state: dict[str, Any] | None = None
@@ -9855,7 +9892,6 @@ def reused_agent_runtime_history(
         ),
         context_assist_summary=runtime_state["context_assist_summary"],
         context_assist_require_compaction=runtime_state["context_assist_require_compaction"],
-        context_assist_write_context_summary=runtime_state["context_assist_write_context_summary"],
         context_assist_skip_next_interval=runtime_state["context_assist_skip_next_interval"],
         runtime_state=runtime_state,
     )
@@ -10076,7 +10112,7 @@ def parse_state_agent_context_summary(
 
 
 
-def load_state_agent_context_assist(turn_dir: Path) -> tuple[str, bool, bool, bool]:
+def load_state_agent_context_assist(turn_dir: Path) -> tuple[str, bool, bool]:
     for artifact_prefix in ("response", "request"):
         summary = read_optional_state_artifact(
             turn_dir / f"{artifact_prefix}_agent_context_assist_summary"
@@ -10086,7 +10122,6 @@ def load_state_agent_context_assist(turn_dir: Path) -> tuple[str, bool, bool, bo
         flags: dict[str, bool] = {}
         for name, label in (
             ("require_compaction", "compaction"),
-            ("write_context_summary", "summary request"),
             ("skip_next_interval", "skip interval"),
         ):
             flag_path = turn_dir / (
@@ -10109,10 +10144,9 @@ def load_state_agent_context_assist(turn_dir: Path) -> tuple[str, bool, bool, bo
         return (
             summary.strip(),
             flags["require_compaction"],
-            flags["write_context_summary"],
             flags["skip_next_interval"],
         )
-    return "", False, False, False
+    return "", False, False
 
 
 def parse_agent_readfile_contexts(
@@ -10650,7 +10684,7 @@ def load_reused_agent_turn_metadata(
         )
     (
         context_assist_summary, context_assist_require_compaction,
-        context_assist_write_context_summary, context_assist_skip_next_interval,
+        context_assist_skip_next_interval,
     ) = load_state_agent_context_assist(selected_turn_dir)
     return reused_agent_runtime_history(
         ReusedAgentHistory(
@@ -10663,7 +10697,6 @@ def load_reused_agent_turn_metadata(
             ),
             context_assist_summary=context_assist_summary,
             context_assist_require_compaction=context_assist_require_compaction,
-            context_assist_write_context_summary=context_assist_write_context_summary,
             context_assist_skip_next_interval=context_assist_skip_next_interval,
             turn_metadata=metadata,
         ),
@@ -10846,7 +10879,7 @@ def load_reused_session_agent_history(
         )
     (
         context_assist_summary, context_assist_require_compaction,
-        context_assist_write_context_summary, context_assist_skip_next_interval,
+        context_assist_skip_next_interval,
     ) = load_state_agent_context_assist(selected_turn_dir)
     return reused_agent_runtime_history(
         ReusedAgentHistory(
@@ -10857,7 +10890,6 @@ def load_reused_session_agent_history(
             context_summary=context_summary,
             context_assist_summary=context_assist_summary,
             context_assist_require_compaction=context_assist_require_compaction,
-            context_assist_write_context_summary=context_assist_write_context_summary,
             context_assist_skip_next_interval=context_assist_skip_next_interval,
         ),
         runtime_state,
@@ -12223,7 +12255,6 @@ class AgentAssist:
             system_prompt_history=self.settings.system_prompt_history.copy(),
             context_assist_summary="",
             context_assist_require_compaction=False,
-            context_assist_write_context_summary=False,
             context_assist_skip_next_interval=False,
             prior_token_estimates=[],
             pending_revision_instruction="",
@@ -12378,13 +12409,6 @@ class AgentAssist:
                 or (assist["require_compaction"] and not summary_compacted)
             )
         )
-        self.settings.context_assist_write_context_summary = (
-            not clear_stale_summary
-            and (
-                self.settings.context_assist_write_context_summary
-                or (assist["write_context_summary"] and not summary_updated)
-            )
-        )
         self.settings.context_assist_skip_next_interval = (
             self.settings.context_assist_skip_next_interval
             or assist["skip_next_context_assist_interval"]
@@ -12415,9 +12439,6 @@ class AgentAssist:
                 self.settings.context_assist_require_compaction,
                 self.request_turn,
                 clear_stale_summary=summary_cleared,
-                write_context_summary=(
-                    self.settings.context_assist_write_context_summary
-                ),
                 skip_next_context_assist_interval=(
                     self.settings.context_assist_skip_next_interval
                 ),
@@ -12524,7 +12545,19 @@ def run_agent_load_file_from_storage_tool(
     settings: AgentRunSettings,
     path_texts: list[str],
     current_token_estimate: int = 0,
+    estimate_context_tokens: Callable[
+        [tuple[tuple[str, str], ...], str], int
+    ] | None = None,
 ) -> AgentToolExecution:
+    def estimate_file_context_tokens(
+        contexts: tuple[tuple[str, str], ...],
+    ) -> int:
+        if estimate_context_tokens is None:
+            return 0
+        return estimate_context_tokens(
+            contexts, "\n".join(section for _, section in contexts)
+        )
+
     try:
         file_paths = list(
             dict.fromkeys(resolve_context_file_paths(path_texts))
@@ -12535,12 +12568,19 @@ def run_agent_load_file_from_storage_tool(
             add_line_numbers=True,
             missing_file_expires_in_turns=settings.agent_context_expires[1],
             model=settings.model_settings.model,
-            token_limit=settings.token_limit,
+            token_limit=max(
+                0, settings.token_limit - AGENT_FILE_CONTEXT_TOKEN_RESERVE
+            ),
             current_token_estimate=current_token_estimate,
             existing_context_sections=(
                 parse_agent_readfile_contexts(settings.context) or ()
             ),
             file_context_ids=settings.file_context_ids,
+            estimate_context_tokens=(
+                estimate_file_context_tokens
+                if estimate_context_tokens is not None
+                else None
+            ),
         )
     except Exception as exc:
         return AgentToolExecution(
@@ -12556,6 +12596,9 @@ def run_agent_load_file_from_storage_tool_call(
     settings: AgentRunSettings,
     tool_call: AgentToolCall,
     current_token_estimate: int = 0,
+    estimate_context_tokens: Callable[
+        [tuple[tuple[str, str], ...], str], int
+    ] | None = None,
 ) -> AgentToolExecution:
     arguments = tool_call.arguments
     if arguments is None:
@@ -12565,6 +12608,7 @@ def run_agent_load_file_from_storage_tool_call(
     paths = arguments.get("paths")
     if (
         not isinstance(paths, list)
+        or not paths
         or any(not isinstance(path, str) for path in paths)
     ):
         return AgentToolExecution(
@@ -12575,6 +12619,7 @@ def run_agent_load_file_from_storage_tool_call(
         settings,
         paths,
         current_token_estimate=current_token_estimate,
+        estimate_context_tokens=estimate_context_tokens,
     )
 
 
@@ -12668,6 +12713,9 @@ def run_agent_patch_tool(
     previous_task: str,
     tool_call_index: int = 0,
     current_token_estimate: int = 0,
+    estimate_context_tokens: Callable[
+        [tuple[tuple[str, str], ...], str], int
+    ] | None = None,
 ) -> AgentToolExecution:
     suffix_provided = settings.suffix_provided
     patch_suffix = settings.patch_suffix
@@ -12751,10 +12799,30 @@ def run_agent_patch_tool(
         )
     if not created_paths:
         return AgentToolExecution(output)
+
+    def estimate_created_context_tokens(
+        contexts: tuple[tuple[str, str], ...],
+        context_output: str,
+    ) -> int:
+        if estimate_context_tokens is None:
+            return 0
+        return estimate_context_tokens(
+            contexts,
+            join_prompt_sections(
+                output,
+                agent_readfile_error_output(context_output, contexts),
+            ),
+        )
+
     execution = run_agent_load_file_from_storage_tool(
         settings,
         created_paths,
         current_token_estimate=current_token_estimate,
+        estimate_context_tokens=(
+            estimate_created_context_tokens
+            if estimate_context_tokens is not None
+            else None
+        ),
     )
     return AgentToolExecution(
         join_prompt_sections(
@@ -12863,7 +12931,7 @@ def prepare_agent_context_summary_request(
     settings: AgentRunSettings,
 ) -> bool:
     summary = settings.context_summary
-    return settings.context_assist_write_context_summary or (
+    return (
         summary is not None
         and bool(summary.content)
         and summary.expires_in_turns <= 0
@@ -12965,6 +13033,7 @@ def run_agent_controller(
     prior_token_estimates = settings.prior_token_estimates
     reasoning_items = settings.initial_reasoning_items
     checkpoint_turn_dir: Path | None = None
+    hook_contents: tuple[str, ...] = ()
 
     def current_file_context() -> str:
         return build_agent_files_context(
@@ -12976,6 +13045,56 @@ def run_agent_controller(
             set(agent_history_turn_numbers(turns)),
             model=settings.model_settings.model,
             file_context_ids=settings.file_context_ids,
+        )
+
+    def build_context_prompts(
+        limit_context: bool,
+        *,
+        context_files: list[tuple[str, str]] | None = None,
+        context_turns: list[AgentTurn] | None = None,
+        context_expirations: dict[str, int] | None = None,
+        advance_expirations: bool = False,
+        refresh_summary: bool = False,
+    ) -> tuple[str, str, int | None, AgentContextCompaction | None]:
+        prompts = agent_system_prompts(settings)
+        return build_agent_context_window_prompts(
+            model=settings.model_settings.model,
+            token_limit=settings.token_limit,
+            system_prompt=prompts["agent_system_prompt"],
+            task=active_task,
+            file_contexts=(
+                file_contexts if context_files is None else context_files
+            ),
+            turns=turns if context_turns is None else context_turns,
+            active_context=active_context,
+            pinned_paths=pinned_paths,
+            pinned_turn_numbers=pinned_turn_numbers,
+            file_expires_in_turns=(
+                file_expires_in_turns
+                if context_expirations is None
+                else context_expirations
+            ),
+            file_context_ids=settings.file_context_ids,
+            revision_instruction=settings.pending_revision_instruction,
+            controller_tools=agent_tool_schemas(
+                settings.agent_profiles,
+                agent_expires_in_turns_schema(settings.agent_context_expires),
+                default_profile=settings.agent_profile_default,
+                prompt_overrides=settings.system_prompt_overrides,
+            ),
+            hook_contents=hook_contents,
+            meta_task_list=meta_task_list,
+            prior_token_estimates=prior_token_estimates,
+            context_summary=context_summary,
+            context_assist_summary=settings.context_assist_summary,
+            require_compaction=settings.context_assist_require_compaction,
+            advance_expirations=advance_expirations,
+            refresh_summary=refresh_summary,
+            limit_context=limit_context,
+            current_turn=settings.state_turn,
+            tool_call_instructions=agent_controller_tool_call_instructions(settings),
+            task_priority_system_prompt=prompts["task_priority_system_prompt"],
+            summary_system_prompt=prompts["context_summary_system_prompt"],
         )
 
     def remove_stale_context(
@@ -13041,7 +13160,7 @@ def run_agent_controller(
         revision_instruction: str = "",
     ) -> AgentModelResult:
         nonlocal active_task, active_context, reasoning_items
-        nonlocal checkpoint_turn_dir
+        nonlocal checkpoint_turn_dir, hook_contents
         if revision_instruction:
             settings.pending_revision_instruction = revision_instruction
         advance_expirations = settings.advance_expirations
@@ -13058,7 +13177,6 @@ def run_agent_controller(
             save_turn_metadata(checkpoint_turn_dir, "request")
             context_assist.collect()
             prompt_assist.collect()
-            prompts = agent_system_prompts(settings)
             controller_tools = agent_tool_schemas(
                 settings.agent_profiles,
                 agent_expires_in_turns_schema(settings.agent_context_expires),
@@ -13076,47 +13194,15 @@ def run_agent_controller(
             refresh_agent_file_contexts(
                 settings, file_contexts, turns, file_expires_in_turns
             )
-            def build_context_prompts(
-                limit_context: bool,
-            ) -> tuple[str, str, int | None, AgentContextCompaction | None]:
-                return build_agent_context_window_prompts(
-                    model=settings.model_settings.model,
-                    token_limit=settings.token_limit,
-                    system_prompt=prompts["agent_system_prompt"],
-                    task=active_task,
-                    file_contexts=file_contexts,
-                    turns=turns,
-                    active_context=active_context,
-                    pinned_paths=pinned_paths,
-                    pinned_turn_numbers=pinned_turn_numbers,
-                    file_expires_in_turns=file_expires_in_turns,
-                    file_context_ids=settings.file_context_ids,
-                    revision_instruction=settings.pending_revision_instruction,
-                    controller_tools=controller_tools,
-                    hook_contents=hook_contents,
-                    meta_task_list=meta_task_list,
-                    prior_token_estimates=prior_token_estimates,
-                    context_summary=context_summary,
-                    context_assist_summary=settings.context_assist_summary,
-                    require_compaction=settings.context_assist_require_compaction,
-                    advance_expirations=(
-                        limit_context
-                        and advance_expirations
-                        and not refresh_summary
-                    ),
-                    refresh_summary=refresh_summary,
-                    limit_context=limit_context,
-                    current_turn=settings.state_turn,
-                    tool_call_instructions=agent_controller_tool_call_instructions(settings),
-                    task_priority_system_prompt=prompts["task_priority_system_prompt"],
-                    summary_system_prompt=prompts["context_summary_system_prompt"],
-                )
-
             try:
                 (
                     request_system_prompt, user_prompt,
                     summary_token_budget, compaction,
-                ) = build_context_prompts(limit_context=True)
+                ) = build_context_prompts(
+                    limit_context=True,
+                    advance_expirations=advance_expirations and not refresh_summary,
+                    refresh_summary=refresh_summary,
+                )
             finally:
                 if advance_expirations and not refresh_summary:
                     settings.advance_expirations = False
@@ -13165,7 +13251,6 @@ def run_agent_controller(
                     0, context_summary.expires_in_turns - 1
                 )
                 settings.context_assist_require_compaction = False
-                settings.context_assist_write_context_summary = False
                 settings.pending_revision_instruction = ""
                 settings.advance_expirations = True
                 save_turn_metadata(result.turn_dir)
@@ -13185,7 +13270,6 @@ def run_agent_controller(
                 compaction=compaction,
             )
             settings.context_assist_require_compaction = False
-            settings.context_assist_write_context_summary = False
             advance_expirations = refresh_summary
             settings.advance_expirations = advance_expirations
             save_turn_metadata(result.turn_dir)
@@ -13255,9 +13339,6 @@ def run_agent_controller(
         tool_outputs: list[str] = []
         tool_revision_instruction = ""
         readfile_contexts_for_turn: tuple[tuple[str, str], ...] | None = None
-        current_token_estimate = model_result.request_tokens
-        encoding = token_encoding_for_model(settings.model_settings.model)
-        file_context_tokens = len(encoding.encode(settings.context))
 
         def save_tool_outputs(*, log_outputs: bool = True) -> bool:
             try:
@@ -13339,6 +13420,57 @@ def run_agent_controller(
 
             readfile_contexts: tuple[tuple[str, str], ...] | None = None
 
+            def estimate_loaded_context_tokens(
+                contexts: tuple[tuple[str, str], ...],
+                output: str,
+            ) -> int:
+                refreshed_paths = {path for path, _ in contexts}
+                context_turns = turns.copy()
+                record_agent_tool_history(
+                    context_turns,
+                    turn_task,
+                    tool_context,
+                    tool_call,
+                    output,
+                    turn_unix_time=model_result.turn_unix_time,
+                    state_turn=int(model_result.turn_dir.name),
+                    tool_call_index=tool_call_index,
+                    readfile_contexts=contexts,
+                )
+                (
+                    request_system_prompt, user_prompt, _, _,
+                ) = build_context_prompts(
+                    limit_context=False,
+                    context_files=[
+                        context for context in file_contexts
+                        if context[0] not in refreshed_paths
+                    ],
+                    context_turns=[
+                        limit_agent_shell_turn_for_context(
+                            turn,
+                            settings.model_settings.model,
+                            settings.token_limit,
+                        )
+                        for turn in context_turns
+                    ],
+                    context_expirations={
+                        path: expires_in_turns
+                        for path, expires_in_turns in file_expires_in_turns.items()
+                        if path not in refreshed_paths
+                    },
+                )
+                return estimate_request_tokens(
+                    model=settings.model_settings.model,
+                    system_prompt=request_system_prompt,
+                    user_prompt=user_prompt,
+                    tools=agent_tool_schemas(
+                        settings.agent_profiles,
+                        agent_expires_in_turns_schema(settings.agent_context_expires),
+                        default_profile=settings.agent_profile_default,
+                        prompt_overrides=settings.system_prompt_overrides,
+                    ),
+                )
+
             if tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL:
                 try:
                     apply_agent_context_control(
@@ -13357,7 +13489,7 @@ def run_agent_controller(
                 execution = run_agent_load_file_from_storage_tool_call(
                     settings,
                     tool_call,
-                    current_token_estimate=current_token_estimate,
+                    estimate_context_tokens=estimate_loaded_context_tokens,
                 )
                 tool_output = execution.output
                 readfile_contexts = execution.readfile_contexts
@@ -13385,7 +13517,7 @@ def run_agent_controller(
                         model_result.turn_dir,
                         turn_task,
                         tool_call_index=tool_call_index,
-                        current_token_estimate=current_token_estimate,
+                        estimate_context_tokens=estimate_loaded_context_tokens,
                     )
                     tool_output = execution.output
                     readfile_contexts = execution.readfile_contexts
@@ -13464,32 +13596,6 @@ def run_agent_controller(
             )
             tool_outputs.append(tool_output)
             settings.context = current_file_context()
-            updated_file_context_tokens = len(encoding.encode(settings.context))
-            if tool_call.tool == AGENT_SHELL_TOOL:
-                context_turn = limit_agent_shell_turn_for_context(
-                    turns[-1],
-                    settings.model_settings.model,
-                    settings.token_limit,
-                )
-                context_output = format_agent_history(
-                    [context_turn],
-                    [len(turns) - 1],
-                    model=settings.model_settings.model,
-                )
-            else:
-                context_output = (
-                    agent_readfile_error_output(tool_output, readfile_contexts)
-                    if readfile_contexts is not None
-                    else tool_output
-                )
-            current_token_estimate = max(
-                0,
-                current_token_estimate
-                - file_context_tokens
-                + updated_file_context_tokens
-                + len(encoding.encode(context_output)),
-            )
-            file_context_tokens = updated_file_context_tokens
             if tool_revision_instruction:
                 settings.pending_revision_instruction = tool_revision_instruction
             if not save_tool_outputs(
@@ -17976,11 +18082,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             ),
             context_assist_require_compaction=(
                 reused_agent_history.context_assist_require_compaction
-                if reused_agent_history is not None
-                else False
-            ),
-            context_assist_write_context_summary=(
-                reused_agent_history.context_assist_write_context_summary
                 if reused_agent_history is not None
                 else False
             ),
