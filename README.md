@@ -831,4 +831,4 @@ https://codeberg.org/Southland-Systems/mince
 
 This project is licensed under the **Apache-2.0 License**
 
-Copyright 2023-2026 Southland Systems, Ontario, Canada
+Copyright 2026 Southland Systems, Ontario, Canada
