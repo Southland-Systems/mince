@@ -2,6 +2,7 @@
 """Run deterministic, offline integration tests for mince and mince-contain."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -426,7 +427,7 @@ class OfflineTests:
         command = [executable]
         if executable == "mince":
             tokenizing_options = {
-                "--ask", "--ask-file", "--task", "--task-file",
+                "--ask", "--ask-file", "--task", "--task-file", "--task-files",
                 "--resume-session", "--reuse-session",
                 "--tree-task", "--tree-task-file",
                 "--tree-reuse-session",
@@ -522,6 +523,29 @@ class OfflineTests:
         )
         return artifacts
 
+    def update_state_context_summary(
+        self,
+        session_name: str,
+        turn: int,
+        **updates: Any,
+    ) -> None:
+        artifacts = self.state_artifacts(
+            session_name, turn,
+            "response_agent_context_summary", "response_agent_runtime_state",
+        )
+        summary = json.loads(artifacts["response_agent_context_summary"])
+        summary.update(updates)
+        runtime = json.loads(artifacts["response_agent_runtime_state"])
+        runtime["context_summary"] = summary
+        directory = self.home / ".local/state/mince/state" / session_name / str(turn)
+        for name, value in (
+            ("response_agent_context_summary", summary),
+            ("response_agent_runtime_state", runtime),
+        ):
+            (directory / name).write_text(
+                json.dumps(value, ensure_ascii=False), encoding="utf-8",
+            )
+
     def session_log(self, session_name: str) -> str:
         path = self.home / ".local/state/mince/logs" / f"{session_name}.txt"
         return path.read_text(encoding="utf-8")
@@ -551,6 +575,7 @@ class OfflineTests:
         source_turn: int,
         *,
         noninteractive: bool,
+        first_local_turn: int | None = None,
     ) -> str:
         session_name = session_name_from_result(
             result, noninteractive=noninteractive,
@@ -569,11 +594,13 @@ class OfflineTests:
             },
             "resumed session did not record its selected source session and turn",
         )
+        if first_local_turn is None:
+            first_local_turn = source_turn + 1
         turn_numbers = self.state_turn_numbers(session_name)
         require(
             bool(turn_numbers)
-            and turn_numbers == list(range(source_turn + 1, turn_numbers[-1] + 1)),
-            "resumed session did not create contiguous local turns after the selected source turn",
+            and turn_numbers == list(range(first_local_turn, turn_numbers[-1] + 1)),
+            "resumed session did not create the expected contiguous local turns",
         )
         return session_name
 
@@ -600,13 +627,15 @@ class OfflineTests:
             and config["agent_backup"] == "off"
             and config["agent_backup_interval"] == 12
             and config["chdir"] == ""
+            and config["task_files"] == ""
+            and config["images"] == ""
             and config["shell_timeout"] == 0
             and config["shell_networking"] == "off"
             and config["shell_trace"] == "off"
             and config["response_json_repair"] == "off"
             and config["stream"] == "off"
             and config["explicit_prompt_cache"] == "off",
-            "retry, expiry, assist, backup, directory, shell, repair, streaming, or cache defaults are incorrect",
+            "retry, expiry, assist, backup, input, shell, repair, streaming, or cache defaults are incorrect",
         )
         require(
             not {"system_prompt_with_task", "patch_save", "contain_networking"}.intersection(config),
@@ -1468,6 +1497,213 @@ class OfflineTests:
         finally:
             self.run("--remove-profile", profile_name)
 
+    def test_repeated_prompts_and_live_task_files(self) -> None:
+        first = self.work / "first live task.txt"
+        second = self.work / "second live task.txt"
+        configured = self.work / "overridden-task.txt"
+        configured.write_text("Overridden configured task\n", encoding="utf-8")
+        profile = "live_task_files"
+        inline = ("First inline task", "Second inline task")
+        initial_task = "\n\n".join((*inline, "First task file", "Second task file"))
+        updated_task = "\n\n".join((*inline, "First task file", "Updated second task file"))
+        commands = {
+            "commands": [{
+                "command": (
+                    f"printf 'Updated second task file\\n' > {shlex.quote(str(second))}"
+                ),
+                "reason": "Change a task file before the next request",
+            }],
+        }
+        self.run("--inherit-profile", profile)
+        try:
+            for mode in ("agent", "shell"):
+                first.write_text("First task file\n", encoding="utf-8")
+                second.write_text("Second task file\n", encoding="utf-8")
+                configured_paths = (
+                    shlex.quote(str(configured))
+                    if mode == "agent"
+                    else "|".join(shlex.quote(str(path)) for path in (first, second))
+                )
+                self.run(
+                    "--profile", profile, "--set-config",
+                    f"task_files={configured_paths}",
+                )
+                options = (
+                    ("--task-file", first, "--task-files", second)
+                    if mode == "agent"
+                    else ()
+                )
+                responses = (
+                    [
+                        MockResponsesAPI.tool_response(("shell", commands)),
+                        MockResponsesAPI.tool_response(("session", {
+                            "action": "end", "reason": "Live agent task files checked",
+                        })),
+                    ]
+                    if mode == "agent"
+                    else [
+                        {"output": commands},
+                        {"output": {
+                            "action": "session_end", "commands": [],
+                            "reason": "Live shell task files checked",
+                        }},
+                    ]
+                )
+                with MockResponsesAPI(responses) as mock:
+                    result = self.run(
+                        "--profile", profile,
+                        "--task", "First", "inline", "task",
+                        "-t", inline[1], *options, f"--{mode}",
+                        "--model", "offline-test-model", "--base-url", mock.url,
+                        "--log", "off", input_text="y\n" if mode == "shell" else None,
+                    )
+                require(len(mock.requests) == 2, f"{mode} task files made unexpected requests")
+                session_name = session_name_from_result(result, noninteractive=False)
+                for turn, request, task in zip(
+                    (0, 1), mock.requests, (initial_task, updated_task),
+                ):
+                    require_task_placement(request, task)
+                    artifacts = self.state_artifacts(session_name, turn)
+                    require_state_request(artifacts, request)
+                    require(
+                        artifacts["request_task"] == task
+                        and "Overridden configured task" not in request_instructions(request),
+                        f"{mode} combined repeated tasks and task files in the wrong order or retained stale text",
+                    )
+                require(
+                    prompt_section(request_prompt(mock.requests[0]), "files") == ""
+                    and first.read_text(encoding="utf-8") == "First task file\n"
+                    and second.read_text(encoding="utf-8") == "Updated second task file\n"
+                    and configured.read_text(encoding="utf-8") == "Overridden configured task\n",
+                    "task-file inputs were loaded as file context or the live update changed unrelated inputs",
+                )
+        finally:
+            self.run("--remove-profile", profile)
+        with MockResponsesAPI(["Combined offline ask answer"]) as mock:
+            result = self.run(
+                "--ask", "First", "inline", "ask", "-a", "Second inline ask",
+                "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
+            )
+        require(
+            len(mock.requests) == 1
+            and request_prompt(mock.requests[0]) == "First inline ask\n\nSecond inline ask"
+            and result.stdout == "Combined offline ask answer\n",
+            "repeated ask arguments were not combined in order",
+        )
+        conflicting = self.run(
+            "--ask", "Invalid mixed prompts", "--task-files", first, check=False,
+        )
+        require(
+            conflicting.returncode == 2
+            and "cannot be combined with --task or --task-file" in conflicting.stderr,
+            "the task-files alias bypassed ask/task mutual exclusion",
+        )
+
+    def test_image_inputs(self) -> None:
+        directory = self.work / "image fixtures"
+        directory.mkdir()
+        images = [directory / "first image.png", directory / "original.unregistered_mince_image"]
+        contents = [b"\x89PNG\r\n\x1a\n\x00offline\xff", b"Original offline image bytes\x00\xfe"]
+        for path, content in zip(images, contents):
+            path.write_bytes(content)
+        image_urls = [
+            f"data:{mime_type};base64,{base64.b64encode(content).decode('ascii')}"
+            for mime_type, content in zip(("image/png", "image/webp"), contents)
+        ]
+        tree = self.work / "image-tree"
+        tree.mkdir()
+        target = tree / "context.txt"
+        target.write_text("Image tree context\n", encoding="utf-8")
+        created = self.work / "image-patch-created.txt"
+        manifest = self._patch_manifest(
+            created, patches=[self._replacement_patch(["Image patch proposal"])],
+        )
+        profile = "offline_images"
+        task = "Inspect the original offline image fixtures."
+        reasoning_item = MockResponsesAPI.reasoning_item("images")
+        self.run("--inherit-profile", profile)
+        try:
+            self.run(
+                "--profile", profile, "--set-config",
+                "images=" + "|".join(shlex.quote(str(path)) for path in images),
+            )
+            with MockResponsesAPI([
+                {"output_text": "Offline image answer", "reasoning_items": [reasoning_item]},
+                "Resumed offline image answer",
+                {"output": manifest},
+                "Offline image tree answer",
+            ]) as mock:
+                common = (
+                    "--profile", profile, "--model", "offline-test-model",
+                    "--base-url", mock.url, "--log", "off",
+                )
+                initial = self.run(
+                    "--task", task, "--images", images[0], "--images", images[1], *common,
+                )
+                source_name = session_name_from_result(initial, noninteractive=False)
+                source_state = self.state_snapshot(source_name)
+                resumed = self.run("--resume-session", source_name, "0", *common)
+                patched = self.run(
+                    "--task", task, "--patch", "--noninteractive",
+                    "--images", images[0], *common,
+                )
+                processed = self.run(
+                    "--tree-files", tree, "--tree-task", task, "--tree-parallel", "1", *common,
+                )
+                missing = directory / "missing.png"
+                failed = self.run("--task", task, "--images", missing, *common, check=False)
+            require(
+                len(mock.requests) == 4
+                and initial.stdout == "Offline image answer\n"
+                and resumed.stdout == "Resumed offline image answer\n"
+                and failed.returncode == 1 and "cannot read image" in failed.stderr
+                and str(missing) in failed.stderr,
+                "image inputs made unexpected requests or failed to reject an unreadable image",
+            )
+            for index, (request, urls) in enumerate(zip(
+                mock.requests, (image_urls, image_urls, image_urls[:1], image_urls),
+            )):
+                require_task_placement(request, task)
+                user_content = [
+                    {"type": "input_text", "text": request_prompt(request)},
+                    *[
+                        {"type": "input_image", "detail": "original", "image_url": url}
+                        for url in urls
+                    ],
+                ]
+                require(
+                    request["input"] == [
+                        *([reasoning_item] if index == 1 else []),
+                        {"role": "user", "content": user_content},
+                    ],
+                    "images were processed, reordered, assigned an incorrect MIME type, or misplaced beside reasoning",
+                )
+            resumed_name = self.resumed_session_name(
+                resumed, source_name, 0, noninteractive=False,
+            )
+            patch_name = session_name_from_result(patched, noninteractive=True)
+            tree_name = session_name_from_result(processed, noninteractive=False)
+            for session_name, turn, request in zip(
+                (source_name, resumed_name, patch_name, tree_name),
+                (0, 1, 0, 0), mock.requests,
+            ):
+                require_state_request(self.state_artifacts(session_name, turn), request)
+            require(
+                not request_file_contexts(mock.requests[0])
+                and not request_file_contexts(mock.requests[2])
+                and set(request_file_contexts(mock.requests[3])) == {str(target)}
+                and self.state_artifacts(source_name, "request_files")["request_files"] == ""
+                and json.loads(self.state_artifacts(
+                    patch_name, "0", "response_schema_patch",
+                )["response_schema_patch"]) == manifest
+                and not created.exists()
+                and self.state_snapshot(source_name) == source_state
+                and all(path.read_bytes() == content for path, content in zip(images, contents)),
+                "image-only tasks, patch proposals, tree context, or resumed state modified their original inputs",
+            )
+        finally:
+            self.run("--remove-profile", profile)
+
     @staticmethod
     def _patch_file_entry(
         path: Path,
@@ -1697,7 +1933,7 @@ class OfflineTests:
                 "patch_id": "overlap",
                 "block_id": "overlap-block",
                 "start_line": 1,
-                "end_line": 2,
+                "end_line": 3,
                 "content_line_array": ["replacement"],
                 "summary_message": "Invalid overlap",
             }
@@ -2451,7 +2687,9 @@ class OfflineTests:
         result = self.run("--state-print-json")
         artifact_types = json.loads(result.stdout)
         require(
-            {
+            isinstance(artifact_types, list)
+            and len(artifact_types) == len(set(artifact_types))
+            and {
                 "request",
                 "request_system_prompt",
                 "request_task",
@@ -2461,19 +2699,20 @@ class OfflineTests:
                 "meta_task_list",
                 "request_agent_turn_metadata",
                 "response_agent_turn_metadata",
+                "request_agent_runtime_state",
+                "response_agent_runtime_state",
                 "request_agent_context_summary",
                 "response_agent_context_summary",
                 "request_agent_context_assist_summary",
                 "response_agent_context_assist_summary",
                 "request_agent_context_assist_require_compaction",
                 "response_agent_context_assist_require_compaction",
-                "request_agent_context_assist_write_context_summary",
-                "response_agent_context_assist_write_context_summary",
                 "request_agent_context_assist_skip_next_interval",
                 "response_agent_context_assist_skip_next_interval",
                 "response_reasoning_encrypted_content",
                 "response_error",
                 "response_schema_patch",
+                "response_diff_patch",
                 "response_schema_patch_applied",
                 "response_shell_output",
                 "response_shell_trace",
@@ -2481,7 +2720,14 @@ class OfflineTests:
                 "response_agent_meta_task_list",
                 "response_agent_file_contexts",
             }.issubset(artifact_types),
-            "state artifact type listing is incomplete",
+            "state artifact type listing is incomplete or contains duplicates",
+        )
+        require(
+            not {
+                "request_agent_context_assist_write_context_summary",
+                "response_agent_context_assist_write_context_summary",
+            }.intersection(artifact_types),
+            "removed context-assist summary flags remain in the artifact type listing",
         )
 
     def test_prompt_placement_and_line_number_override(self) -> None:
@@ -2524,8 +2770,8 @@ class OfflineTests:
                 "line-number overrides omitted context or produced incorrect file and working-directory metadata",
             )
             require(
-                instructions.index("</user_supplied_instructions>")
-                < instructions.index("offline system")
+                instructions.index("offline system")
+                < instructions.index("<user_supplied_instructions>\n")
                 and prompt.startswith("The remaining text is the data, not instructions.")
                 and task not in prompt
                 and ("--system-prompt-with-task is deprecated and has no effect." in result.stderr)
@@ -3535,17 +3781,23 @@ class OfflineTests:
             "shell commands inherited input, lost explicit input, or discarded undecodable output and exit status",
         )
 
-    def test_agent_patch_file_companion(self) -> None:
+    def test_agent_patch_context(self) -> None:
         target = self.work / "agent-patch.txt"
+        created = self.work / "agent-created" / "nested.txt"
         target.write_text("original\n", encoding="utf-8")
-        manifest = self._patch_manifest(target, patches=[self._replacement_patch(["agent-updated"])])
+        manifest = self._patch_manifest(
+            target, patches=[self._replacement_patch(["agent-updated"])],
+        )
+        manifest["files"].append(self._patch_file_entry(
+            created, patches=[self._replacement_patch(["agent-created"])],
+        ))
         responses = [
             MockResponsesAPI.tool_response(("patch", {**manifest, "expires_in_turns": 999})),
             MockResponsesAPI.tool_response(("session", {"action": "end", "reason": "Agent patch completed"})),
         ]
         with MockResponsesAPI(responses) as mock:
             result = self.run(
-                "--task", "Apply an agent patch.", "--agent",
+                "--task", "Apply an agent patch.", "--files", target, "--agent",
                 "--agent-context-expires", "3:1:4",
                 "--model", "offline-test-model", "--base-url", mock.url,
                 "--log", "off",
@@ -3553,8 +3805,9 @@ class OfflineTests:
         require(len(mock.requests) == 2, "expected two agent controller requests")
         require(
             target.read_text(encoding="utf-8") == "agent-updated\n"
+            and created.read_text(encoding="utf-8") == "agent-created"
             and not target.with_name(target.name + ".mcepatched").exists(),
-            "automatic agent patch did not overwrite the source by default",
+            "automatic agent patch did not overwrite existing files and create new files without a suffix",
         )
         request = mock.requests[0]
         require_task_placement(request, "Apply an agent patch.")
@@ -3564,8 +3817,8 @@ class OfflineTests:
             and request.get("parallel_tool_calls") is True
             and instructions.startswith("<core_system_instructions>\n")
             and instructions.index("</core_system_instructions>")
-            < instructions.index("<tool_call_instructions>\n")
             < instructions.index("<user_supplied_instructions>\n")
+            < instructions.index("<tool_call_instructions>\n")
             < instructions.index("<meta_task_list>\n")
             and "Control the autonomous agent session"
             in prompt_section(instructions, "tool_call_instructions")
@@ -3586,50 +3839,166 @@ class OfflineTests:
             == {"patch_id", "block_id", "start_line", "end_line", "content_line_array", "summary_message"},
             "agent patch tool exposed obsolete manifest fields",
         )
-        followup = request_prompt(mock.requests[1])
-        files = prompt_section(followup, "files")
-        attributes = prompt_attributes(files, "file")
+        initial_files = request_file_contexts(request)
+        followup_request = mock.requests[1]
+        followup = request_prompt(followup_request)
+        files = request_file_contexts(followup_request)
         require(
-            "1 agent-updated" in files
-            and attributes["path"] == str(target)
-            and attributes["relative_path"] == target.name
-            and attributes["expires_in_turns"] == "3"
-            and not {"turn", "last_modified_time", "last_refreshed_time"}.intersection(attributes)
-            and context_token_count(files, "file") > 0
-            and prompt_section(followup, "loaded_content_files") == f"{target} | {target.name}"
+            set(initial_files) == {str(target)} and set(files) == {str(target), str(created)},
+            "agent patch lost initial context or failed to load its newly created file",
+        )
+        for path, text, expiry, identifier in (
+            (target, "1 agent-updated", "1", "0"),
+            (created, "1 agent-created", "3", "1"),
+        ):
+            attributes = prompt_attributes(files[str(path)], "file")
+            require(
+                text in files[str(path)]
+                and attributes["path"] == str(path)
+                and attributes["relative_path"] == path.relative_to(self.work).as_posix()
+                and attributes["expires_in_turns"] == expiry
+                and attributes["ID"] == identifier
+                and not {"turn", "last_modified_time", "last_refreshed_time"}.intersection(attributes)
+                and context_token_count(files[str(path)], "file") > 0,
+                "agent patch file context lost its stable ID, current content, path metadata, or independent lifetime",
+            )
+        require(
+            prompt_attributes(initial_files[str(target)], "file")["ID"] == "0"
+            and prompt_section(followup, "loaded_content_files").splitlines() == [
+                f"{target} | {target.name}",
+                f"{created} | {created.relative_to(self.work).as_posix()}",
+            ]
             and "<current_unix_time>" in followup,
-            "patch companion omitted current file metadata or the loaded-content inventory",
+            "patch refresh changed an existing file ID or omitted the loaded-content inventory",
         )
         history = prompt_section(followup, "agent_history")
         tool_call = prompt_section(history, "tool_call")
         tool_output = prompt_section(history, "tool_output")
+        written_paths = f"{target}\n{created}"
         require(
-            history.count("<agent_turn") == 1 and "index='0'" in history
-            and context_token_count(history, "agent_turn") > 0
+            set(request_history_turns(followup_request)) == {0}
             and tool_call.startswith("Tool: patch\n")
             and "Summary: Replace the offline fixture" in tool_call
             and "content_line_array" not in tool_call
             and "Patch changes were written." in tool_output
-            and f"<written_paths>\n{target}\n</written_paths>" in tool_output
-            and "1 agent-updated" not in history,
-            "patch history omitted its readable call or actual output, or duplicated companion file content",
+            and f"<written_paths>\n{written_paths}\n</written_paths>" in tool_output
+            and "1 agent-updated" not in history and "1 agent-created" not in history,
+            "patch history duplicated file content or omitted its readable call and actual written paths",
         )
         session_name = session_name_from_result(result, noninteractive=False)
         state = self.state_artifacts(session_name, "0")
-        require_state_request(state, mock.requests[0])
-        calls = json.loads(state["response"])["tool_calls"]
+        require_state_request(state, request)
         require(
-            [call["tool"] for call in calls] == ["patch", "load_file_from_storage"]
-            and all(call["expires_in_turns"] == 4 for call in calls)
-            and calls[1]["paths"] == [str(target)]
-            and state["response_schema_patch_applied_0"] == str(target),
-            "patch companion, clamped expiry, or indexed application paths were not saved",
+            json.loads(state["response"]) == {"tool": "patch", **manifest, "expires_in_turns": 4}
+            and state["response_schema_patch_applied_0"] == written_paths,
+            "agent patch injected a redundant read call or lost its clamped expiry and indexed paths",
         )
         contexts = json.loads(state["response_agent_file_contexts"])
         require(
-            len(contexts) == 1 and contexts[0]["path"] == str(target)
-            and "1 agent-updated" in contexts[0]["section"],
-            "refreshed agent file context was not persisted",
+            len(contexts) == 1 and contexts[0]["path"] == str(created)
+            and "1 agent-created" in contexts[0]["section"],
+            "agent patch did not persist only its newly loaded file context",
+        )
+
+    def test_agent_patch_batches(self) -> None:
+        target = self.work / "agent-batch-target.txt"
+        untouched = self.work / "agent-batch-untouched.txt"
+        unchanged = self.work / "agent-batch-unchanged.txt"
+        created = self.work / "agent-batch-created" / "nested.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        untouched.write_text("untouched\n", encoding="utf-8")
+        unchanged.write_text("unchanged\n", encoding="utf-8")
+        first_patch = {
+            **self._replacement_patch(["first"]),
+            "end_line": 2, "summary_message": "Replace first range",
+        }
+        shared_patch = {
+            **self._replacement_patch(["second"]),
+            "patch_id": "offline-p2", "block_id": "offline-b2",
+            "start_line": 2, "end_line": 3,
+            "summary_message": "Replace shared endpoint range",
+        }
+        first = self._patch_manifest(target, patches=[shared_patch, first_patch])
+        conflicting = self._patch_manifest(
+            Path(target.name), patches=[self._replacement_patch(["must-not-write"])],
+        )
+        conflicting["files"].append(self._patch_file_entry(
+            untouched, patches=[self._replacement_patch(["must-not-write"])],
+        ))
+        disjoint = self._patch_manifest(
+            created, patches=[self._replacement_patch(["disjoint-created"])],
+        )
+        no_change = self._patch_manifest(
+            unchanged, patches=[self._replacement_patch(["unchanged"])],
+        )
+        expected_contents = {
+            target: "first\nsecond\n", created: "disjoint-created",
+            untouched: "untouched\n", unchanged: "unchanged\n",
+        }
+        shell = {
+            "commands": [{
+                "command": shlex.quote(sys.executable),
+                "lines": [
+                    "from pathlib import Path",
+                    *[
+                        f"assert Path({str(path)!r}).read_text(encoding='utf-8') == {content!r}"
+                        for path, content in expected_contents.items()
+                    ],
+                    "print('batch-order-ok')",
+                ],
+                "reason": "Verify earlier patch calls before ending the session",
+            }],
+        }
+        response = MockResponsesAPI.tool_response(
+            ("session", {"action": "end", "reason": "Batched agent patches checked"}),
+            ("patch", first), ("patch", conflicting),
+            ("patch", disjoint), ("patch", no_change), ("shell", shell),
+        )
+        with MockResponsesAPI([response]) as mock:
+            result = self.run(
+                "--task", "Apply nonoverlapping agent patch calls in order.", "--agent",
+                "--agent-context-expires", "3 1 4",
+                "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
+            )
+        require(
+            len(mock.requests) == 1
+            and "Removed overlapping agent patch tool call 2" in result.stderr
+            and str(target) in result.stderr
+            and all(path.read_text(encoding="utf-8") == content for path, content in expected_contents.items()),
+            "overlapping patch calls were executed, disjoint calls were dropped, or session completion ran too early",
+        )
+        session_name = session_name_from_result(result, noninteractive=False)
+        artifacts = self.state_artifacts(session_name, "0")
+        require_state_request(artifacts, mock.requests[0])
+        calls = json.loads(artifacts["response"])["tool_calls"]
+        outputs = json.loads(artifacts["response_agent_tool_output"])["tool_outputs"]
+        merged = {
+            **first_patch, "end_line": 3, "content_line_array": ["first", "second"],
+            "summary_message": "Replace first range\n\nReplace shared endpoint range",
+        }
+        require(
+            [call["tool"] for call in calls] == ["patch", "patch", "patch", "shell", "session"]
+            and all(call["expires_in_turns"] == 3 for call in calls)
+            and calls[0]["files"][0]["patches"] == [merged]
+            and json.loads(artifacts["response_schema_patch_0"])["files"][0]["patches"] == [merged]
+            and artifacts["response_schema_patch_applied_0"] == str(target)
+            and artifacts["response_schema_patch_applied_1"] == str(created)
+            and artifacts["response_schema_patch_applied_2"] == ""
+            and artifacts["response_diff_patch_2"] == ""
+            and len(outputs) == 5
+            and outputs[3] == artifacts["response_shell_output_3"]
+            and "<stdout>\nbatch-order-ok\n</stdout>" in outputs[3]
+            and "<exit_status>0</exit_status>" in outputs[3]
+            and outputs[4] == "Agent session ended.",
+            "patch normalization, accepted no-op patches, canonical call ordering, or indexed execution artifacts were incorrect",
+        )
+        metadata = json.loads(artifacts["response_agent_turn_metadata"])
+        require(
+            self.state_turn_numbers(session_name) == [0]
+            and metadata["turn_count"] == 5
+            and [entry["number"] for entry in metadata["turns"]] == list(range(5))
+            and [entry["tool_call_index"] for entry in metadata["turns"]] == list(range(5)),
+            "batched session completion lost stable history IDs or recorded removed patch calls",
         )
 
     def test_agent_task_list_atomic_capacity(self) -> None:
@@ -3744,9 +4113,11 @@ class OfflineTests:
         invalid_cases = [
             (meta_only, "Agent returned no executable tool call"),
             (MockResponsesAPI.tool_response(
-                ("session", {"action": "end", "reason": "Invalid extra call"}),
-                ("meta_context_control", {"action": "pin", "context_id": "turn:1", "reason": "Extra"}),
-            ), "agent session end responses must contain exactly one tool call"),
+                ("meta_context_control", {"action": "pin", "context_id": "turn:1", "reason": "Invalid leading call"}),
+                ("session", {"action": "end", "reason": "Leading retention is not executable"}),
+            ), "Agent returned no executable tool call"),
+            (MockResponsesAPI.tool_response(("unknown_offline_tool", {})),
+             "unknown function call: unknown_offline_tool"),
         ]
         for invalid, diagnostic in invalid_cases:
             with MockResponsesAPI([invalid]) as mock:
@@ -3760,7 +4131,7 @@ class OfflineTests:
                 failed.returncode == 1 and len(mock.requests) == 1
                 and "Agent request failed (1/1)" in failed.stderr
                 and diagnostic in failed.stderr,
-                "invalid controller ordering or session companion was accepted",
+                "invalid controller ordering or an unknown function call was accepted",
             )
             failed_name = session_name_from_result(failed, noninteractive=False)
             failed_state = self.state_artifacts(failed_name, "0")
@@ -4231,12 +4602,17 @@ class OfflineTests:
             and str(transient) not in file_contexts[5],
             "updated file expiry did not retain and then remove the unpinned context",
         )
-        final_input = request_prompt(mock.requests[5])
+        final_request = mock.requests[5]
+        final_input = request_prompt(final_request)
+        retained_turn = request_history_turns(final_request)[0]
+        retained_attributes = prompt_attributes(retained_turn, "agent_turn")
         require(
-            " pinned='true' index='0' " in final_input
+            retained_attributes["pinned"] == "true"
+            and retained_attributes["ID"] == retained_attributes["index"] == "0"
+            and retained_attributes["tool_call_index"] == "0"
             and "expires_in_turns limit was reached" in final_input
             and "purge_in_turns='1'" in final_input,
-            "agent history omitted the pinned turn or the expired-turn removal notice",
+            "agent history omitted the pinned turn, stable ID, or expired-turn removal notice",
         )
 
     def test_agent_reuse_restores_selected_history(self) -> None:
@@ -4332,6 +4708,164 @@ class OfflineTests:
         require(
             json.loads(final_state["meta_task_list"]) == completed_tasks,
             "resumed agent task-list snapshot was not persisted in the new session",
+        )
+
+    def test_agent_resumes_pending_tool_calls(self) -> None:
+        first_marker = self.work / "pending-first-executions.txt"
+        second_marker = self.work / "pending-second-executions.txt"
+        task = "Resume only the unexecuted suffix of an agent response."
+        commands = [
+            {"commands": [{
+                "command": f"printf 'executed\\n' >> {shlex.quote(str(path))}",
+                "reason": f"Record execution of pending command {index}",
+            }]}
+            for index, path in enumerate((first_marker, second_marker), start=1)
+        ]
+        response = MockResponsesAPI.tool_response(
+            ("session", {"action": "end", "reason": "Pending tool calls completed"}),
+            ("shell", commands[0]), ("shell", commands[1]),
+        )
+        with MockResponsesAPI([response]) as mock:
+            common = (
+                "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
+            )
+            interrupted = self.run(
+                "--task", task, "--agent", "--agent-review", *common,
+                input_text="y\ny\n", check=False,
+            )
+            require(
+                interrupted.returncode == 1 and "EOF when reading a line" in interrupted.stderr
+                and len(mock.requests) == 1
+                and first_marker.read_text(encoding="utf-8") == "executed\n"
+                and not second_marker.exists(),
+                "review interruption did not stop after the first accepted shell call",
+            )
+            source_name = session_name_from_result(interrupted, noninteractive=False)
+            partial = self.state_artifacts(source_name, "0")
+            partial_outputs = json.loads(partial["response_agent_tool_output"])["tool_outputs"]
+            require(
+                [call["tool"] for call in json.loads(partial["response"])["tool_calls"]]
+                == ["shell", "shell", "session"]
+                and partial_outputs == [
+                    partial["response_shell_output_0"],
+                    "Tool call was not executed.", "Tool call was not executed.",
+                ]
+                and json.loads(partial["response_agent_turn_metadata"])["turn_count"] == 1,
+                "interrupted execution lost its canonical response or completed output prefix",
+            )
+            source_state = self.state_snapshot(source_name)
+            resumed = self.run("--agent", "--resume-session", source_name, "0", *common)
+        resumed_name = self.resumed_session_name(
+            resumed, source_name, 0, noninteractive=False, first_local_turn=0,
+        )
+        completed = self.state_artifacts(resumed_name, "0")
+        require_state_request(completed, mock.requests[0])
+        outputs = json.loads(completed["response_agent_tool_output"])["tool_outputs"]
+        metadata = json.loads(completed["response_agent_turn_metadata"])
+        require(
+            len(mock.requests) == 1
+            and first_marker.read_text(encoding="utf-8") == "executed\n"
+            and second_marker.read_text(encoding="utf-8") == "executed\n"
+            and completed["response"] == partial["response"]
+            and outputs == [
+                partial["response_shell_output_0"],
+                completed["response_shell_output_1"], "Agent session ended.",
+            ]
+            and metadata["turn_count"] == 3
+            and [entry["number"] for entry in metadata["turns"]] == [0, 1, 2]
+            and [entry["state_turn"] for entry in metadata["turns"]] == [0, 0, 0]
+            and [entry["tool_call_index"] for entry in metadata["turns"]] == [0, 1, 2]
+            and self.state_snapshot(source_name) == source_state,
+            "pending response resume requested another model response, repeated completed work, or changed source history",
+        )
+        require_cumulative_stats(
+            interrupted, {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+        )
+        require_cumulative_stats(
+            resumed, {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+        )
+
+    def test_agent_resumes_failed_runtime_request(self) -> None:
+        target = self.work / "failed-agent-runtime-context.txt"
+        target.write_text("Retained failed-request context\n", encoding="utf-8")
+        task = "Start the offline runtime checkpoint check."
+        continued_task = "Continue the checkpointed agent task."
+        active_context = "Verified context retained across the failed request"
+        diagnostic = "Offline agent request interrupted"
+        responses = [
+            MockResponsesAPI.tool_response(("agent", {
+                "task": continued_task, "context": active_context,
+                "reason": "Checkpoint the next active task and context",
+            })),
+            {
+                "http_status": 401,
+                "error": {"message": diagnostic, "type": "invalid_request_error"},
+            },
+            MockResponsesAPI.tool_response(("session", {
+                "action": "end", "reason": "Failed runtime request resumed",
+            })),
+        ]
+        with MockResponsesAPI(responses) as mock:
+            common = (
+                "--agent", "--agent-context-expires", "4 1 6",
+                "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
+            )
+            interrupted = self.run(
+                "--task", task, "--files", target, *common, check=False,
+            )
+            source_name = session_name_from_result(interrupted, noninteractive=False)
+            failed_state = self.state_artifacts(source_name, "1")
+            require_failed_state_turn(failed_state, diagnostic)
+            require_state_request(failed_state, mock.requests[1])
+            runtime = json.loads(failed_state["response_agent_runtime_state"])
+            require(
+                interrupted.returncode == 1 and len(mock.requests) == 2
+                and self.state_turn_numbers(source_name) == [0, 1]
+                and runtime["version"] == 1
+                and runtime["advance_expirations"] is False
+                and runtime["file_context_ids"] == {str(target): 0}
+                and len(runtime["prior_token_estimates"]) == 1
+                and runtime["prior_token_estimates"][0][0] == 0
+                and runtime["turn_metadata"]["active_task"] == continued_task
+                and runtime["turn_metadata"]["active_context"] == active_context,
+                "failed controller request did not checkpoint its active runtime state and expiration progress",
+            )
+            source_state = self.state_snapshot(source_name)
+            resumed = self.run("--resume-session", source_name, *common)
+        resumed_name = self.resumed_session_name(
+            resumed, source_name, 1, noninteractive=False, first_local_turn=1,
+        )
+        require(len(mock.requests) == 3, "failed runtime resume replayed an earlier controller request")
+        for request in mock.requests[1:]:
+            require_task_placement(request, continued_task)
+            require(
+                prompt_section(request_prompt(request), "agent_context") == active_context,
+                "failed runtime resume lost the checkpointed active context",
+            )
+        require(
+            request_instructions(mock.requests[1]) == request_instructions(mock.requests[2])
+            and request_file_contexts(mock.requests[1]) == request_file_contexts(mock.requests[2])
+            and request_history_turns(mock.requests[1]) == request_history_turns(mock.requests[2])
+            and prompt_section(request_prompt(mock.requests[1]), "prior_token_estimates")
+            == prompt_section(request_prompt(mock.requests[2]), "prior_token_estimates")
+            and prompt_attributes(request_file_contexts(mock.requests[2])[str(target)], "file")
+            ["expires_in_turns"] == "2",
+            "failed runtime resume changed prompts, stable IDs, token history, or aged retained context twice",
+        )
+        completed = self.state_artifacts(resumed_name, "1")
+        require_state_request(completed, mock.requests[2])
+        require(
+            completed["request_task"] == continued_task
+            and json.loads(completed["response"])["tool"] == "session"
+            and "response_error" not in completed
+            and self.state_snapshot(source_name) == source_state,
+            "resuming an incomplete agent request retained its failure or modified the source session",
+        )
+        require_cumulative_stats(
+            interrupted, {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+        )
+        require_cumulative_stats(
+            resumed, {"input_tokens": 16, "output_tokens": 8, "total_tokens": 24},
         )
 
     def test_api_key_redaction(self) -> None:
@@ -5064,38 +5598,60 @@ class OfflineTests:
             "agent-review was accepted without agent mode",
         )
 
-    def test_agent_context_assist_summary_request(self) -> None:
-        target = self.work / "assisted-agent-context.txt"
-        target.write_text("Retained assisted context\n", encoding="utf-8")
-        task = "Request a durable summary without discarding live context."
-        summary = f"# Assisted offline summary\n\n- `{target}`: retained temporary fixture."
-        guidance = "The file was inspected; write a durable summary and retain the live context."
+    def test_agent_context_assist_removals(self) -> None:
+        retained = self.work / "assisted-retained.txt"
+        stale = self.work / "assisted-stale.txt"
+        changed = self.work / "assisted-changed.txt"
+        reloaded = self.work / "assisted-reloaded.txt"
+        paths = (retained, stale, changed, reloaded)
+        for path in paths:
+            path.write_text(f"Original {path.name}\n", encoding="utf-8")
+        task = "Remove stale reviewed context without losing newer evidence."
+        guidance = "Drop stale evidence while preserving changed files and newer tool outcomes."
         assist = {
-            "summary": guidance, "require_compaction": False,
-            "write_context_summary": True, "clear_stale_summary": False,
+            "summary": guidance, "remove_turn_ids": [0, 1, 2, 3, 999, 0],
+            "remove_file_ids": [1, 2, 3, 999, 1],
+            "require_compaction": False, "clear_stale_summary": False,
             "skip_next_context_assist_interval": True,
         }
-        continuation = {"task": task, "context": "", "reason": "Continue the assisted check"}
+        continuation = {"task": task, "context": "", "reason": "Continue the context review check"}
         responses = [
-            MockResponsesAPI.tool_response(("load_file_from_storage", {"paths": [str(target)]})),
+            MockResponsesAPI.tool_response(("load_file_from_storage", {
+                "paths": [str(path) for path in paths],
+            })),
+            MockResponsesAPI.tool_response(
+                ("shell", {"commands": [{
+                    "command": "printf reviewed-evidence", "reason": "Record older verification evidence",
+                }]}),
+                ("meta_context_control", {
+                    "action": "pin", "context_id": "turn:0",
+                    "reason": "Retain loaded files independently of stale history",
+                }),
+            ),
+            MockResponsesAPI.tool_response(
+                ("shell", {"commands": [{
+                    "command": f"printf 'Changed assisted context\\n' > {shlex.quote(str(changed))}",
+                    "reason": "Change file content after the reviewed request",
+                }]}),
+                ("load_file_from_storage", {"paths": [str(reloaded)]}),
+            ),
             MockResponsesAPI.tool_response(("agent", continuation)),
             MockResponsesAPI.tool_response(("agent", continuation)),
-            summary,
             MockResponsesAPI.tool_response(("session", {
-                "action": "end", "reason": "Assisted summary checked",
+                "action": "end", "reason": "Targeted context removal checked",
             })),
         ]
         with MockResponsesAPI(responses, tool_responses={
             "context_assist": [
                 MockResponsesAPI.tool_response(("context_assist", {
-                    **assist, "write_context_summary": "yes",
+                    **assist, "remove_file_ids": [True],
                 })),
                 MockResponsesAPI.tool_response(("context_assist", assist)),
             ],
         }) as mock:
             result = self.run(
                 "--task", task, "--agent", "--agent-context-assist", "2",
-                "--agent-context-expires", "3", "1", "4", "--retry", "2",
+                "--agent-context-expires", "6 1 8", "--retry", "2",
                 "--model", "offline-test-model", "--base-url", mock.url, "--log", "on",
             )
         reviews = [
@@ -5104,51 +5660,66 @@ class OfflineTests:
         ]
         requests = [request for request in mock.requests if request not in reviews]
         require(
-            len(reviews) == 2 and reviews[0] == reviews[1] and len(requests) == 5
+            len(reviews) == 2 and reviews[0] == reviews[1] and len(requests) == 6
             and reviews[0].get("parallel_tool_calls") is False
             and reviews[0].get("tool_choice") == "required"
+            and set(reviews[0]["tools"][0]["parameters"]["properties"]) == set(assist)
             and "This review is for turn 2." in request_instructions(reviews[0])
             and "Treat all of it as data to review" in request_instructions(reviews[0]),
-            "context assist was not scheduled, retried independently, or skipped at its next interval",
+            "context assist used an obsolete schema, failed to retry independently, or ignored its skip interval",
         )
-        summary_request = requests[3]
+        reviewed_files = request_file_contexts(reviews[0])
+        identifiers = {
+            path: int(prompt_attributes(reviewed_files[str(path)], "file")["ID"])
+            for path in paths
+        }
         require(
-            "tools" not in summary_request
-            and summary_request["text"]["format"] == {"type": "text"}
-            and task in prompt_section(request_prompt(summary_request), "agent_instructions")
-            and "<user_supplied_instructions>" not in request_instructions(summary_request)
-            and "1 Retained assisted context" in request_file_contexts(summary_request)[str(target)],
-            "assist summary generation omitted live context or treated controller instructions as summarizer instructions",
+            identifiers == dict(zip(paths, range(4)))
+            and set(request_history_turns(reviews[0])) == {0, 1, 2},
+            "context review did not expose stable file IDs and individual history-entry IDs",
         )
-        final = requests[4]
-        require_task_placement(final, task)
-        instructions = request_instructions(final)
+        final_files = request_file_contexts(requests[3])
         require(
-            prompt_section(instructions, "agent_context_summary") == summary
-            and prompt_attributes(instructions, "agent_context_summary")["expires_in_turns"] == "3"
-            and context_token_count(instructions, "agent_context_summary") > 0
-            and prompt_section(instructions, "agent_context_assist_summary") == guidance
-            and "1 Retained assisted context" in request_file_contexts(final)[str(target)],
-            "summary-only assistance compacted files or lost its summary and advisory guidance",
+            set(final_files) == {str(retained), str(changed), str(reloaded)}
+            and "1 Changed assisted context" in final_files[str(changed)]
+            and "1 Original assisted-reloaded.txt" in final_files[str(reloaded)]
+            and all(
+                int(prompt_attributes(final_files[str(path)], "file")["ID"]) == identifiers[path]
+                for path in (retained, changed, reloaded)
+            )
+            and set(request_history_turns(requests[3])) == {3, 4}
+            and stale.read_text(encoding="utf-8") == "Original assisted-stale.txt\n"
+            and "Removed turn IDs: 0, 1, 2" in result.stdout
+            and "Removed file IDs: 1" in result.stdout,
+            "targeted removal discarded changed or newly loaded files, removed newer turns, changed IDs, or deleted disk content",
+        )
+        require_task_placement(requests[3], task)
+        require(
+            prompt_section(request_instructions(requests[3]), "agent_context_assist_summary") == guidance
+            and all(
+                [tool["name"] for tool in request.get("tools", [])] != ["context_summary"]
+                for request in requests
+            ),
+            "advisory context assistance generated an unsolicited summary or lost its system guidance",
         )
         session_name = session_name_from_result(result, noninteractive=False)
-        require(self.state_turn_numbers(session_name) == list(range(5)), "assist requests became controller turns")
-        reviewed = self.state_artifacts(session_name, "2")
+        reviewed = self.state_artifacts(session_name, "3")
+        metadata = json.loads(reviewed["response_agent_turn_metadata"])
+        runtime = json.loads(reviewed["response_agent_runtime_state"])
         require(
-            reviewed["response_agent_context_assist_summary"] == guidance
-            and json.loads(reviewed["response_agent_context_assist_write_context_summary"]) is True
+            self.state_turn_numbers(session_name) == list(range(6))
+            and reviewed["response_agent_context_assist_summary"] == guidance
             and json.loads(reviewed["response_agent_context_assist_skip_next_interval"]) is True
-            and json.loads(reviewed["response_agent_context_assist_require_compaction"]) is False,
-            "context assist guidance and scheduling flags were not persisted on the reviewed turn",
-        )
-        snapshot = json.loads(self.state_artifacts(
-            session_name, "3", "response_agent_context_summary",
-        )["response_agent_context_summary"])
-        require(
-            snapshot["content"] == summary and snapshot["generated_turn"] == 3
-            and snapshot["expires_in_turns"] == 3
-            and snapshot["removed_file_paths"] == snapshot["removed_turn_numbers"] == [],
-            "assist-requested summary did not preserve its generation turn and noncompacting state",
+            and json.loads(reviewed["response_agent_context_assist_require_compaction"]) is False
+            and "response_agent_context_assist_write_context_summary" not in reviewed
+            and metadata["turn_count"] == 6
+            and [entry["number"] for entry in metadata["turns"]] == [3, 4, 5]
+            and set(metadata["pinned_file_paths"]) == {str(retained), str(changed)}
+            and runtime["file_context_ids"] == {str(path): identifier for path, identifier in identifiers.items()}
+            and json.loads(self.state_artifacts(
+                session_name, "4", "response_agent_context_assist_skip_next_interval",
+            )["response_agent_context_assist_skip_next_interval"]) is False,
+            "context removal lost retained file pins, stable history numbering, runtime IDs, or persisted scheduling flags",
         )
         assist_dir = self.home / ".local/state/mince/state" / session_name / "context_assist" / "2"
         assist_state = {
@@ -5157,13 +5728,85 @@ class OfflineTests:
         }
         require_state_request(assist_state, reviews[1])
         require(
-            json.loads(assist_state["response"]) == assist
+            json.loads(assist_state["response"]) == {
+                **assist, "remove_turn_ids": [0, 1, 2, 3, 999],
+                "remove_file_ids": [1, 2, 3, 999],
+            }
             and "response_error" not in assist_state
             and "Agent context assist request failed (1/2 +0.5s)" in self.session_log(session_name),
-            "successful assist recovery lost its independent state or retry log",
+            "context assist did not normalize duplicate IDs or preserve its independent retry state and log",
         )
         require_cumulative_stats(
-            result, {"input_tokens": 56, "output_tokens": 28, "total_tokens": 84},
+            result, {"input_tokens": 64, "output_tokens": 32, "total_tokens": 96},
+        )
+
+    def test_agent_context_assist_clears_stale_summary(self) -> None:
+        target = self.work / "stale-summary-live-context.txt"
+        target.write_text("Retained beside stale guidance\n", encoding="utf-8")
+        task = "Clear obsolete summary guidance without compacting live context."
+        stale_summary = "# Obsolete offline summary\n\nThis guidance has been contradicted."
+        guidance = "Discard the contradicted summary and retain the verified live file."
+        assist = {
+            "summary": guidance, "remove_turn_ids": [], "remove_file_ids": [],
+            "require_compaction": True, "clear_stale_summary": True,
+            "skip_next_context_assist_interval": True,
+        }
+        ended = MockResponsesAPI.tool_response(("session", {
+            "action": "end", "reason": "Stale summary handling checked",
+        }))
+        with MockResponsesAPI([
+            ended,
+            MockResponsesAPI.tool_response(("agent", {
+                "task": task, "context": "", "reason": "Continue after the independent review",
+            })),
+            ended,
+        ], tool_responses={
+            "context_assist": [MockResponsesAPI.tool_response(("context_assist", assist))],
+        }) as mock:
+            common = (
+                "--agent", "--agent-context-assist", "1", "--agent-context-expires", "8 1 10",
+                "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
+            )
+            initial = self.run("--task", task, "--files", target, *common)
+            source_name = session_name_from_result(initial, noninteractive=False)
+            self.update_state_context_summary(
+                source_name, 0, content=stale_summary, expires_in_turns=8, generated_turn=0,
+            )
+            source_state = self.state_snapshot(source_name)
+            result = self.run("--resume-session", source_name, "0", *common)
+        session_name = self.resumed_session_name(
+            result, source_name, 0, noninteractive=False,
+        )
+        reviews = [
+            request for request in mock.requests
+            if [tool["name"] for tool in request.get("tools", [])] == ["context_assist"]
+        ]
+        requests = [request for request in mock.requests if request not in reviews]
+        require(
+            len(reviews) == 1 and len(requests) == 3
+            and prompt_section(request_prompt(requests[1]), "agent_context_summary") == stale_summary
+            and "<agent_context_summary " not in request_prompt(requests[2])
+            and prompt_section(request_instructions(requests[2]), "agent_context_assist_summary") == guidance
+            and all(set(request_file_contexts(request)) == {str(target)} for request in requests)
+            and "Stale summary cleared: yes" in result.stdout
+            and "Compaction required: no" in result.stdout
+            and "Context summary:\n" not in result.stdout,
+            "clearing stale guidance generated a replacement summary, compacted live files, or ignored the skipped review",
+        )
+        state = self.state_artifacts(session_name, "2")
+        runtime = json.loads(state["request_agent_runtime_state"])
+        require(
+            runtime["context_summary"]["content"] == ""
+            and runtime["context_summary"]["generated_turn"] is None
+            and runtime["context_summary"]["expires_in_turns"] == 8
+            and runtime["context_assist_require_compaction"] is False
+            and runtime["context_assist_skip_next_interval"] is False
+            and runtime["assist_last_turns"] == {"context": 2}
+            and self.state_snapshot(source_name) == source_state,
+            "stale-summary clearing did not reset runtime guidance and scheduling without modifying its source",
+        )
+        require_cumulative_stats(
+            result, {"input_tokens": 32, "output_tokens": 16, "total_tokens": 48},
         )
 
     def test_deprecated_option_aliases(self) -> None:
@@ -5271,22 +5914,28 @@ class OfflineTests:
         large = self.work / "over-budget-agent-context.txt"
         small = self.work / "usable-agent-context.txt"
         missing = self.work / "missing-agent-context.txt"
+        deferred = self.work / "deferred-agent-context.txt"
         source = "Budget-only sentinel " + "x " * 100000 + "\n"
         large.write_text(source, encoding="utf-8")
         small.write_text("Usable loaded context\n", encoding="utf-8")
+        deferred.write_text("Deferred loaded context\n", encoding="utf-8")
         task = "Inspect bounded and missing offline file context."
         responses = [
             MockResponsesAPI.tool_response(
                 ("load_file_from_storage", {
-                    "paths": [str(large), str(missing), str(small)], "expires_in_turns": 4,
+                    "paths": [str(missing), str(small), str(large), str(deferred)],
+                    "expires_in_turns": 4,
                 }),
                 ("shell", {"commands": [{
                     "command": f"printf 'Now bounded context\\n' > {shlex.quote(str(large))}",
-                    "reason": "Reduce the fixture before automatic per-turn refresh",
+                    "reason": "Reduce the fixture before an explicit reload",
                 }]}),
             ),
             MockResponsesAPI.tool_response(("agent", {
-                "task": task, "context": "", "reason": "Advance missing-file expiry",
+                "task": task, "context": "", "reason": "Advance independent file-error expiry",
+            })),
+            MockResponsesAPI.tool_response(("load_file_from_storage", {
+                "paths": [str(large), str(deferred)], "expires_in_turns": 4,
             })),
             MockResponsesAPI.tool_response(("session", {
                 "action": "end", "reason": "Bounded file context checked",
@@ -5298,44 +5947,60 @@ class OfflineTests:
                 "--agent-context-expires", "3", "1", "4", "--token-limit", "65534",
                 "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
             )
-        require(len(mock.requests) == 3, "unexpected bounded-file request count")
+        require(len(mock.requests) == 4, "unexpected bounded-file request count")
         session_name = session_name_from_result(result, noninteractive=False)
         artifacts = self.state_artifacts(session_name, "0", "response_agent_file_contexts")
         entries = json.loads(artifacts["response_agent_file_contexts"])
         contexts = {entry["path"]: entry["section"] for entry in entries}
-        large_attributes = prompt_attributes(contexts[str(large)], "file")
+        require(
+            len(entries) == 4 and set(contexts) == {str(missing), str(small), str(large), str(deferred)},
+            "bounded file loading lost a requested path or duplicated its context",
+        )
+        for path, total_lines in ((large, "1"), (deferred, "0")):
+            attributes = prompt_attributes(contexts[str(path)], "file")
+            require(
+                attributes["error"] == "TOKEN LIMIT EXCEEDED: file could not be loaded"
+                and attributes["total_lines"] == total_lines
+                and attributes["expires_in_turns"] == "1"
+                and context_token_count(contexts[str(path)], "file") == 0
+                and contexts[str(path)].split("\n", 1)[1] == "</file>",
+                "file-budget exhaustion read a later path or lost bounded-error metadata and minimum expiry",
+            )
         missing_attributes = prompt_attributes(contexts[str(missing)], "file")
         require(
-            len(entries) == 3 and set(contexts) == {str(large), str(missing), str(small)}
-            and large_attributes["error"] == "TOKEN LIMIT EXCEEDED: file could not be loaded"
-            and large_attributes["total_lines"] == "1"
-            and context_token_count(contexts[str(large)], "file") == 0
-            and contexts[str(large)].split("\n", 1)[1] == "</file>"
-            and missing_attributes["error"] == f"MISSING FILE: {missing}"
+            missing_attributes["error"] == f"MISSING FILE: {missing}"
             and missing_attributes["expires_in_turns"] == "1"
-            and "1 Usable loaded context" in contexts[str(small)]
-            and all(
-                not {"turn", "last_modified_time", "last_refreshed_time"}.intersection(
-                    prompt_attributes(section, "file")
-                ) for section in contexts.values()
-            ),
-            "file loading lost bounded errors, minimum missing-file expiry, or numbered usable context",
+            and "1 Usable loaded context" in contexts[str(small)],
+            "file loading lost missing-file diagnostics or earlier usable numbered content",
         )
         first_files = request_file_contexts(mock.requests[1])
-        final_files = request_file_contexts(mock.requests[2])
+        expired_files = request_file_contexts(mock.requests[2])
+        final_files = request_file_contexts(mock.requests[3])
         require(
-            str(missing) in first_files and str(missing) not in final_files
-            and prompt_attributes(first_files[str(missing)], "file")["expires_in_turns"] == "0"
-            and "TOKEN LIMIT EXCEEDED: file could not be loaded"
-            in prompt_section(request_prompt(mock.requests[1]), "agent_history")
+            set(first_files) == set(contexts)
+            and set(expired_files) == {str(small)}
+            and set(final_files) == {str(small), str(large), str(deferred)}
             and all(
-                "1 Usable loaded context" in files.get(str(small), "")
-                and "1 Now bounded context" in files.get(str(large), "")
-                and "error" not in prompt_attributes(files[str(large)], "file")
-                and prompt_attributes(files[str(large)], "file")["expires_in_turns"] == expiry
-                for files, expiry in ((first_files, "3"), (final_files, "2"))
+                prompt_attributes(first_files[str(path)], "file")["expires_in_turns"] == "0"
+                for path in (missing, large, deferred)
+            )
+            and "TOKEN LIMIT EXCEEDED: file could not be loaded"
+            in prompt_attributes(first_files[str(large)], "file")["error"]
+            and "1 Now bounded context" not in first_files[str(large)]
+            and "1 Now bounded context" in final_files[str(large)]
+            and "1 Deferred loaded context" in final_files[str(deferred)]
+            and all(
+                "error" not in prompt_attributes(final_files[str(path)], "file")
+                and prompt_attributes(final_files[str(path)], "file")["expires_in_turns"] == "3"
+                and prompt_attributes(final_files[str(path)], "file")["ID"]
+                == prompt_attributes(contexts[str(path)], "file")["ID"]
+                for path in (large, deferred)
+            )
+            and all(
+                "1 Usable loaded context" in files[str(small)]
+                for files in (first_files, expired_files, final_files)
             ),
-            "missing context did not expire independently or automatically refreshed content was lost",
+            "bounded errors were automatically retried, failed to expire independently, or lost stable IDs on explicit reload",
         )
         require(
             all("1 Budget-only sentinel" not in request_prompt(request) for request in mock.requests)
@@ -5362,7 +6027,7 @@ class OfflineTests:
         small.write_text("Retained beside an error\n", encoding="utf-8")
         responses = [
             MockResponsesAPI.tool_response(("load_file_from_storage", {
-                "paths": [str(large), str(small)], "expires_in_turns": 4,
+                "paths": [str(small), str(large)], "expires_in_turns": 4,
             })),
             continuation, ended, ended,
         ]
@@ -5458,9 +6123,9 @@ class OfflineTests:
         }))
         common = (
             "--agent", "--agent-context-expires", "3", "1", "4",
+            "--agent-context-assist", "1", "--retry", "2",
             "--model", "offline-test-model", "--log", "off",
         )
-        # Measure the real controller envelope rather than duplicating tokenization.
         with MockResponsesAPI([ended]) as calibration:
             self.run(
                 "--task", task, "--files", target, *common,
@@ -5474,16 +6139,25 @@ class OfflineTests:
         require(estimate is not None, "controller request omitted its token estimate")
         token_limit = int(str(estimate)) + 1024
         summary = f"# Automatic offline summary\n\n- `{target}`: inspected temporary fixture."
-        with MockResponsesAPI([summary, ended, ended]) as mock:
+        assist = {
+            "summary": "Retain the completed compaction.",
+            "remove_turn_ids": [], "remove_file_ids": [],
+            "require_compaction": False, "clear_stale_summary": False,
+            "skip_next_context_assist_interval": False,
+        }
+        with MockResponsesAPI([
+            summary,
+            MockResponsesAPI.tool_response(("context_summary", {"summary": summary})),
+            ended, ended,
+        ], tool_responses={
+            "context_assist": [MockResponsesAPI.tool_response(("context_assist", assist))],
+        }) as mock:
             result = self.run(
                 "--task", task, "--files", target, *common,
                 "--token-limit", token_limit, "--base-url", mock.url,
             )
             session_name = session_name_from_result(result, noninteractive=False)
-            compacted = self.state_artifacts(
-                session_name, "0", "response", "response_agent_context_summary",
-                "response_agent_turn_metadata",
-            )
+            compacted = self.state_artifacts(session_name, "0")
             source_state = self.state_snapshot(session_name)
             resumed = self.run(
                 "--resume-session", session_name, "0", *common,
@@ -5493,45 +6167,59 @@ class OfflineTests:
             resumed, session_name, 0, noninteractive=False,
         )
         require(
-            len(mock.requests) == 3,
-            "automatic summary or summary-turn resume made unexpected requests",
+            len(mock.requests) == 4 and mock.requests[0] == mock.requests[1]
+            and "agent context summary requires exactly one context_summary tool call" in result.stderr
+            and "Agent request failed (1/2 +0.5s)" in result.stderr,
+            "summary protocol validation failed to retry intact or a recent compaction triggered an unnecessary assist",
         )
-        summary_request = mock.requests[0]
-        require(
-            "tools" not in summary_request and "tool_choice" not in summary_request
-            and summary_request["text"]["format"] == {"type": "text"}
-            and "1 Automatic summary fixture" in request_prompt(summary_request),
-            "automatic compaction did not request Markdown without tools using the visible file context",
-        )
-        for request in mock.requests[1:]:
+        for request in mock.requests[:2]:
+            require_summary_request(request)
+            require(
+                "1 Automatic summary fixture" in request_prompt(request)
+                and task not in request_instructions(request),
+                "automatic compaction omitted visible file data or reused controller task instructions",
+            )
+        for request in mock.requests[2:]:
             require_task_placement(request, task)
             prompt = request_prompt(request)
             instructions = request_instructions(request)
             require(
                 request.get("tool_choice") == "required" and bool(request.get("tools"))
                 and prompt_section(prompt, "files") == ""
-                and prompt_section(instructions, "agent_context_summary") == summary
-                and prompt_attributes(instructions, "agent_context_summary")["expires_in_turns"] == "3"
-                and context_token_count(instructions, "agent_context_summary") > 0
-                and "<agent_context_summary " not in prompt,
-                "controller continuation or resume misplaced its summary or restored compacted file context",
+                and prompt_section(prompt, "agent_context_summary") == summary
+                and prompt_attributes(prompt, "agent_context_summary")["expires_in_turns"] == "3"
+                and context_token_count(prompt, "agent_context_summary") > 0
+                and "<agent_context_summary " not in instructions
+                and prompt.index("<agent_context_summary ") < prompt.index("<files "),
+                "controller continuation or resume misplaced summary data or restored compacted file context",
             )
         snapshot = json.loads(compacted["response_agent_context_summary"])
         metadata = json.loads(compacted["response_agent_turn_metadata"])
+        runtime = json.loads(compacted["response_agent_runtime_state"])
         require(
             compacted["response"] == summary and snapshot["content"] == summary
+            and "response_error" not in compacted
             and snapshot["removed_file_paths"] == [str(target)]
             and snapshot["removed_turn_numbers"] == [] and snapshot["expires_in_turns"] == 3
+            and snapshot["generated_turn"] == 0
             and metadata["turn_count"] == 0 and metadata["file_expires_in_turns"] == {}
-            and metadata["pinned_file_paths"] == [],
-            "automatic summary did not persist Markdown and compact even pinned initial file context",
+            and metadata["pinned_file_paths"] == []
+            and runtime["last_compaction_turn"] == 0
+            and runtime["context_summary"] == snapshot,
+            "automatic summary lost its native result, generation turn, runtime snapshot, or pinned-context compaction",
         )
         require(
             self.state_turn_numbers(session_name) == [0, 1]
             and self.state_turn_numbers(resumed_session_name) == [1]
-            and self.state_snapshot(session_name) == source_state,
-            "resuming a summary-only turn modified source state or created incorrect local turns",
+            and self.state_snapshot(session_name) == source_state
+            and not (self.home / ".local/state/mince/state" / session_name / "context_assist").exists()
+            and not (self.home / ".local/state/mince/state" / resumed_session_name / "context_assist").exists(),
+            "summary-only resume modified source state or failed to suppress reviews immediately after compaction",
         )
+        for completed in (result, resumed):
+            require_cumulative_stats(
+                completed, {"input_tokens": 24, "output_tokens": 12, "total_tokens": 36},
+            )
 
     def test_agent_summary_expiry_refreshes_live_context(self) -> None:
         target = self.work / "summary-refresh-context.txt"
@@ -5547,7 +6235,8 @@ class OfflineTests:
             MockResponsesAPI.tool_response(("load_file_from_storage", {
                 "paths": [str(target)], "expires_in_turns": 2,
             })),
-            refreshed_summary, ended,
+            MockResponsesAPI.tool_response(("context_summary", {"summary": refreshed_summary})),
+            ended,
         ]
         with MockResponsesAPI(responses) as mock:
             common = (
@@ -5556,53 +6245,46 @@ class OfflineTests:
             )
             initial = self.run("--task", task, *common)
             source_name = session_name_from_result(initial, noninteractive=False)
-            summary_path = (
-                self.home / ".local/state/mince/state" / source_name / "0"
-                / "response_agent_context_summary"
+            self.update_state_context_summary(
+                source_name, 0, content=initial_summary, expires_in_turns=0, generated_turn=0,
             )
-            saved_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            saved_summary.update({
-                "content": initial_summary, "expires_in_turns": 0, "generated_turn": 0,
-            })
-            summary_path.write_text(json.dumps(saved_summary), encoding="utf-8")
             source_state = self.state_snapshot(source_name)
             result = self.run("--resume-session", source_name, "0", *common)
         session_name = self.resumed_session_name(result, source_name, 0, noninteractive=False)
         require(len(mock.requests) == 4, "expired summary was not refreshed exactly once")
         require(
-            prompt_section(request_instructions(mock.requests[1]), "agent_context_summary")
+            prompt_section(request_prompt(mock.requests[1]), "agent_context_summary")
             == initial_summary and not request_file_contexts(mock.requests[1]),
             "a just-generated saved summary was refreshed before the next controller action",
         )
         refresh_request = mock.requests[2]
+        require_summary_request(refresh_request)
         refresh_prompt = request_prompt(refresh_request)
         final_request = mock.requests[3]
         final_prompt = request_prompt(final_request)
         final_instructions = request_instructions(final_request)
         require(
-            "tools" not in refresh_request
-            and refresh_request["text"]["format"] == {"type": "text"}
-            and prompt_section(refresh_prompt, "agent_context_summary") == initial_summary
+            prompt_section(refresh_prompt, "agent_context_summary") == initial_summary
             and prompt_attributes(refresh_prompt, "agent_context_summary")["expires_in_turns"] == "0"
             and context_token_count(refresh_prompt, "agent_context_summary") > 0
-            and initial_summary in prompt_section(refresh_prompt, "agent_instructions")
+            and task not in request_instructions(refresh_request)
             and "1 Live context after the initial summary"
             in request_file_contexts(refresh_request)[str(target)]
             and prompt_attributes(request_file_contexts(refresh_request)[str(target)], "file")
             ["expires_in_turns"] == "2",
-            "expiry refresh omitted instruction snapshots or advanced live context before summarizing",
+            "expiry refresh omitted summary data or advanced live context before summarizing",
         )
         require(
             final_request.get("tool_choice") == "required"
-            and prompt_section(final_instructions, "agent_context_summary") == refreshed_summary
-            and prompt_attributes(final_instructions, "agent_context_summary")["expires_in_turns"] == "1"
-            and context_token_count(final_instructions, "agent_context_summary") > 0
-            and "<agent_context_summary " not in final_prompt
+            and prompt_section(final_prompt, "agent_context_summary") == refreshed_summary
+            and prompt_attributes(final_prompt, "agent_context_summary")["expires_in_turns"] == "1"
+            and context_token_count(final_prompt, "agent_context_summary") > 0
+            and "<agent_context_summary " not in final_instructions
             and "1 Live context after the initial summary"
             in request_file_contexts(final_request)[str(target)]
             and prompt_attributes(request_file_contexts(final_request)[str(target)], "file")
             ["expires_in_turns"] == "1",
-            "summary refresh compacted live files, misplaced the summary, or double-aged context",
+            "summary refresh compacted live files, misplaced summary data, or double-aged context",
         )
         state = self.state_artifacts(
             session_name, "2", "response", "response_agent_context_summary",
@@ -5613,19 +6295,20 @@ class OfflineTests:
         next_metadata = json.loads(self.state_artifacts(
             session_name, "3", "request_agent_turn_metadata",
         )["request_agent_turn_metadata"])
-        before_turn = before_metadata["turns"][0]
-        next_turn = next_metadata["turns"][0]
+        before_turn = next(entry for entry in before_metadata["turns"] if entry["state_turn"] == 1)
+        next_turn = next(entry for entry in next_metadata["turns"] if entry["state_turn"] == 1)
         require(
             state["response"] == refreshed_summary and snapshot["content"] == refreshed_summary
             and snapshot["expires_in_turns"] == 1 and snapshot["generated_turn"] == 2
             and snapshot["removed_file_paths"] == snapshot["removed_turn_numbers"] == []
-            and before_metadata["turn_count"] == next_metadata["turn_count"] == 1
-            and before_turn["state_turn"] == next_turn["state_turn"] == 1
+            and before_metadata["turn_count"] == next_metadata["turn_count"] == 2
+            and before_turn["number"] == next_turn["number"] == 1
+            and before_turn["tool_call_index"] == next_turn["tool_call_index"] == 0
             and before_turn["expires_in_turns"] == 2 and next_turn["expires_in_turns"] == 1
             and set(next_turn["readfile_contexts"]) == {str(target)}
             and self.state_snapshot(source_name) == source_state
             and self.state_turn_numbers(session_name) == [1, 2, 3],
-            "summary refresh lost live history, changed expiry or turn IDs, or modified source state",
+            "summary refresh lost completed session history, changed expiry or stable IDs, or modified source state",
         )
 
     def test_shell_trace_and_indexed_artifacts(self) -> None:
@@ -6391,11 +7074,13 @@ class OfflineTests:
             {"name": "agent_system_prompt", "content": "Offline revised controller core."},
             {"name": "tool_call_progress", "content": "Use the newest verified outcome before acting."},
         ]
+        replacements = {update["name"]: update["content"] for update in updates}
         continuation = {"task": task, "context": "", "reason": "Continue the prompt review check"}
-        responses = [MockResponsesAPI.tool_response(("agent", continuation)) for _ in range(5)]
-        responses.append(MockResponsesAPI.tool_response(("session", {
+        ended = MockResponsesAPI.tool_response(("session", {
             "action": "end", "reason": "In-memory prompt updates checked",
-        })))
+        }))
+        responses = [MockResponsesAPI.tool_response(("agent", continuation)) for _ in range(5)]
+        responses.extend((ended, ended))
         self.run("--inherit-profile", profile)
         try:
             with MockResponsesAPI(responses, tool_responses={
@@ -6421,13 +7106,22 @@ class OfflineTests:
                     "--agent-prompt-assist", "2", profile, "low", "offline-review-model",
                     "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
                 )
+                session_name = session_name_from_result(result, noninteractive=False)
+                source_state = self.state_snapshot(session_name)
+                resumed = self.run(
+                    "--agent", "--resume-session", session_name, "5",
+                    "--model", "offline-test-model", "--base-url", mock.url, "--log", "off",
+                )
+            resumed_name = self.resumed_session_name(
+                resumed, session_name, 5, noninteractive=False,
+            )
             reviews = [
                 request for request in mock.requests
                 if [tool["name"] for tool in request.get("tools", [])] == ["prompt_assist"]
             ]
             requests = [request for request in mock.requests if request not in reviews]
             require(
-                len(reviews) == 2 and len(requests) == 6
+                len(reviews) == 2 and len(requests) == 7
                 and all(
                     request["model"] == "offline-review-model"
                     and request["reasoning"]["effort"] == "low"
@@ -6437,14 +7131,23 @@ class OfflineTests:
                 and all(request["model"] == "offline-test-model" for request in requests),
                 "prompt assist scheduling or secondary-profile model and reasoning overrides were incorrect",
             )
-            first_inventory = json.loads(prompt_section(request_prompt(reviews[0]), "agent_system_prompts"))
-            next_inventory = json.loads(prompt_section(request_prompt(reviews[1]), "agent_system_prompts"))
-            originals = json.loads(prompt_section(request_prompt(reviews[1]), "original_agent_system_prompts"))
+            first_prompt = request_prompt(reviews[0])
+            next_prompt = request_prompt(reviews[1])
+            first_inventory = json.loads(prompt_section(first_prompt, "agent_system_prompts"))
+            next_inventory = json.loads(prompt_section(next_prompt, "agent_system_prompts"))
+            previous = {name: first_inventory[name] for name in replacements}
             require(
-                originals == {update["name"]: first_inventory[update["name"]] for update in updates}
-                and all(next_inventory[update["name"]] == update["content"] for update in updates)
-                and "<original_agent_system_prompts>" not in request_prompt(reviews[0]),
-                "prompt assist lost the session-start inventory or accumulated incorrect replacement references",
+                json.loads(prompt_section(first_prompt, "previous_agent_system_prompts")) == {}
+                and json.loads(prompt_section(first_prompt, "original_agent_system_prompts")) == first_inventory
+                and json.loads(prompt_section(next_prompt, "previous_agent_system_prompts")) == previous
+                and json.loads(prompt_section(next_prompt, "original_agent_system_prompts")) == first_inventory
+                and next_inventory == {**first_inventory, **replacements}
+                and {
+                    "worker_system_prompt", "task_priority_system_prompt",
+                    "context_assist_system_prompt", "context_summary_system_prompt",
+                    "prompt_assist_system_prompt", "tool_call_patch",
+                }.issubset(first_inventory),
+                "prompt assist lost full original inventories, previous replacements, or unchanged prompt components",
             )
             for index, request in enumerate(requests):
                 require_task_placement(request, task)
@@ -6453,18 +7156,36 @@ class OfflineTests:
                     all((update["content"] in instructions) == (index >= 3) for update in updates)
                     and request["tools"] == requests[0]["tools"]
                     and "<meta_task_list>\n" in instructions,
-                    "prompt replacements were applied at the wrong turn or changed persistent task and tool schemas",
+                    "prompt replacements were applied or restored at the wrong turn or changed task and tool schemas",
+                )
+            for selected_session, turn in ((session_name, 5), (resumed_name, 6)):
+                runtime = json.loads(self.state_artifacts(
+                    selected_session, turn, "response_agent_runtime_state",
+                )["response_agent_runtime_state"])
+                require(
+                    runtime["system_prompt_overrides"] == replacements
+                    and runtime["previous_system_prompts"] == previous
+                    and runtime["original_system_prompts"] == first_inventory
+                    and runtime["pending_assists"] == {}
+                    and all(
+                        content == first_inventory[name]
+                        for name, content in runtime["base_system_prompts"].items()
+                    ),
+                    "runtime persistence or resume lost in-memory replacements and their previous and original inventories",
                 )
             require(
                 all(path.read_bytes() == content for path, content in before.items())
+                and self.state_snapshot(session_name) == source_state
                 and "Updated prompts: agent_system_prompt, tool_call_progress" in result.stdout
                 and "Updated prompts: none" in result.stdout,
-                "prompt assistance changed stored prompts or configuration, or omitted its update report",
+                "prompt assistance or resume changed stored prompts, configuration, or source state, or omitted its report",
             )
-            session_name = session_name_from_result(result, noninteractive=False)
             require(self.state_turn_numbers(session_name) == list(range(6)), "prompt reviews became controller turns")
             require_cumulative_stats(
                 result, {"input_tokens": 64, "output_tokens": 32, "total_tokens": 96},
+            )
+            require_cumulative_stats(
+                resumed, {"input_tokens": 72, "output_tokens": 36, "total_tokens": 108},
             )
         finally:
             self.run("--remove-profile", profile)
@@ -6549,7 +7270,17 @@ def request_prompt(request: dict[str, Any]) -> str:
     ]
     require(len(messages) == 1, "request did not contain exactly one user message")
     content = messages[0].get("content")
-    require(isinstance(content, str), "request user content was not text")
+    if isinstance(content, list):
+        text_parts = [
+            part for part in content
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        ]
+        require(
+            len(text_parts) == 1 and isinstance(text_parts[0].get("text"), str),
+            "multimodal request did not contain exactly one user text part",
+        )
+        return str(text_parts[0]["text"])
+    require(isinstance(content, str), "request user content was not text or a content array")
     return str(content)
 
 
@@ -6570,6 +7301,20 @@ def request_file_contexts(request: dict[str, Any]) -> dict[str, str]:
     return contexts
 
 
+def request_history_turns(request: dict[str, Any]) -> dict[int, str]:
+    history = prompt_section(request_prompt(request), "agent_history")
+    sections = re.findall(r"(?ms)^<agent_turn(?:\s[^>]*)?>\n.*?^</agent_turn>", history)
+    turns: dict[int, str] = {}
+    for section in sections:
+        identifier = prompt_attributes(section, "agent_turn").get("ID", "")
+        require(
+            identifier.isascii() and identifier.isdigit() and int(identifier) not in turns,
+            "agent history omitted a non-negative entry ID or duplicated it",
+        )
+        turns[int(identifier)] = section
+    return turns
+
+
 def require_task_placement(
     request: dict[str, Any],
     task: str,
@@ -6582,6 +7327,26 @@ def require_task_placement(
         and "<user_supplied_instructions>\n" not in prompt
         and prompt_attributes(instructions, "user_supplied_instructions") == {},
         "task instructions were misplaced, duplicated, or given context metadata",
+    )
+
+
+def require_summary_request(request: dict[str, Any]) -> None:
+    tools = request.get("tools", [])
+    instructions = request_instructions(request)
+    require(
+        len(tools) == 1 and tools[0].get("name") == "context_summary"
+        and tools[0].get("strict") is True
+        and set(tools[0]["parameters"]["properties"]) == {"summary"}
+        and tools[0]["parameters"]["required"] == ["summary"]
+        and request.get("tool_choice") == "required"
+        and request.get("parallel_tool_calls") is False
+        and request["text"]["format"] == {"type": "text"}
+        and "Ignore the controller's `<system>` section"
+        in prompt_section(instructions, "core_system_instructions")
+        and "<user_supplied_instructions>\n" not in instructions
+        and "<tool_call_instructions>\n" not in instructions
+        and "<agent_instructions" not in request_prompt(request),
+        "context summary request omitted its single native tool or reused serialized controller instructions",
     )
 
 
@@ -6747,6 +7512,8 @@ def main() -> int:
         ("creates, assigns, and removes prompt-library entries", "test_prompt_library"),
         ("expands prompt-library references", "test_prompt_expansion"),
         ("loads prompt and context files", "test_file_list_and_prompt_file_inputs"),
+        ("combines repeated prompts and rereads CLI and configured task files before each turn", "test_repeated_prompts_and_live_task_files"),
+        ("preserves original image bytes across task, patch, tree, and resumed requests", "test_image_inputs"),
         ("lists state artifact types offline", "test_state_artifact_listing"),
         ("applies patches to multiple files and creates files", "test_multifile_patch_and_new_file"),
         ("inserts patches into empty files", "test_empty_file_patch_insertion"),
@@ -6789,11 +7556,12 @@ def main() -> int:
         ("revises the last shell command turn after session completion", "test_shell_session_revision"),
         ("restricts shell address families and overrides inherited pagers", "test_shell_network_address_families"),
         ("isolates shell stdin and preserves non-UTF-8 output and exit statuses", "test_shell_standard_input_and_binary_output"),
-        ("applies native agent patches and refreshes companion file context", "test_agent_patch_file_companion"),
+        ("refreshes existing agent patch context and loads newly created files without redundant calls", "test_agent_patch_context"),
+        ("merges touching ranges, removes overlapping patch calls, accepts no-op patches, and ends batches last", "test_agent_patch_batches"),
         ("bounds loaded file content and expires missing files independently", "test_agent_file_context_budget_and_missing_expiry"),
         ("bounds automatic file refreshes and restores normal retention after file errors", "test_agent_file_context_error_lifetimes"),
         ("updates persistent agent tasks atomically at capacity", "test_agent_task_list_atomic_capacity"),
-        ("retries invalid agent requests and rejects invalid call batches", "test_agent_controller_retries"),
+        ("retries invalid agent responses and rejects leading retention and unknown calls", "test_agent_controller_retries"),
         ("manages agent profiles and replays reasoning across worker delegation", "test_agent_profile_worker"),
         ("delegates named and default built-in worker profiles without executing their proposals", "test_agent_builtin_profile_workers_are_proposals"),
         ("reviews plans and preserves accepted, rejected, and saved state", "test_plan_review_and_saved_state"),
@@ -6801,6 +7569,8 @@ def main() -> int:
         ("resumes indexed and legacy shell output without executing commands again", "test_shell_reuse_keeps_existing_output"),
         ("pins agent file context and extends unpinned context expiry", "test_agent_context_control_and_expiry"),
         ("restores selected agent history, tasks, file context, and remaining expiry", "test_agent_reuse_restores_selected_history"),
+        ("resumes pending agent tool-call suffixes without requesting or executing completed work again", "test_agent_resumes_pending_tool_calls"),
+        ("restores failed agent request checkpoints without double-aging retained context", "test_agent_resumes_failed_runtime_request"),
         ("redacts API keys in configuration output and session logs", "test_api_key_redaction"),
         ("writes text and JSON output files without duplicating stdout", "test_text_and_json_output_files"),
         ("estimates tokens and rejects oversized requests before API calls", "test_input_token_estimation_and_limit"),
@@ -6814,10 +7584,11 @@ def main() -> int:
         ("persists encrypted reasoning and replays it when resuming a task", "test_session_reasoning_replay"),
         ("forks resumed session chains and respects inherited turn cutoffs", "test_resume_session_chain_and_turn_cutoff"),
         ("distinguishes automatic, reviewed, rejected, and saved agent execution", "test_agent_review_modes"),
-        ("reviews context independently and requests summaries without compaction", "test_agent_context_assist_summary_request"),
-        ("automatically compacts pinned context and resumes summary-only turns", "test_agent_automatic_context_summary_and_resume"),
+        ("removes stale reviewed context by stable IDs while retaining changed files and newer outcomes", "test_agent_context_assist_removals"),
+        ("clears stale summary guidance without compacting live context or generating a replacement", "test_agent_context_assist_clears_stale_summary"),
+        ("uses native summary calls, compacts pinned context, and resumes without immediate redundant reviews", "test_agent_automatic_context_summary_and_resume"),
         ("refreshes expired summaries without compacting or double-aging live context", "test_agent_summary_expiry_refreshes_live_context"),
-        ("updates in-memory prompts using independent profile-based reviews", "test_agent_prompt_assist"),
+        ("tracks current, previous, and original prompts across independent reviews and resumed sessions", "test_agent_prompt_assist"),
         ("retains deprecated option compatibility with explicit warnings", "test_deprecated_option_aliases"),
         ("builds default containment commands and preserves argument boundaries", "test_contain_default_command_and_passthrough"),
         ("selects containment state, visibility, network, runtime, and shell modes", "test_contain_modes_and_shell_selection"),

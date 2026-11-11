@@ -27,6 +27,7 @@ import shlex
 import subprocess
 import shutil
 import tempfile
+from copy import deepcopy
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -97,11 +98,19 @@ def format_response_output(
 def emit_response_output(
     output_text: str,
     *,
+    reasoning: str = "",
+    print_reasoning: bool = False,
+    skip_empty: bool = False,
     suppress_response_output: bool = False,
     append_output: bool = False,
     stream_output_emitted: bool = False,
     output_file_path: Path | None = None,
 ) -> int:
+    output_text = format_response_output(
+        output_text, reasoning, print_reasoning
+    )
+    if skip_empty and not output_text:
+        return 0
     if OUTPUT_FILE is not None:
         if not stream_output_emitted:
             try:
@@ -1252,6 +1261,16 @@ def read_optional_state_artifact(path: Path) -> str | None:
     return read_state_artifact(path)
 
 
+def read_first_present_state_artifact(
+    paths: tuple[Path, ...],
+) -> tuple[Path, str] | None:
+    for path in paths:
+        text = read_optional_state_artifact(path)
+        if text is not None:
+            return path, text
+    return None
+
+
 def state_session_chain(
     state_session_dir: Path,
 ) -> list[tuple[Path, int | None]]:
@@ -1534,16 +1553,13 @@ def load_reused_session_task(
     state_session_dir: Path,
     turn: int | None = None,
 ) -> str:
-    turn_dir = last_completed_state_turn(state_session_dir, turn)
-    request_task_path = turn_dir / "request_task"
-    if not request_task_path.is_file():
-        raise ValueError(f"completed turn has no request_task: {turn_dir}")
-    try:
-        return request_task_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        raise ValueError(
-            f"cannot read reused session task from {turn_dir} ({exc})"
-        ) from exc
+    _, artifacts = _load_reused_session_turn_artifacts(
+        state_session_dir,
+        turn,
+        ("request_task",),
+        "completed turn has no request_task",
+    )
+    return artifacts["request_task"]
 
 
 def _load_reused_session_turn_artifacts(
@@ -2473,25 +2489,20 @@ def load_agent_profiles(values: list[str] | None) -> list[AgentProfile]:
     ]
 
 
-def resolved_agent_profile_content(profile: AgentProfile) -> str:
-    profile_type = normalize_agent_profile_type(profile.profile_type)
-    schema = AGENT_PROFILE_BUILTIN_SCHEMAS.get(profile_type)
-    if schema is not None:
-        return json.dumps(schema, indent=2, ensure_ascii=False)
-    return profile.content
-
-
 def agent_profile_response_schema(
     profile: AgentProfile,
  ) -> dict[str, Any]:
-    try:
-        response_schema = json.loads(
-            resolved_agent_profile_content(profile)
-        )
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"agent profile '{profile.name}' response schema must be valid JSON"
-        ) from exc
+    profile_type = normalize_agent_profile_type(profile.profile_type)
+    builtin_schema = AGENT_PROFILE_BUILTIN_SCHEMAS.get(profile_type)
+    if builtin_schema is not None:
+        response_schema = deepcopy(builtin_schema)
+    else:
+        try:
+            response_schema = json.loads(profile.content)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"agent profile '{profile.name}' response schema must be valid JSON"
+            ) from exc
     if not isinstance(response_schema, dict):
         raise ValueError(
             f"agent profile '{profile.name}' response schema must be a JSON object"
@@ -2833,36 +2844,55 @@ def parse_agent_backup(value: Any) -> list[str] | None:
     return parts
 
 
-def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, Any]:
-    if "=" not in value:
-        raise ValueError("expected NAME=VALUE")
+@dataclass(frozen=True)
+class ConfigAssignment:
+    name: str
+    value: Any = None
+    reset: bool = False
 
-    name, raw_value = value.split("=", 1)
+
+def canonical_config_assignment_name(name: str) -> str:
     name = name.strip()
     if not name:
         raise ValueError("configuration name cannot be empty")
-    raw_value = raw_value.strip()
-
-    if name in DEPRECATED_CONFIG_KEYS and name not in config:
-        raise ValueError(
-            f"{name} is deprecated and is not present in the config"
-        )
-
     canonical_name = DEPRECATED_CONFIG_KEYS.get(name) or name
     if canonical_name == INHERIT_PROFILE_CONFIG_KEY:
         raise ValueError(
             f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
         )
+    return canonical_name
+
+
+def parse_config_assignment(
+    value: str,
+    config: dict[str, Any],
+    *,
+    inherited_defaults: bool = False,
+) -> ConfigAssignment:
+    if "=" not in value:
+        raise ValueError("expected NAME=VALUE")
+
+    name, raw_value = value.split("=", 1)
+    name = name.strip()
+    canonical_name = canonical_config_assignment_name(name)
+    raw_value = raw_value.strip()
+    if name in DEPRECATED_CONFIG_KEYS and name not in config:
+        raise ValueError(
+            f"{name} is deprecated and is not present in the config"
+        )
+
     if raw_value == "DEFAULT":
+        if inherited_defaults:
+            if name not in config and canonical_name not in config:
+                raise ValueError(f"{name} has no built-in default value")
+            return ConfigAssignment(canonical_name, reset=True)
         parsed_value = get_default_config_value(canonical_name)
     elif canonical_name == "patch_branch":
         parsed_value = parse_bool_or_string(raw_value, canonical_name)
     elif canonical_name == "agent_backup_interval":
         parsed_value = parse_config_value(canonical_name, raw_value)
-    elif canonical_name == "agent_context_assist":
-        parsed_value = normalize_agent_context_assist(raw_value)
-    elif canonical_name == "agent_prompt_assist":
-        parsed_value = normalize_agent_prompt_assist(raw_value)
+    elif canonical_name in ("agent_context_assist", "agent_prompt_assist"):
+        parsed_value = normalize_agent_assist(raw_value, canonical_name)
     elif canonical_name == "agent_context_expires":
         parsed_value = normalize_agent_context_expires(raw_value)
     elif canonical_name == "retry":
@@ -2891,7 +2921,24 @@ def parse_config_assignment(value: str, config: dict[str, Any]) -> tuple[str, An
         else:
             parsed_value = raw_value
     parse_config_value(canonical_name, parsed_value)
-    return name, parsed_value
+    return ConfigAssignment(canonical_name, parsed_value)
+
+
+def update_config_document(
+    document: dict[str, Any],
+    assignments: list[ConfigAssignment],
+) -> dict[str, Any]:
+    updated_document = document.copy()
+    for assignment in assignments:
+        name = canonical_config_assignment_name(assignment.name)
+        if assignment.reset:
+            updated_document.pop(name, None)
+        else:
+            updated_document[name] = assignment.value
+        for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
+            if replacement == name:
+                updated_document.pop(deprecated, None)
+    return updated_document
 
 
 def format_config_value(value: Any) -> str:
@@ -4002,9 +4049,10 @@ class ConfigurationScreen(NcursesForm):
         name = field.name
         if value.strip() == "DEFAULT":
             return self.defaults[name]
-        _, parsed_value = parse_config_assignment(
+        assignment = parse_config_assignment(
             f"{name}={value}", self.values
         )
+        parsed_value = assignment.value
         parsed = parse_config_value(name, parsed_value)
         for existing in (self.applied[name], self.defaults[name]):
             if parsed == parse_config_value(name, existing):
@@ -5284,6 +5332,57 @@ def apply_file_patch_manifest(original_text: str, file_manifest: dict[str, Any])
         result += eol
     return result
 
+def normalize_patch_manifest(
+    manifest: Any,
+    *,
+    require_files: bool = False,
+    require_commit_message: bool = False,
+    require_patches: bool = False,
+    strict_documents: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("patch manifest must contain a JSON object")
+    files = manifest.get("files", [])
+    if not isinstance(files, list) or require_files and not files:
+        requirement = "a non-empty files array" if require_files else "a files array"
+        raise ValueError(f"patch manifest must contain {requirement}")
+    if require_commit_message:
+        commit_message = manifest.get("commit_message")
+        if not isinstance(commit_message, str) or not commit_message.strip():
+            raise ValueError("patch manifest commit_message cannot be empty")
+    for index, file_entry in enumerate(files, start=1):
+        label = f"patch files entry {index}"
+        if not isinstance(file_entry, dict):
+            raise ValueError(f"{label} must be an object")
+        if strict_documents and set(file_entry) != {"document", "patches"}:
+            raise ValueError(f"{label} requires document and patches")
+        document = file_entry.get("document")
+        if not isinstance(document, dict) or (
+            strict_documents
+            and set(document) != {"path", "encoding", "line_ending"}
+        ):
+            raise ValueError(f"{label} requires document metadata")
+        path = document.get("path")
+        if not isinstance(path, str) or not path.strip() or "\x00" in path:
+            raise ValueError(f"{label} document requires a path")
+        patches = file_entry.get("patches")
+        if patches is None and not require_patches:
+            continue
+        if not isinstance(patches, list) or require_patches and not patches:
+            requirement = (
+                "a non-empty patches array" if require_patches else "a patches array"
+            )
+            raise ValueError(f"{label} requires {requirement}")
+        if not patches:
+            continue
+        if document.get("encoding") != "utf-8":
+            raise ValueError("patch document encoding must be utf-8")
+        if document.get("line_ending") not in ("lf", "crlf"):
+            raise ValueError("patch document line_ending must be lf or crlf")
+        file_entry["patches"] = normalize_patch_ranges(patches)
+    return manifest
+
+
 def patch_manifest_document_path(file_entry: dict[str, Any]) -> Path:
     document = file_entry["document"]
     path = Path(str(document["path"])).expanduser()
@@ -5328,6 +5427,7 @@ def build_patch_changes(
  ) -> tuple[dict[str, str], str, list[tuple[str, str]]]:
     manifests = manifest if isinstance(manifest, list) else [manifest]
     for manifest in manifests:
+        normalize_patch_manifest(manifest)
         original_texts = load_patch_original_texts(manifest, original_texts)
     updated_texts = original_texts
     for manifest in manifests:
@@ -5358,16 +5458,11 @@ def build_patch_changes(
 def load_patch_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"patch JSON file does not exist: {path}")
-    raw = read_json_document(path, "patch JSON file")
-    if not isinstance(raw, dict):
-        raise ValueError("patch manifest must contain a JSON object")
-    files = raw.get("files")
-    if not isinstance(files, list) or not files:
-        raise ValueError("patch manifest must contain a non-empty files array")
-    commit_message = raw.get("commit_message")
-    if not isinstance(commit_message, str) or not commit_message.strip():
-        raise ValueError("patch manifest commit_message cannot be empty")
-    return raw
+    return normalize_patch_manifest(
+        read_json_document(path, "patch JSON file"),
+        require_files=True,
+        require_commit_message=True,
+    )
 
 
 def resolve_patch_file_argument(
@@ -6339,10 +6434,8 @@ def parse_config_value(name: str, value: Any) -> Any:
                 raise ValueError(
                     "must be a finite non-negative number of minutes"
                 )
-        elif name == "agent_context_assist":
-            value = parse_agent_context_assist(value)
-        elif name == "agent_prompt_assist":
-            value = parse_agent_prompt_assist(value)
+        elif name in ("agent_context_assist", "agent_prompt_assist"):
+            value = parse_agent_assist(value, name)
         elif name == "agent_context_expires":
             value = parse_agent_context_expires(value)
         elif name in ("temperature", "top_p"):
@@ -6572,13 +6665,10 @@ def read_prompt_files(
     paths: Path | list[Path],
 ) -> str:
     prompt_paths = paths if isinstance(paths, list) else [paths]
-    prompt_parts = [
-        read_file(prompt_path, raise_errors=True).strip()
+    return join_prompt_sections(*(
+        read_file(prompt_path, raise_errors=True)
         for prompt_path in prompt_paths
-    ]
-    return "\n\n".join(
-        part for part in prompt_parts if part
-    ).strip()
+    ))
 
 
 PROMPT_EXPANSION_PATTERN = re.compile(r"\^\^([^^\r\n\s]+?)\^\^")
@@ -6639,16 +6729,13 @@ def resolve_configured_prompt(value: Any, default: str) -> str:
 
     file_definitions, prompt_text = parsed
     try:
-        prompt_parts = [
-            read_file(
-                configured_prompt_file_path(prompt_file),
-                raise_errors=True,
-            ).strip()
+        prompt_paths = [
+            configured_prompt_file_path(prompt_file)
             for prompt_file in file_definitions
         ]
-        if prompt_text:
-            prompt_parts.append(prompt_text)
-        return join_prompt_sections(*prompt_parts)
+        return join_prompt_sections(
+            read_prompt_files(prompt_paths), prompt_text
+        )
     except Exception as exc:
         raise ValueError(f"cannot read configured system prompt file {value} ({exc})") from exc
 
@@ -6665,7 +6752,7 @@ def resolve_prompt_setting(
     if explicit_value is not None:
         prompt = str(explicit_value).strip()
     elif prompt_file is not None:
-        prompt = read_file(prompt_file, raise_errors=True).strip()
+        prompt = read_prompt_files(prompt_file)
     else:
         prompt = resolve_configured_prompt(
             config.get(config_key, default),
@@ -7548,8 +7635,20 @@ class AgentToolExecution:
     readfile_contexts: tuple[tuple[str, str], ...] | None = None
     meta_task_list: tuple[dict[str, Any], ...] | None = None
     reasoning_items: tuple[dict[str, Any], ...] = ()
- 
- 
+
+
+@dataclass
+class AgentResultState:
+    turns: list[AgentTurn]
+    active_task: str
+    active_context: str
+    meta_task_list: list[dict[str, Any]]
+    context_summary: AgentContextSummary | None = None
+    file_contexts: list[tuple[str, str]] | None = None
+    file_expires_in_turns: dict[str, int] = field(default_factory=dict)
+    pinned_paths: set[str] = field(default_factory=set)
+    pinned_turn_numbers: set[int] = field(default_factory=set)
+
 @dataclass(frozen=True)
 class ModelSettings:
     model: str
@@ -7791,13 +7890,13 @@ def parse_state_agent_profile(value: Any) -> AgentProfile:
 
 
 def load_state_agent_runtime_state(turn_dir: Path) -> dict[str, Any] | None:
-    for artifact_prefix in ("response", "request"):
-        artifact_path = turn_dir / f"{artifact_prefix}_agent_runtime_state"
-        artifact_text = read_optional_state_artifact(artifact_path)
-        if artifact_text is not None:
-            break
-    else:
+    artifact = read_first_present_state_artifact(tuple(
+        turn_dir / f"{prefix}_agent_runtime_state"
+        for prefix in ("response", "request")
+    ))
+    if artifact is None:
         return None
+    artifact_path, artifact_text = artifact
 
     def is_integer(value: Any) -> bool:
         return (
@@ -8104,18 +8203,6 @@ def parse_agent_assist(
     return interval, profile, reasoning, model
 
 
-def parse_agent_context_assist(
-    value: Any,
-) -> tuple[int | None, str | None, str | None, str | None]:
-    return parse_agent_assist(value, "agent_context_assist")
-
-
-def parse_agent_prompt_assist(
-    value: Any,
-) -> tuple[int | None, str | None, str | None, str | None]:
-    return parse_agent_assist(value, "agent_prompt_assist")
-
-
 def normalize_agent_assist(value: Any, name: str) -> int | str:
     interval, profile, reasoning, model = parse_agent_assist(value, name)
     if profile is None:
@@ -8126,14 +8213,6 @@ def normalize_agent_assist(value: Any, name: str) -> int | str:
     if model is not None:
         parts.append(model)
     return shlex.join(parts)
-
-
-def normalize_agent_context_assist(value: Any) -> int | str:
-    return normalize_agent_assist(value, "agent_context_assist")
-
-
-def normalize_agent_prompt_assist(value: Any) -> int | str:
-    return normalize_agent_assist(value, "agent_prompt_assist")
 
 
 def parse_agent_context_expires(value: Any) -> tuple[int, int, int]:
@@ -8422,28 +8501,21 @@ def _parse_agent_tool_arguments_value(
         expires_in_turns = parse_agent_expires_in_turns(
             value["expires_in_turns"], expires_schema
         )
-        if not isinstance(value["files"], list) or not value["files"]:
-            raise ValueError(
-                "agent patch arguments require a non-empty files array"
-            )
-        commit_message = value["commit_message"]
-        if (
-            not isinstance(commit_message, str)
-            or not commit_message.strip()
-        ):
-            raise ValueError(
-                "agent patch arguments require a non-empty commit_message"
-            )
-        tool_call = AgentToolCall(
+        manifest = normalize_patch_manifest(
+            {
+                "files": value["files"],
+                "commit_message": value["commit_message"],
+            },
+            require_files=True,
+            require_commit_message=True,
+            require_patches=True,
+            strict_documents=True,
+        )
+        return AgentToolCall(
             tool=tool,
             expires_in_turns=expires_in_turns,
-            arguments={
-                "files": value["files"],
-                "commit_message": commit_message,
-            },
+            arguments=manifest,
         )
-        agent_patch_document_paths(tool_call)
-        return tool_call
  
     if tool == AGENT_SHELL_TOOL:
         expires_in_turns = parse_agent_expires_in_turns(
@@ -8598,48 +8670,19 @@ def normalize_agent_controller_tool_calls(
 
 
 def agent_patch_document_paths(tool_call: AgentToolCall) -> list[str]:
-    arguments = tool_call.arguments
-    if not isinstance(arguments, dict):
+    if not isinstance(tool_call.arguments, dict):
         raise ValueError("agent patch tool received no manifest")
-    files = arguments.get("files")
-    if not isinstance(files, list) or not files:
-        raise ValueError(
-            "agent patch arguments require a non-empty files array"
-        )
-    paths: list[str] = []
-    for index, file_entry in enumerate(files, start=1):
-        if not isinstance(file_entry, dict):
-            raise ValueError(
-                f"agent patch files entry {index} must be an object"
-            )
-        if set(file_entry) != {"document", "patches"}:
-            raise ValueError(
-                f"agent patch files entry {index} requires document and patches"
-            )
-        document = file_entry["document"]
-        if not isinstance(document, dict) or set(document) != {
-            "path", "encoding", "line_ending"
-        }:
-            raise ValueError(
-                f"agent patch files entry {index} requires document metadata"
-            )
-        path = document["path"]
-        if not isinstance(path, str) or not path.strip() or "\x00" in path:
-            raise ValueError(
-                f"agent patch files entry {index} document requires a path"
-            )
-        if document["encoding"] != "utf-8":
-            raise ValueError("agent patch document encoding must be utf-8")
-        if document["line_ending"] not in ("lf", "crlf"):
-            raise ValueError("agent patch document line_ending must be lf or crlf")
-        patches = file_entry["patches"]
-        if not isinstance(patches, list) or not patches:
-            raise ValueError(
-                f"agent patch files entry {index} requires a non-empty patches array"
-            )
-        file_entry["patches"] = normalize_patch_ranges(patches)
-        paths.append(path.strip())
-    return paths
+    manifest = normalize_patch_manifest(
+        tool_call.arguments,
+        require_files=True,
+        require_commit_message=True,
+        require_patches=True,
+        strict_documents=True,
+    )
+    return [
+        file_entry["document"]["path"].strip()
+        for file_entry in manifest["files"]
+    ]
 
 
 def normalize_agent_patch_tool_calls(
@@ -8652,8 +8695,14 @@ def normalize_agent_patch_tool_calls(
             normalized_tool_calls.append(tool_call)
             continue
         try:
-            agent_patch_document_paths(tool_call)
-            documents = patch_manifest_documents(tool_call.arguments or {})
+            manifest = normalize_patch_manifest(
+                tool_call.arguments,
+                require_files=True,
+                require_commit_message=True,
+                require_patches=True,
+                strict_documents=True,
+            )
+            documents = patch_manifest_documents(manifest)
         except ValueError as exc:
             raise AgentControllerResponseError(
                 f"agent tool call {index}: {exc}"
@@ -9629,6 +9678,20 @@ def remove_duplicate_agent_history_context_files(
             readfile_contexts=remaining_context_sections,
         )
 
+def remove_agent_initial_file_contexts(
+    file_contexts: list[tuple[str, str]],
+    file_expires_in_turns: dict[str, int],
+    pinned_paths: set[str],
+    paths: set[str],
+) -> None:
+    file_contexts[:] = [
+        context for context in file_contexts
+        if context[0] not in paths
+    ]
+    for path in paths:
+        file_expires_in_turns.pop(path, None)
+    pinned_paths.difference_update(paths)
+
 
 AGENT_HISTORY_PURGE_IN_TURNS = 1
 AGENT_HISTORY_EXPIRATION_REMOVAL_REASON = (
@@ -10058,9 +10121,29 @@ class ReusedAgentHistory:
 def reused_agent_runtime_history(
     history: ReusedAgentHistory,
     runtime_state: dict[str, Any] | None,
+    *,
+    turn_dir: Path | None = None,
+    default_expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT,
 ) -> ReusedAgentHistory:
     if runtime_state is None:
-        return history
+        if turn_dir is None:
+            return history
+        summary, require_compaction, skip_next_interval = (
+            load_state_agent_context_assist(turn_dir)
+        )
+        return replace(
+            history,
+            context_summary=(
+                history.context_summary
+                if history.context_summary is not None
+                else load_state_agent_context_summary(
+                    turn_dir, default_expires_in_turns
+                )
+            ),
+            context_assist_summary=summary,
+            context_assist_require_compaction=require_compaction,
+            context_assist_skip_next_interval=skip_next_interval,
+        )
     summary = runtime_state["context_summary"]
     return replace(
         history,
@@ -10196,17 +10279,13 @@ def load_state_agent_context_summary(
     turn_dir: Path,
     default_expires_in_turns: int = AGENT_EXPIRES_IN_TURNS_DEFAULT,
 ) -> AgentContextSummary | None:
-    artifact_text: str | None = None
-    for artifact_name in (
-        "response_agent_context_summary",
-        "request_agent_context_summary",
-    ):
-        artifact_path = turn_dir / artifact_name
-        artifact_text = read_optional_state_artifact(artifact_path)
-        if artifact_text is not None:
-            break
-    if artifact_text is None:
+    artifact = read_first_present_state_artifact(tuple(
+        turn_dir / f"{prefix}_agent_context_summary"
+        for prefix in ("response", "request")
+    ))
+    if artifact is None:
         return None
+    artifact_path, artifact_text = artifact
     try:
         value = json.loads(artifact_text)
     except json.JSONDecodeError as exc:
@@ -10292,40 +10371,41 @@ def parse_state_agent_context_summary(
 
 
 def load_state_agent_context_assist(turn_dir: Path) -> tuple[str, bool, bool]:
-    for artifact_prefix in ("response", "request"):
-        summary = read_optional_state_artifact(
-            turn_dir / f"{artifact_prefix}_agent_context_assist_summary"
+    artifact = read_first_present_state_artifact(tuple(
+        turn_dir / f"{prefix}_agent_context_assist_summary"
+        for prefix in ("response", "request")
+    ))
+    if artifact is None:
+        return "", False, False
+    summary_path, summary = artifact
+    artifact_prefix = summary_path.name.split("_", 1)[0]
+    flags: dict[str, bool] = {}
+    for name, label in (
+        ("require_compaction", "compaction"),
+        ("skip_next_interval", "skip interval"),
+    ):
+        flag_path = turn_dir / (
+            f"{artifact_prefix}_agent_context_assist_{name}"
         )
-        if summary is None:
-            continue
-        flags: dict[str, bool] = {}
-        for name, label in (
-            ("require_compaction", "compaction"),
-            ("skip_next_interval", "skip interval"),
-        ):
-            flag_path = turn_dir / (
-                f"{artifact_prefix}_agent_context_assist_{name}"
+        flag_text = read_optional_state_artifact(flag_path)
+        value = False
+        if flag_text is not None:
+            invalid_flag = (
+                f"invalid saved agent context assist {label} flag: "
+                f"{flag_path}"
             )
-            flag_text = read_optional_state_artifact(flag_path)
-            value = False
-            if flag_text is not None:
-                invalid_flag = (
-                    f"invalid saved agent context assist {label} flag: "
-                    f"{flag_path}"
-                )
-                try:
-                    value = json.loads(flag_text)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(invalid_flag) from exc
-                if not isinstance(value, bool):
-                    raise ValueError(invalid_flag)
-            flags[name] = value
-        return (
-            summary.strip(),
-            flags["require_compaction"],
-            flags["skip_next_interval"],
-        )
-    return "", False, False
+            try:
+                value = json.loads(flag_text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(invalid_flag) from exc
+            if not isinstance(value, bool):
+                raise ValueError(invalid_flag)
+        flags[name] = value
+    return (
+        summary.strip(),
+        flags["require_compaction"],
+        flags["skip_next_interval"],
+    )
 
 
 def parse_agent_readfile_contexts(
@@ -10567,6 +10647,110 @@ def parse_reused_agent_meta_task_list(
         normalize_agent_meta_task_list(value)
     )
 
+def reused_agent_tool_execution(
+    turn_dir: Path,
+    tool_call: AgentToolCall,
+    output: str,
+    task_list: list[dict[str, Any]],
+    meta_task_list_snapshot: tuple[dict[str, Any], ...] | None = None,
+) -> AgentToolExecution:
+    contexts = None
+    snapshot = None
+    if output and output != AGENT_TOOL_NOT_EXECUTED_OUTPUT:
+        if tool_call.tool == AGENT_LOAD_FILE_FROM_STORAGE_TOOL:
+            if not output.startswith("ERROR:"):
+                contexts = load_reused_agent_readfile_contexts(turn_dir, output)
+        elif tool_call.tool == AGENT_PATCH_TOOL:
+            contexts = load_state_agent_file_contexts(turn_dir)
+        elif (
+            tool_call.tool == AGENT_META_TASK_LIST_TOOL
+            and not output.startswith("ERROR:")
+            and isinstance(tool_call.arguments, dict)
+        ):
+            if meta_task_list_snapshot is not None:
+                snapshot = meta_task_list_snapshot
+            else:
+                try:
+                    snapshot = tuple(parse_reused_agent_meta_task_list(
+                        output, task_list, tool_call.arguments.get("operations")
+                    ))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid saved meta_task_list output: {turn_dir} ({exc})"
+                    ) from exc
+    return AgentToolExecution(
+        output, readfile_contexts=contexts, meta_task_list=snapshot
+    )
+
+
+def apply_agent_tool_result(
+    state: AgentResultState,
+    tool_call: AgentToolCall,
+    execution: AgentToolExecution,
+    *,
+    state_turn: int,
+    tool_call_index: int,
+    turn_unix_time: int | None = None,
+    preceding_patch_tool_call: AgentToolCall | None = None,
+) -> AgentToolExecution:
+    successful = (
+        execution.output != AGENT_TOOL_NOT_EXECUTED_OUTPUT
+        and not execution.output.startswith("ERROR:")
+    )
+    if (
+        successful
+        and tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL
+        and state.file_contexts is not None
+    ):
+        try:
+            apply_agent_context_control(
+                tool_call, state.file_contexts, state.turns,
+                state.file_expires_in_turns, state.pinned_paths,
+                state.pinned_turn_numbers,
+            )
+        except ValueError as exc:
+            execution = replace(
+                execution, output=f"ERROR: Failed to pin context: {exc}"
+            )
+            successful = False
+    if execution.readfile_contexts is not None and state.file_contexts is not None:
+        remove_agent_initial_file_contexts(
+            state.file_contexts, state.file_expires_in_turns,
+            state.pinned_paths,
+            {path for path, _ in execution.readfile_contexts},
+        )
+    record_agent_tool_history(
+        state.turns,
+        state.active_task,
+        "\n\n".join(
+            value for value in (state.active_context, tool_call.context) if value
+        ),
+        tool_call,
+        execution.output,
+        turn_unix_time=turn_unix_time,
+        readfile_contexts=execution.readfile_contexts,
+        preceding_patch_tool_call=preceding_patch_tool_call,
+        state_turn=state_turn,
+        tool_call_index=tool_call_index,
+    )
+    if preceding_patch_tool_call is not None:
+        return execution
+    if successful and tool_call.tool == AGENT_META_TASK_LIST_TOOL:
+        if execution.meta_task_list is not None:
+            state.meta_task_list = limit_agent_meta_task_list(
+                normalize_agent_meta_task_list(list(execution.meta_task_list))
+            )
+    if (
+        successful and execution.output
+        and tool_call.tool == AGENT_AGENT_TOOL
+        and not tool_call.profile_name
+    ):
+        state.active_task = tool_call.task
+        state.active_context = tool_call.context
+        if state.context_summary is not None:
+            state.context_summary.active_context_checksum = ""
+    return execution
+
 
 def build_agent_turn_metadata(
     turns: list[AgentTurn],
@@ -10642,17 +10826,13 @@ def load_reused_agent_turn_metadata(
         else None
     )
     if metadata is None:
-        artifact_text: str | None = None
-        for artifact_name in (
-            "response_agent_turn_metadata",
-            "request_agent_turn_metadata",
-        ):
-            artifact_path = selected_turn_dir / artifact_name
-            artifact_text = read_optional_state_artifact(artifact_path)
-            if artifact_text is not None:
-                break
-        if artifact_text is None:
+        artifact = read_first_present_state_artifact(tuple(
+            selected_turn_dir / f"{prefix}_agent_turn_metadata"
+            for prefix in ("response", "request")
+        ))
+        if artifact is None:
             return None
+        artifact_path, artifact_text = artifact
         try:
             metadata = json.loads(artifact_text)
         except json.JSONDecodeError as exc:
@@ -10861,25 +11041,17 @@ def load_reused_agent_turn_metadata(
             state_turn=source_turn,
             tool_call_index=call_index,
         )
-    (
-        context_assist_summary, context_assist_require_compaction,
-        context_assist_skip_next_interval,
-    ) = load_state_agent_context_assist(selected_turn_dir)
     return reused_agent_runtime_history(
         ReusedAgentHistory(
             turns=tuple(turns),
             active_task=metadata["active_task"],
             active_context=metadata["active_context"],
             meta_task_list=tuple(task_list),
-            context_summary=load_state_agent_context_summary(
-                selected_turn_dir, expires_schema["default"]
-            ),
-            context_assist_summary=context_assist_summary,
-            context_assist_require_compaction=context_assist_require_compaction,
-            context_assist_skip_next_interval=context_assist_skip_next_interval,
             turn_metadata=metadata,
         ),
         runtime_state,
+        turn_dir=selected_turn_dir,
+        default_expires_in_turns=expires_schema["default"],
     )
 
 
@@ -10940,86 +11112,56 @@ def resume_reused_agent_turn(
         for index in range(len(saved_outputs), completed_count)
     ]
 
-    # Tool output is written before metadata. Recover a newer recorded
-    # output prefix without executing those actions a second time.
     if completed_count > processed_count:
-        turns = list(history.turns)
         metadata = history.turn_metadata or {}
         saved_contexts = metadata.get("file_contexts")
-        file_contexts = list(
-            normalize_state_agent_file_contexts(saved_contexts)
-            if saved_contexts is not None else ()
+        state = AgentResultState(
+            turns=list(history.turns),
+            active_task=history.active_task,
+            active_context=history.active_context,
+            meta_task_list=list(history.meta_task_list),
+            context_summary=history.context_summary,
+            file_contexts=list(
+                normalize_state_agent_file_contexts(saved_contexts)
+                if saved_contexts is not None else ()
+            ),
+            file_expires_in_turns=metadata.get("file_expires_in_turns", {}).copy(),
+            pinned_paths=set(metadata.get("pinned_file_paths", ())),
+            pinned_turn_numbers=set(metadata.get("pinned_turn_numbers", ())),
         )
-        file_expirations = metadata.get("file_expires_in_turns", {}).copy()
-        pinned_paths = set(metadata.get("pinned_file_paths", ()))
-        pinned_turns = set(metadata.get("pinned_turn_numbers", ()))
-        active_task = history.active_task
-        active_context = history.active_context
-        task_list = list(history.meta_task_list)
+        turn_unix_time = state_artifact_last_modified_time(turn_dir / "response")
         for index in range(processed_count, completed_count):
             tool_call = tool_calls[index]
-            output = completed_outputs[index]
-            contexts = None
-            if tool_call.tool == AGENT_LOAD_FILE_FROM_STORAGE_TOOL:
-                contexts = load_reused_agent_readfile_contexts(turn_dir, output)
-            elif tool_call.tool == AGENT_PATCH_TOOL:
-                contexts = load_state_agent_file_contexts(turn_dir)
-            if contexts is not None:
-                refreshed_paths = {path for path, _ in contexts}
-                file_contexts[:] = [
-                    context for context in file_contexts
-                    if context[0] not in refreshed_paths
-                ]
-                for path in refreshed_paths:
-                    file_expirations.pop(path, None)
-                pinned_paths.difference_update(refreshed_paths)
-            if (
-                tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL
-                and not output.startswith("ERROR:")
-            ):
-                try:
-                    apply_agent_context_control(
-                        tool_call, file_contexts, turns, file_expirations,
-                        pinned_paths, pinned_turns,
-                    )
-                except ValueError:
-                    pass
-            record_agent_tool_history(
-                turns, active_task,
-                join_prompt_sections(active_context, tool_call.context),
-                tool_call, output,
-                turn_unix_time=state_artifact_last_modified_time(turn_dir / "response"),
-                readfile_contexts=contexts,
+            execution = reused_agent_tool_execution(
+                turn_dir, tool_call, completed_outputs[index], state.meta_task_list
+            )
+            preceding_patch_tool_call = (
+                tool_calls[index - 1]
+                if index > 0 and is_agent_patch_readfile_companion(
+                    tool_calls[index - 1], tool_call
+                )
+                else None
+            )
+            apply_agent_tool_result(
+                state, tool_call, execution,
                 state_turn=selected_turn,
                 tool_call_index=index,
+                turn_unix_time=turn_unix_time,
+                preceding_patch_tool_call=preceding_patch_tool_call,
             )
-            if (
-                tool_call.tool == AGENT_META_TASK_LIST_TOOL
-                and output and not output.startswith("ERROR:")
-                and isinstance(tool_call.arguments, dict)
-            ):
-                task_list = parse_reused_agent_meta_task_list(
-                    output, task_list, tool_call.arguments.get("operations")
-                )
-            if (
-                tool_call.tool == AGENT_AGENT_TOOL
-                and not tool_call.profile_name
-                and output and not output.startswith("ERROR:")
-            ):
-                active_task = tool_call.task
-                active_context = tool_call.context
-                if history.context_summary is not None:
-                    history.context_summary.active_context_checksum = ""
         history = replace(
             history,
-            turns=tuple(turns),
-            active_task=active_task,
-            active_context=active_context,
-            meta_task_list=tuple(task_list),
+            turns=tuple(state.turns),
+            active_task=state.active_task,
+            active_context=state.active_context,
+            meta_task_list=tuple(state.meta_task_list),
             turn_metadata=build_agent_turn_metadata(
-                turns, file_expirations, pinned_paths, pinned_turns,
-                active_task, active_context, task_list,
-                file_contexts=file_contexts if saved_contexts is not None else None,
+                state.turns, state.file_expires_in_turns,
+                state.pinned_paths, state.pinned_turn_numbers,
+                state.active_task, state.active_context, state.meta_task_list,
+                file_contexts=(
+                    state.file_contexts if saved_contexts is not None else None
+                ),
             ),
         )
 
@@ -11037,7 +11179,9 @@ def resume_reused_agent_turn(
         history,
         next_state_turn=selected_turn + 1,
         pending_model_result=pending_result,
-        completed_tool_outputs=tuple(completed_outputs),
+        completed_tool_outputs=(
+            tuple(completed_outputs) if pending_result is not None else ()
+        ),
     )
 
 
@@ -11074,6 +11218,9 @@ def load_reused_session_agent_history(
     context_summary: AgentContextSummary | None = None
     has_summary_turn = False
     selected_controller_turn = False
+    runtime_history = reused_agent_runtime_history(
+        ReusedAgentHistory((), "", ""), runtime_state
+    )
 
     for turn_number, turn_dir in turn_directories:
         saved_task_list_text = read_optional_state_artifact(
@@ -11091,8 +11238,12 @@ def load_reused_session_agent_history(
         response_path = turn_dir / "response"
         response = read_state_artifact(response_path)
         turn_unix_time = state_artifact_last_modified_time(response_path)
-        saved_summary = load_state_agent_context_summary(
-            turn_dir, expires_schema["default"]
+        saved_summary = (
+            runtime_history.context_summary
+            if turn_number == selected_turn and runtime_state is not None
+            else load_state_agent_context_summary(
+                turn_dir, expires_schema["default"]
+            )
         )
         try:
             tool_calls = parse_reused_agent_tool_calls(
@@ -11105,7 +11256,10 @@ def load_reused_session_agent_history(
                 saved_summary is not None
                 and saved_summary.content
                 and response.strip() == saved_summary.content
-                and (turn_dir / "response_agent_context_summary").is_file()
+                and (
+                    saved_summary.generated_turn == turn_number
+                    or (turn_dir / "response_agent_context_summary").is_file()
+                )
             ):
                 tool_calls = []
             elif turn_number == selected_turn:
@@ -11148,102 +11302,68 @@ def load_reused_session_agent_history(
                 == saved_summary.active_context_checksum
             ):
                 active_context = ""
-        task = read_state_artifact(turn_dir / "request_task")
-        active_task = task
+        state = AgentResultState(
+            turns=turns,
+            active_task=read_state_artifact(turn_dir / "request_task"),
+            active_context=active_context,
+            meta_task_list=task_list,
+            context_summary=context_summary,
+        )
+        task_list_snapshot = (
+            tuple(task_list) if saved_task_list_text is not None else None
+        )
         for tool_call_index, (tool_call, tool_output) in enumerate(
             zip(tool_calls, tool_outputs)
         ):
             if tool_call is None:
                 continue
-            tool_context = "\n\n".join(
-                value for value in (active_context, tool_call.context) if value
+            execution = reused_agent_tool_execution(
+                turn_dir, tool_call, tool_output, state.meta_task_list,
+                task_list_snapshot,
             )
-            patch_readfile_companion = (
-                tool_call_index > 0
-                and is_agent_patch_readfile_companion(
-                    tool_calls[tool_call_index - 1],
-                    tool_call,
+            preceding_patch_tool_call = (
+                tool_calls[tool_call_index - 1]
+                if tool_call_index > 0 and is_agent_patch_readfile_companion(
+                    tool_calls[tool_call_index - 1], tool_call
                 )
-            )
-            readfile_contexts = (
-                load_reused_agent_readfile_contexts(
-                    turn_dir,
-                    tool_output,
-                )
-                if tool_call.tool == AGENT_LOAD_FILE_FROM_STORAGE_TOOL
                 else None
             )
-            record_agent_tool_history(
-                turns,
-                task,
-                tool_context,
-                tool_call,
-                tool_output,
-                turn_unix_time=turn_unix_time,
+            apply_agent_tool_result(
+                state, tool_call, execution,
                 state_turn=turn_number,
                 tool_call_index=tool_call_index,
-                readfile_contexts=readfile_contexts,
-                preceding_patch_tool_call=(
-                    tool_calls[tool_call_index - 1]
-                    if patch_readfile_companion
-                    else None
-                ),
+                turn_unix_time=turn_unix_time,
+                preceding_patch_tool_call=preceding_patch_tool_call,
             )
-            if patch_readfile_companion:
-                continue
-            if (
-                tool_call.tool == AGENT_META_TASK_LIST_TOOL
-                and saved_task_list_text is None
-                and tool_output
-                and not tool_output.startswith("ERROR:")
-                and isinstance(tool_call.arguments, dict)
-            ):
-                try:
-                    task_list = parse_reused_agent_meta_task_list(
-                        tool_output,
-                        task_list,
-                        tool_call.arguments.get("operations"),
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        f"invalid saved meta_task_list output: {turn_dir} ({exc})"
-                    ) from exc
-            if (
-                tool_call.tool == AGENT_AGENT_TOOL
-                and not tool_call.profile_name
-                and tool_output
-                and tool_output != AGENT_TOOL_NOT_EXECUTED_OUTPUT
-                and not tool_output.startswith("ERROR:")
-            ):
-                active_task = tool_call.task
-                active_context = tool_call.context
-                if context_summary is not None:
-                    context_summary.active_context_checksum = ""
+        active_task = state.active_task
+        active_context = state.active_context
+        task_list = state.meta_task_list
 
     if not turns and not has_summary_turn and not selected_controller_turn:
         raise ValueError(
             "selected session turn is not an agent controller turn: "
             f"{selected_turn_dir}"
         )
-    (
-        context_assist_summary, context_assist_require_compaction,
-        context_assist_skip_next_interval,
-    ) = load_state_agent_context_assist(selected_turn_dir)
-    return resume_reused_agent_turn(
-        reused_agent_runtime_history(
-            ReusedAgentHistory(
-                turns=tuple(turns),
-                active_task=active_task,
-                active_context=active_context,
-                meta_task_list=tuple(task_list),
-                context_summary=context_summary,
-                context_assist_summary=context_assist_summary,
-                context_assist_require_compaction=context_assist_require_compaction,
-                context_assist_skip_next_interval=context_assist_skip_next_interval,
-            ),
-            runtime_state,
+    history = replace(
+        runtime_history,
+        turns=tuple(turns),
+        active_task=active_task,
+        active_context=active_context,
+        meta_task_list=tuple(task_list),
+        context_summary=(
+            runtime_history.context_summary
+            if runtime_state is not None
+            else context_summary
         ),
-        selected_turn_dir, expires_schema, response_json_repair,
+    )
+    if runtime_state is None:
+        history = reused_agent_runtime_history(
+            history, None,
+            turn_dir=selected_turn_dir,
+            default_expires_in_turns=expires_schema["default"],
+        )
+    return resume_reused_agent_turn(
+        history, selected_turn_dir, expires_schema, response_json_repair
     )
 
 def reused_agent_context_pins(
@@ -11277,7 +11397,7 @@ def reused_agent_context_pins(
             )
         if (
             turn.tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL
-            and turn.output
+            and turn.output != AGENT_TOOL_NOT_EXECUTED_OUTPUT
             and not turn.output.startswith("ERROR:")
         ):
             try:
@@ -11329,14 +11449,10 @@ def apply_agent_context_summary(
     pinned_paths: set[str],
     pinned_turn_numbers: set[int],
 ) -> None:
-    removed_paths = set(summary.removed_file_paths)
-    file_contexts[:] = [
-        context for context in file_contexts
-        if context[0] not in removed_paths
-    ]
-    for path in removed_paths:
-        file_expires_in_turns.pop(path, None)
-    pinned_paths.difference_update(removed_paths)
+    remove_agent_initial_file_contexts(
+        file_contexts, file_expires_in_turns, pinned_paths,
+        set(summary.removed_file_paths),
+    )
     for turn_number in summary.removed_turn_numbers:
         if not 0 <= turn_number < len(turns):
             raise ValueError(f"summarized agent turn does not exist: turn:{turn_number}")
@@ -11409,13 +11525,9 @@ def apply_agent_context_assist_removals(
         removed_paths.add(path)
         removed_file_ids.append(identifier)
     if removed_paths:
-        file_contexts[:] = [
-            context for context in file_contexts
-            if context[0] not in removed_paths
-        ]
-        for path in removed_paths:
-            file_expires_in_turns.pop(path, None)
-        pinned_paths.difference_update(removed_paths)
+        remove_agent_initial_file_contexts(
+            file_contexts, file_expires_in_turns, pinned_paths, removed_paths
+        )
         remove_duplicate_agent_history_context_files(
             turns,
             tuple((path, current_files[path]) for path in sorted(removed_paths)),
@@ -12105,6 +12217,150 @@ def format_model_response_log(
     )
 
 
+@dataclass
+class RecordedModelTurn:
+    settings: ModelRequestSettings
+    cumulative_stats: CumulativeStats
+    logger: Callable[[str], None]
+    turn: int | None = None
+    prefix: str = ""
+    response_tag: str = "response"
+    session_stats: CumulativeStats | None = None
+    system_prompt: str = ""
+    user_prompt: str = ""
+    tools: list[dict[str, Any]] | None = None
+    timer: ModelRequestTimer = field(default_factory=ModelRequestTimer)
+    request_text: str = ""
+    request_tokens: int = 0
+    request_characters: int = 0
+    turn_dir: Path | None = None
+    response_stats: str = ""
+
+    def prepare(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        request_tokens: int | None = None,
+    ) -> None:
+        self.system_prompt = system_prompt
+        self.user_prompt = user_prompt
+        self.tools = tools
+        self.request_tokens = (
+            estimate_request_tokens(
+                self.settings.model_settings.model,
+                system_prompt, user_prompt, tools=tools,
+            )
+            if request_tokens is None
+            else request_tokens
+        )
+        self.request_text = format_request_text(
+            system_prompt, user_prompt, tools=tools
+        )
+        self.request_characters = len(self.request_text)
+
+    def check_token_limit(self, label: str = "input") -> None:
+        if self.request_tokens > self.settings.token_limit:
+            raise ValueError(
+                f"Estimated {label} token count ({self.request_tokens}) exceeds "
+                f"token limit ({self.settings.token_limit})"
+            )
+
+    def log_request(self, stats_tag: str = "request_stats") -> None:
+        emit_stats(
+            format_request_stats(
+                request_characters=self.request_characters,
+                request_tokens=self.request_tokens,
+                token_cost=self.settings.token_cost,
+                model_settings=self.settings.model_settings,
+                turn=self.turn,
+                prefix=self.prefix,
+            ),
+            self.logger,
+            stats_tag,
+        )
+        self.logger(f"<request>\n{self.request_text}\n</request>\n")
+
+    def log_response(self, response_text: str, reasoning: str) -> None:
+        self.logger(format_model_response_log(
+            response_text, reasoning, self.response_tag
+        ))
+
+    def start_state(
+        self,
+        state_session_dir: Path,
+        turn: int,
+        task: str,
+        file_paths: list[Path],
+        *,
+        skip_missing_files: bool = False,
+    ) -> Path:
+        self.turn_dir = start_state_turn(
+            state_session_dir, turn, self.system_prompt, task, file_paths,
+            skip_missing_files=skip_missing_files,
+            user_prompt=self.user_prompt,
+            tools=self.tools,
+        )
+        return self.turn_dir
+
+    @contextmanager
+    def record(self) -> Iterator[None]:
+        try:
+            yield
+        finally:
+            self.response_stats = record_response_stats(
+                self.timer, self.cumulative_stats,
+                request_characters=self.request_characters,
+                request_tokens=self.request_tokens,
+                token_cost=self.settings.token_cost,
+                session_stats=self.session_stats,
+                turn=self.turn,
+                prefix=self.prefix,
+            )
+
+    def call(self, **options: Any) -> tuple[Any, str]:
+        options.setdefault("request_logger", self.logger)
+        options.setdefault("response_logger", self.log_response)
+        response_obj, _ = call_model(
+            self.settings.model_settings,
+            self.system_prompt, self.user_prompt,
+            tools=self.tools,
+            request_timer=self.timer,
+            **options,
+        )
+        return (
+            response_obj,
+            "" if options.get("stream") else response_output_text(response_obj),
+        )
+
+    def complete(
+        self,
+        response_obj: Any,
+        response: str,
+    ) -> tuple[str, tuple[dict[str, Any], ...]]:
+        reasoning = response_reasoning_text(response_obj)
+        reasoning_items = response_reasoning_encrypted_items(response_obj)
+        if self.turn_dir is not None:
+            complete_state_turn(
+                self.turn_dir, reasoning, response, reasoning_items
+            )
+        return reasoning, reasoning_items
+
+    def record_error(self, error: BaseException | str) -> None:
+        if self.turn_dir is not None:
+            append_state_response_error(self.turn_dir, error)
+        detail = (
+            format_exception_message(error)
+            if isinstance(error, BaseException)
+            else str(error).strip()
+        )
+        self.logger(
+            f"<{self.response_tag}_error>\n{detail}\n"
+            f"</{self.response_tag}_error>\n"
+        )
+
+
 def request_agent_model(
     settings: AgentRunSettings,
     system_prompt: str,
@@ -12129,7 +12385,6 @@ def request_agent_model(
     elif prompt_assist:
         tools = [AGENT_PROMPT_ASSIST_TOOL_SCHEMA]
     request_name = f"agent_{assist_type}_assist" if assist_type else "agent"
-    stats_prefix = f"request_type={request_name}"
     if summary_token_budget is not None:
         if assist_type or json_schema is not None:
             raise ValueError(
@@ -12139,48 +12394,39 @@ def request_agent_model(
         tools = [AGENT_CONTEXT_SUMMARY_TOOL_SCHEMA]
 
     def append_log(text: str) -> None:
-        append_session_log(
-            settings.log_path, text, settings.log_enabled
-        )
+        append_session_log(settings.log_path, text, settings.log_enabled)
 
-    def log_response(response_text: str, reasoning: str) -> None:
-        append_log(
-            format_model_response_log(
-                response_text, reasoning, f"{request_name}_response"
-            )
+    model_settings = settings.model_settings
+    if summary_token_budget is not None:
+        model_settings = replace(
+            model_settings,
+            extra_body={
+                name: value
+                for name, value in (model_settings.extra_body or {}).items()
+                if name not in ("tools", "tool_choice", "parallel_tool_calls")
+            },
         )
-
-    request_tokens = estimate_request_tokens(
-        model=settings.model_settings.model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        tools=tools,
-    )
-    if request_tokens > settings.token_limit:
-        raise ValueError(
-            f"Estimated agent input token count ({request_tokens}) exceeds "
-            f"token limit ({settings.token_limit})"
-        )
-    request_text = format_request_text(
-        system_prompt, user_prompt, tools=tools
-    )
-    request_characters = len(request_text)
     current_turn = (
         settings.state_turn
         if record_state
         else max(0, settings.state_turn - 1)
     )
+    request = RecordedModelTurn(
+        ModelRequestSettings(model_settings, settings.token_limit, settings.token_cost),
+        settings.cumulative_stats,
+        append_log,
+        turn=current_turn,
+        prefix=f"request_type={request_name}",
+        response_tag=f"{request_name}_response",
+        session_stats=settings.session_stats,
+    )
+    request.prepare(system_prompt, user_prompt, tools=tools)
+    request.check_token_limit("agent input")
     turn_dir: Path | None = None
     if record_state:
-        turn_dir = start_state_turn(
-            settings.state_session_dir,
-            settings.state_turn,
-            system_prompt,
-            task,
-            settings.file_paths,
-            skip_missing_files=True,
-            user_prompt=user_prompt,
-            tools=tools,
+        turn_dir = request.start_state(
+            settings.state_session_dir, settings.state_turn, task,
+            settings.file_paths, skip_missing_files=True,
         )
         if turn_metadata is not None:
             write_state_artifact(
@@ -12193,58 +12439,25 @@ def request_agent_model(
             turn_dir, settings, "request", turn_metadata
         )
     append_log(f"<{request_name}_request>\n")
-    emit_stats(
-        format_request_stats(
-            request_characters=request_characters,
-            request_tokens=request_tokens,
-            token_cost=settings.token_cost,
-            model_settings=settings.model_settings,
-            turn=current_turn,
-            prefix=stats_prefix,
-        ),
-        append_log,
-        "request_stats",
-    )
-    append_log(
-        f"<request>\n{request_text}\n</request>\n"
-        f"</{request_name}_request>\n"
-    )
-    model_settings = settings.model_settings
-    if summary_token_budget is not None:
-        model_settings = replace(
-            model_settings,
-            extra_body={
-                name: value
-                for name, value in (model_settings.extra_body or {}).items()
-                if name not in ("tools", "tool_choice", "parallel_tool_calls")
-            },
-        )
+    request.log_request()
+    append_log(f"</{request_name}_request>\n")
     log_tool_schema = True
-    request_timer = ModelRequestTimer()
 
-    def request_response() -> tuple[
-        Any, str, tuple[AgentToolCall, ...]
-    ]:
+    def request_response() -> tuple[Any, str, tuple[AgentToolCall, ...]]:
         nonlocal log_tool_schema
         try:
-            response_obj, _ = call_model(
-                model_settings,
-                system_prompt,
-                user_prompt,
+            response_obj, response = request.call(
                 image_urls=settings.image_urls,
                 response_format=("schema" if json_schema is not None else "text"),
                 json_schema=json_schema,
                 retry=0,
                 report_errors=False,
                 request_logger=append_log if log_tool_schema else None,
-                response_logger=log_response,
-                tools=tools,
                 tool_choice="required" if tools else None,
                 parallel_tool_calls=(
                     False if assist_type or summary_token_budget is not None
                     else True if tools else None
                 ),
-                request_timer=request_timer,
                 reasoning_items=reasoning_items,
             )
         finally:
@@ -12252,14 +12465,12 @@ def request_agent_model(
         parsed_tool_calls: tuple[AgentToolCall, ...] = ()
         if context_assist:
             response = parse_agent_context_assist_response(
-                response_obj,
-                model_settings.model,
+                response_obj, model_settings.model,
                 model_settings.response_json_repair,
             )
         elif prompt_assist:
             response = parse_agent_prompt_assist_response(
-                response_obj,
-                model_settings.model,
+                response_obj, model_settings.model,
                 agent_system_prompts(settings),
                 model_settings.response_json_repair,
             )
@@ -12272,28 +12483,20 @@ def request_agent_model(
                 token_budget=summary_token_budget,
             )["summary"]
         elif tools:
-            parsed_tool_calls = tuple(
-                response_agent_tool_calls(
-                    response_obj,
-                    settings.agent_profiles,
-                    agent_expires_in_turns_schema(
-                        settings.agent_context_expires
-                    ),
-                    response_json_repair=model_settings.response_json_repair,
-                    default_profile=settings.agent_profile_default,
-                )
-            )
+            parsed_tool_calls = tuple(response_agent_tool_calls(
+                response_obj,
+                settings.agent_profiles,
+                agent_expires_in_turns_schema(settings.agent_context_expires),
+                response_json_repair=model_settings.response_json_repair,
+                default_profile=settings.agent_profile_default,
+            ))
             for tool_call in parsed_tool_calls:
                 if tool_call.tool == AGENT_PATCH_TOOL:
                     try:
                         manifest = tool_call.arguments
                         if manifest is None:
                             raise ValueError("agent patch tool received no manifest")
-                        build_patch_changes(
-                            load_patch_original_texts(manifest),
-                            manifest,
-                            require_changes=False,
-                        )
+                        build_patch_changes({}, manifest, require_changes=False)
                     except ValueError as exc:
                         raise AgentControllerResponseError(
                             f"agent patch arguments are invalid: {exc}"
@@ -12305,46 +12508,33 @@ def request_agent_model(
                     f"agent tool calls could not be serialized: {exc}"
                 ) from exc
             parse_agent_response_json(response, "agent tool calls")
-        else:
-            response = response_output_text(response_obj)
-            if json_schema is not None:
-                response = normalize_agent_json_response(
-                    response,
-                    json_schema,
-                    model_settings.response_json_repair,
-                )
+        elif json_schema is not None:
+            response = normalize_agent_json_response(
+                response, json_schema, model_settings.response_json_repair
+            )
         return response_obj, response, parsed_tool_calls
 
     try:
         try:
-            response_obj, response, parsed_tool_calls = execute_openai_request(
-                request_response,
-                retry=model_settings.retry,
-                operation_name=(
-                    f"Agent {assist_type} assist request"
-                    if assist_type
-                    else "Agent request"
-                ),
-                report_errors=not assist_type,
-                error_logger=append_log,
-                retry_if=lambda exc: (
-                    isinstance(exc, AgentControllerResponseError)
-                    or _is_openai_temp_error(exc)
-                ),
-            )
+            with request.record():
+                response_obj, response, parsed_tool_calls = execute_openai_request(
+                    request_response,
+                    retry=model_settings.retry,
+                    operation_name=(
+                        f"Agent {assist_type} assist request"
+                        if assist_type
+                        else "Agent request"
+                    ),
+                    report_errors=not assist_type,
+                    error_logger=append_log,
+                    retry_if=lambda exc: (
+                        isinstance(exc, AgentControllerResponseError)
+                        or _is_openai_temp_error(exc)
+                    ),
+                )
         finally:
             emit_stats(
-                record_response_stats(
-                    request_timer,
-                    settings.cumulative_stats,
-                    request_characters=request_characters,
-                    request_tokens=request_tokens,
-                    token_cost=settings.token_cost,
-                    session_stats=settings.session_stats,
-                    turn=current_turn,
-                    prefix=stats_prefix,
-                ),
-                append_log,
+                request.response_stats, append_log,
                 f"{request_name}_response_stats",
             )
             if turn_dir is not None:
@@ -12353,14 +12543,10 @@ def request_agent_model(
                 )
             elif settings.runtime_state_checkpoint is not None:
                 settings.runtime_state_checkpoint()
-        reasoning = response_reasoning_text(response_obj)
-        response_reasoning_items = response_reasoning_encrypted_items(
-            response_obj
-        )
         if turn_dir is not None:
             if not assist_type:
                 settings.prior_token_estimates.append(
-                    (current_turn, request_tokens)
+                    (current_turn, request.request_tokens)
                 )
                 del settings.prior_token_estimates[
                     :-AGENT_PRIOR_TOKEN_ESTIMATES_MAX_TURNS
@@ -12368,23 +12554,14 @@ def request_agent_model(
             write_state_agent_runtime_state(
                 turn_dir, settings, turn_metadata=turn_metadata
             )
-            complete_state_turn(
-                turn_dir, reasoning, response, response_reasoning_items
-            )
+        reasoning, response_reasoning_items = request.complete(response_obj, response)
+        if turn_dir is not None:
             settings.state_turn += 1
-            turn_unix_time = state_artifact_last_modified_time(
-                turn_dir / "response"
-            )
+            turn_unix_time = state_artifact_last_modified_time(turn_dir / "response")
         else:
             turn_unix_time = None
     except Exception as exc:
-        if turn_dir is not None:
-            append_state_response_error(turn_dir, exc)
-        append_log(
-            f"<{request_name}_response_error>\n"
-            f"{format_exception_message(exc)}\n"
-            f"</{request_name}_response_error>\n"
-        )
+        request.record_error(exc)
         raise
     return AgentModelResult(
         response=response,
@@ -12392,7 +12569,7 @@ def request_agent_model(
         turn_dir=turn_dir,
         turn_unix_time=turn_unix_time,
         tool_calls=parsed_tool_calls,
-        request_tokens=request_tokens,
+        request_tokens=request.request_tokens,
         reasoning_items=response_reasoning_items,
     )
 
@@ -12450,10 +12627,17 @@ class AgentAssist:
                 reviewed_context = metadata.get("reviewed_file_context", "")
                 if isinstance(reviewed_context, str):
                     self.request_settings.context = reviewed_context
-            self.request_summary = (
-                load_state_agent_context_summary(turn_dir)
-                or AgentContextSummary()
-            )
+                request_history = reused_agent_runtime_history(
+                    ReusedAgentHistory((), "", ""), runtime_state
+                )
+                self.request_summary = (
+                    request_history.context_summary or AgentContextSummary()
+                )
+            else:
+                self.request_summary = (
+                    load_state_agent_context_summary(turn_dir)
+                    or AgentContextSummary()
+                )
             response = read_optional_state_artifact(turn_dir / "response")
             if response is None:
                 raise ValueError("interrupted assist request has no saved response")
@@ -12798,16 +12982,6 @@ class AgentAssist:
                 self.executor.shutdown(wait=True)
 
 
-@dataclass
-class AgentContextAssist(AgentAssist):
-    assist_type: str = field(default="context", init=False)
-
-
-@dataclass
-class AgentPromptAssist(AgentAssist):
-    assist_type: str = field(default="prompt", init=False)
-
-
 def run_agent_profile_tool(
     settings: AgentRunSettings,
     profile_name: str,
@@ -13066,9 +13240,8 @@ def run_agent_patch_tool(
         patch_suffix = ""
         suffix_provided = False
     try:
-        original_texts = load_patch_original_texts(manifest)
         updated_texts, diff_text, changed_items = build_patch_changes(
-            original_texts,
+            {},
             manifest,
             require_changes=False,
         )
@@ -13178,37 +13351,9 @@ def run_agent_patch_tool(
     )
 
 
-def finish_agent_response(
-    settings: AgentRunSettings,
-    response_text: str,
-    reasoning: str,
-    append_output: bool = False,
- ) -> int:
-    output_text = format_response_output(
-        response_text,
-        reasoning,
-        settings.print_reasoning,
-    )
-    if not output_text:
-        return 0
-    return emit_response_output(
-        output_text,
-        suppress_response_output=settings.suppress_response_output,
-        append_output=append_output,
-    )
-
-
 def prepare_agent_context(
     settings: AgentRunSettings,
-) -> tuple[
-    list[AgentTurn],
-    list[tuple[str, str]],
-    dict[str, int],
-    set[str],
-    set[int],
-    AgentContextSummary,
-    list[dict[str, Any]],
-]:
+) -> AgentResultState:
     turns: list[AgentTurn] = list(settings.initial_turns)
     file_contexts = list(agent_context_file_sections(settings))
     file_expires_in_turns = agent_file_context_expirations(
@@ -13264,9 +13409,16 @@ def prepare_agent_context(
             list(settings.initial_meta_task_list),
         )
     )
-    return (
-        turns, file_contexts, file_expires_in_turns, pinned_paths,
-        pinned_turn_numbers, context_summary, meta_task_list,
+    return AgentResultState(
+        turns=turns,
+        active_task=settings.task,
+        active_context=settings.initial_active_context,
+        meta_task_list=meta_task_list,
+        context_summary=context_summary,
+        file_contexts=file_contexts,
+        file_expires_in_turns=file_expires_in_turns,
+        pinned_paths=pinned_paths,
+        pinned_turn_numbers=pinned_turn_numbers,
     )
 
 
@@ -13282,7 +13434,26 @@ def prepare_agent_context_summary_request(
     )
 
 
-def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
+@dataclass(frozen=True)
+class AgentControllerRequest:
+    system_prompt: str
+    user_prompt: str
+    tools: list[dict[str, Any]]
+    request_tokens: int
+    summary_token_budget: int | None
+    compaction: AgentContextCompaction | None
+
+
+def build_agent_controller_request(
+    settings: AgentRunSettings,
+    state: AgentResultState,
+    *,
+    hook_contents: tuple[str, ...] = (),
+    advance_expirations: bool = False,
+    refresh_summary: bool = False,
+    limit_context: bool = True,
+    file_context_ids: dict[str, int] | None = None,
+) -> AgentControllerRequest:
     controller_tools = agent_tool_schemas(
         settings.agent_profiles,
         agent_expires_in_turns_schema(settings.agent_context_expires),
@@ -13290,56 +13461,73 @@ def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
         prompt_overrides=settings.system_prompt_overrides,
     )
     prompts = agent_system_prompts(settings)
-    (
-        turns, file_contexts, file_expires_in_turns, pinned_paths,
-        pinned_turn_numbers, context_summary, meta_task_list,
-    ) = prepare_agent_context(settings)
-    refresh_agent_file_contexts(
-        settings, file_contexts, turns, file_expires_in_turns
+    system_prompt, user_prompt, summary_token_budget, compaction = (
+        build_agent_context_window_prompts(
+            model=settings.model_settings.model,
+            token_limit=settings.token_limit,
+            system_prompt=prompts["agent_system_prompt"],
+            task=state.active_task,
+            file_contexts=(
+                state.file_contexts if state.file_contexts is not None else []
+            ),
+            turns=state.turns,
+            active_context=state.active_context,
+            pinned_paths=state.pinned_paths,
+            pinned_turn_numbers=state.pinned_turn_numbers,
+            file_expires_in_turns=state.file_expires_in_turns,
+            file_context_ids=(
+                settings.file_context_ids
+                if file_context_ids is None
+                else file_context_ids
+            ),
+            revision_instruction=settings.pending_revision_instruction,
+            controller_tools=controller_tools,
+            hook_contents=hook_contents,
+            meta_task_list=state.meta_task_list,
+            prior_token_estimates=settings.prior_token_estimates,
+            context_summary=state.context_summary,
+            context_assist_summary=settings.context_assist_summary,
+            require_compaction=settings.context_assist_require_compaction,
+            advance_expirations=advance_expirations,
+            refresh_summary=refresh_summary,
+            limit_context=limit_context,
+            current_turn=settings.state_turn,
+            tool_call_instructions=agent_controller_tool_call_instructions(settings),
+            task_priority_system_prompt=prompts["task_priority_system_prompt"],
+            summary_system_prompt=prompts["context_summary_system_prompt"],
+        )
     )
-    refresh_summary = prepare_agent_context_summary_request(settings)
-    (
-        request_system_prompt, user_prompt, summary_token_budget, _,
-    ) = build_agent_context_window_prompts(
-        model=settings.model_settings.model,
-        token_limit=settings.token_limit,
-        system_prompt=prompts["agent_system_prompt"],
-        task=(
-            settings.task_file_prompt.read()
-            if settings.task_file_prompt is not None
-            else settings.task
+    tools = (
+        [AGENT_CONTEXT_SUMMARY_TOOL_SCHEMA]
+        if summary_token_budget is not None
+        else controller_tools
+    )
+    return AgentControllerRequest(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        tools=tools,
+        request_tokens=estimate_request_tokens(
+            settings.model_settings.model, system_prompt, user_prompt, tools=tools
         ),
-        file_contexts=file_contexts,
-        turns=turns,
-        active_context=settings.initial_active_context,
-        pinned_paths=pinned_paths,
-        pinned_turn_numbers=pinned_turn_numbers,
-        file_expires_in_turns=file_expires_in_turns,
-        file_context_ids=settings.file_context_ids,
-        controller_tools=controller_tools,
-        meta_task_list=meta_task_list,
-        revision_instruction=settings.pending_revision_instruction,
-        prior_token_estimates=settings.prior_token_estimates,
-        context_summary=context_summary,
-        context_assist_summary=settings.context_assist_summary,
-        require_compaction=settings.context_assist_require_compaction,
+        summary_token_budget=summary_token_budget,
+        compaction=compaction,
+    )
+
+
+def estimate_agent_request_tokens(settings: AgentRunSettings) -> int:
+    settings = replace(settings, file_context_ids=settings.file_context_ids.copy())
+    state = prepare_agent_context(settings)
+    refresh_agent_file_contexts(
+        settings, state.file_contexts, state.turns, state.file_expires_in_turns
+    )
+    if settings.task_file_prompt is not None:
+        state.active_task = settings.task_file_prompt.read()
+    refresh_summary = prepare_agent_context_summary_request(settings)
+    return build_agent_controller_request(
+        settings, state,
         advance_expirations=settings.advance_expirations and not refresh_summary,
         refresh_summary=refresh_summary,
-        current_turn=settings.state_turn,
-        tool_call_instructions=agent_controller_tool_call_instructions(settings),
-        task_priority_system_prompt=prompts["task_priority_system_prompt"],
-        summary_system_prompt=prompts["context_summary_system_prompt"],
-    )
-    return estimate_request_tokens(
-        model=settings.model_settings.model,
-        system_prompt=request_system_prompt,
-        user_prompt=user_prompt,
-        tools=(
-            [AGENT_CONTEXT_SUMMARY_TOOL_SCHEMA]
-            if summary_token_budget is not None
-            else controller_tools
-        ),
-    )
+    ).request_tokens
 
 
 def copy_resumed_agent_turn(
@@ -13368,8 +13556,8 @@ def copy_resumed_agent_turn(
 def run_agent_mode(settings: AgentRunSettings) -> int:
     if not settings.original_system_prompts:
         settings.original_system_prompts = agent_system_prompts(settings)
-    context_assist = AgentContextAssist(settings)
-    prompt_assist = AgentPromptAssist(settings)
+    context_assist = AgentAssist(settings, assist_type="context")
+    prompt_assist = AgentAssist(settings, assist_type="prompt")
     try:
         return run_agent_controller(settings, context_assist, prompt_assist)
     finally:
@@ -13388,17 +13576,17 @@ def run_agent_mode(settings: AgentRunSettings) -> int:
 
 def run_agent_controller(
     settings: AgentRunSettings,
-    context_assist: AgentContextAssist,
-    prompt_assist: AgentPromptAssist,
+    context_assist: AgentAssist,
+    prompt_assist: AgentAssist,
 ) -> int:
-    (
-        turns, file_contexts, file_expires_in_turns, pinned_paths,
-        pinned_turn_numbers, context_summary, meta_task_list,
-    ) = prepare_agent_context(settings)
-    active_task = settings.task
-    active_context = settings.initial_active_context
-    write_state_meta_task_list(settings.state_session_dir, meta_task_list)
-    prior_token_estimates = settings.prior_token_estimates
+    state = prepare_agent_context(settings)
+    turns = state.turns
+    file_contexts = state.file_contexts
+    file_expires_in_turns = state.file_expires_in_turns
+    pinned_paths = state.pinned_paths
+    pinned_turn_numbers = state.pinned_turn_numbers
+    context_summary = state.context_summary
+    write_state_meta_task_list(settings.state_session_dir, state.meta_task_list)
     reasoning_items = settings.initial_reasoning_items
     model_result = settings.initial_model_result
     pending_tool_outputs = list(settings.initial_tool_outputs)
@@ -13420,56 +13608,6 @@ def run_agent_controller(
             set(agent_history_turn_numbers(turns)),
             model=settings.model_settings.model,
             file_context_ids=settings.file_context_ids,
-        )
-
-    def build_context_prompts(
-        limit_context: bool,
-        *,
-        context_files: list[tuple[str, str]] | None = None,
-        context_turns: list[AgentTurn] | None = None,
-        context_expirations: dict[str, int] | None = None,
-        advance_expirations: bool = False,
-        refresh_summary: bool = False,
-    ) -> tuple[str, str, int | None, AgentContextCompaction | None]:
-        prompts = agent_system_prompts(settings)
-        return build_agent_context_window_prompts(
-            model=settings.model_settings.model,
-            token_limit=settings.token_limit,
-            system_prompt=prompts["agent_system_prompt"],
-            task=active_task,
-            file_contexts=(
-                file_contexts if context_files is None else context_files
-            ),
-            turns=turns if context_turns is None else context_turns,
-            active_context=active_context,
-            pinned_paths=pinned_paths,
-            pinned_turn_numbers=pinned_turn_numbers,
-            file_expires_in_turns=(
-                file_expires_in_turns
-                if context_expirations is None
-                else context_expirations
-            ),
-            file_context_ids=settings.file_context_ids,
-            revision_instruction=settings.pending_revision_instruction,
-            controller_tools=agent_tool_schemas(
-                settings.agent_profiles,
-                agent_expires_in_turns_schema(settings.agent_context_expires),
-                default_profile=settings.agent_profile_default,
-                prompt_overrides=settings.system_prompt_overrides,
-            ),
-            hook_contents=hook_contents,
-            meta_task_list=meta_task_list,
-            prior_token_estimates=prior_token_estimates,
-            context_summary=context_summary,
-            context_assist_summary=settings.context_assist_summary,
-            require_compaction=settings.context_assist_require_compaction,
-            advance_expirations=advance_expirations,
-            refresh_summary=refresh_summary,
-            limit_context=limit_context,
-            current_turn=settings.state_turn,
-            tool_call_instructions=agent_controller_tool_call_instructions(settings),
-            task_priority_system_prompt=prompts["task_priority_system_prompt"],
-            summary_system_prompt=prompts["context_summary_system_prompt"],
         )
 
     def remove_stale_context(
@@ -13505,9 +13643,9 @@ def run_agent_controller(
             file_expires_in_turns,
             pinned_paths,
             pinned_turn_numbers,
-            active_task,
-            active_context,
-            meta_task_list,
+            state.active_task,
+            state.active_context,
+            state.meta_task_list,
             file_contexts=file_contexts,
         )
 
@@ -13534,8 +13672,7 @@ def run_agent_controller(
     def request_next(
         revision_instruction: str = "",
     ) -> AgentModelResult:
-        nonlocal active_task, active_context, reasoning_items
-        nonlocal checkpoint_turn_dir, hook_contents
+        nonlocal reasoning_items, checkpoint_turn_dir, hook_contents
         if revision_instruction:
             settings.pending_revision_instruction = revision_instruction
         advance_expirations = settings.advance_expirations
@@ -13544,7 +13681,7 @@ def run_agent_controller(
                 settings.state_session_dir,
                 settings.state_turn,
                 agent_system_prompts(settings)["agent_system_prompt"],
-                active_task,
+                state.active_task,
                 settings.file_paths,
                 skip_missing_files=True,
             )
@@ -13552,12 +13689,6 @@ def run_agent_controller(
             save_turn_metadata(checkpoint_turn_dir, "request")
             context_assist.collect()
             prompt_assist.collect()
-            controller_tools = agent_tool_schemas(
-                settings.agent_profiles,
-                agent_expires_in_turns_schema(settings.agent_context_expires),
-                default_profile=settings.agent_profile_default,
-                prompt_overrides=settings.system_prompt_overrides,
-            )
             refresh_summary = prepare_agent_context_summary_request(settings)
             if settings.agent_backup is not None:
                 settings.agent_backup.run_if_due()
@@ -13565,53 +13696,49 @@ def run_agent_controller(
                 settings.agent_hook_context_scripts
             )
             if settings.task_file_prompt is not None:
-                active_task = settings.task_file_prompt.read()
+                state.active_task = settings.task_file_prompt.read()
             refresh_agent_file_contexts(
                 settings, file_contexts, turns, file_expires_in_turns
             )
             try:
-                (
-                    request_system_prompt, user_prompt,
-                    summary_token_budget, compaction,
-                ) = build_context_prompts(
-                    limit_context=True,
+                request = build_agent_controller_request(
+                    settings, state,
+                    hook_contents=hook_contents,
                     advance_expirations=advance_expirations and not refresh_summary,
                     refresh_summary=refresh_summary,
                 )
             finally:
                 if advance_expirations and not refresh_summary:
                     settings.advance_expirations = False
-            if active_context and (
-                agent_context_checksum(active_context) == context_summary.active_context_checksum
+            if state.active_context and (
+                agent_context_checksum(state.active_context)
+                == context_summary.active_context_checksum
             ):
-                active_context = ""
+                state.active_context = ""
             settings.context = current_file_context()
-            request_tools = (
-                [AGENT_CONTEXT_SUMMARY_TOOL_SCHEMA]
-                if summary_token_budget is not None
-                else controller_tools
-            )
-            context_assist_due = compaction is None and context_assist.is_due()
+            context_assist_due = request.compaction is None and context_assist.is_due()
             if context_assist_due or prompt_assist.is_due():
-                (
-                    assist_system_prompt, assist_user_prompt, _, _,
-                ) = build_context_prompts(limit_context=False)
-                if compaction is None:
+                assist_request = build_agent_controller_request(
+                    settings, state,
+                    hook_contents=hook_contents,
+                    limit_context=False,
+                )
+                if request.compaction is None:
                     context_assist.start_if_due(
-                        assist_system_prompt, assist_user_prompt,
-                        controller_tools, active_task,
+                        assist_request.system_prompt, assist_request.user_prompt,
+                        assist_request.tools, state.active_task,
                     )
                 prompt_assist.start_if_due(
-                    assist_system_prompt, assist_user_prompt,
-                    controller_tools, active_task,
+                    assist_request.system_prompt, assist_request.user_prompt,
+                    assist_request.tools, state.active_task,
                 )
             result = request_agent_model(
                 settings,
-                request_system_prompt,
-                user_prompt,
-                active_task,
-                tools=request_tools,
-                summary_token_budget=summary_token_budget,
+                request.system_prompt,
+                request.user_prompt,
+                state.active_task,
+                tools=request.tools,
+                summary_token_budget=request.summary_token_budget,
                 reasoning_items=reasoning_items,
                 turn_metadata=current_turn_metadata(),
             )
@@ -13619,11 +13746,9 @@ def run_agent_controller(
             if result.turn_dir is None:
                 raise ValueError("agent controller request did not create a state turn")
             write_state_meta_task_list(
-                result.turn_dir,
-                meta_task_list,
-                "response_agent_meta_task_list",
+                result.turn_dir, state.meta_task_list, "response_agent_meta_task_list"
             )
-            if summary_token_budget is None:
+            if request.summary_token_budget is None:
                 context_summary.expires_in_turns = max(
                     0, context_summary.expires_in_turns - 1
                 )
@@ -13633,10 +13758,10 @@ def run_agent_controller(
                 save_turn_metadata(result.turn_dir)
                 return result
 
-            active_context = update_agent_context_summary(
+            state.active_context = update_agent_context_summary(
                 context_summary,
                 result.response,
-                active_context,
+                state.active_context,
                 file_contexts,
                 turns,
                 file_expires_in_turns,
@@ -13644,9 +13769,9 @@ def run_agent_controller(
                 pinned_turn_numbers,
                 current_turn=int(result.turn_dir.name),
                 expires_in_turns=settings.agent_context_expires[0],
-                compaction=compaction,
+                compaction=request.compaction,
             )
-            if compaction is not None:
+            if request.compaction is not None:
                 settings.last_compaction_turn = int(result.turn_dir.name)
             settings.context_assist_require_compaction = False
             advance_expirations = refresh_summary
@@ -13656,7 +13781,7 @@ def run_agent_controller(
                 settings,
                 format_agent_turn_report(
                     "Context summary:\n"
-                    f"Context compacted: {'yes' if compaction is not None else 'no'}\n"
+                    f"Context compacted: {'yes' if request.compaction is not None else 'no'}\n"
                     f"{context_summary.content}",
                     int(result.turn_dir.name),
                 ),
@@ -13689,13 +13814,15 @@ def run_agent_controller(
         review_action, revision_task = review_agent_tool_calls(
             tool_calls[len(tool_outputs):],
             settings.agent_auto,
-            meta_task_list,
+            state.meta_task_list,
         )
         if review_action == "save":
-            return finish_agent_response(
-                settings,
+            return emit_response_output(
                 model_result.response,
-                model_result.reasoning,
+                reasoning=model_result.reasoning,
+                print_reasoning=settings.print_reasoning,
+                skip_empty=True,
+                suppress_response_output=settings.suppress_response_output,
             )
         if review_action == "reject":
             if VERBOSE:
@@ -13706,10 +13833,9 @@ def run_agent_controller(
                 try:
                     revision_task = edit_tool_revision_task(
                         format_agent_tool_call_report(
-                            tool_calls,
-                            meta_task_list=meta_task_list,
+                            tool_calls, meta_task_list=state.meta_task_list
                         ),
-                        active_task,
+                        state.active_task,
                     )
                 except Exception as exc:
                     print(
@@ -13736,7 +13862,7 @@ def run_agent_controller(
             try:
                 write_state_meta_task_list(
                     model_result.turn_dir,
-                    meta_task_list,
+                    state.meta_task_list,
                     "response_agent_meta_task_list",
                 )
                 if tool_outputs:
@@ -13744,8 +13870,7 @@ def run_agent_controller(
                         len(tool_calls) - len(tool_outputs)
                     )
                     tool_output_text = format_agent_tool_outputs(
-                        tool_calls,
-                        tool_outputs + pending_outputs,
+                        tool_calls, tool_outputs + pending_outputs
                     )
                     write_state_artifact(
                         model_result.turn_dir,
@@ -13760,14 +13885,10 @@ def run_agent_controller(
                             "</agent_tool_output>\n",
                             settings.log_enabled,
                         )
-                write_state_reasoning_items(
-                    model_result.turn_dir,
-                    reasoning_items,
-                )
+                write_state_reasoning_items(model_result.turn_dir, reasoning_items)
                 if readfile_contexts_for_turn is not None:
                     write_state_agent_file_contexts(
-                        model_result.turn_dir,
-                        readfile_contexts_for_turn,
+                        model_result.turn_dir, readfile_contexts_for_turn
                     )
                 save_turn_metadata(model_result.turn_dir)
             except Exception as exc:
@@ -13777,7 +13898,7 @@ def run_agent_controller(
                 )
                 return False
             return True
- 
+
         for tool_call_index in range(len(tool_outputs), len(tool_calls)):
             tool_call = tool_calls[tool_call_index]
             if settings.agent_auto:
@@ -13786,7 +13907,7 @@ def run_agent_controller(
                         settings,
                         tool_call,
                         int(model_result.turn_dir.name),
-                        meta_task_list,
+                        state.meta_task_list,
                         tool_call_number=tool_call_index + 1,
                         tool_call_count=len(tool_calls),
                     )
@@ -13797,204 +13918,130 @@ def run_agent_controller(
                         file=sys.stderr,
                     )
                     return 1
-            if tool_call.tool == AGENT_SESSION_TOOL:
-                tool_output = "Agent session ended."
-                record_agent_tool_history(
-                    turns, active_task, active_context, tool_call, tool_output,
-                    turn_unix_time=model_result.turn_unix_time,
-                    state_turn=int(model_result.turn_dir.name),
-                    tool_call_index=tool_call_index,
-                )
-                tool_outputs.append(tool_output)
-                if not save_tool_outputs():
-                    return 1
-                return finish_agent_response(
-                    settings,
-                    "" if settings.agent_auto else tool_call.reason,
-                    model_result.reasoning,
-                    append_output=settings.agent_auto,
-                )
-            turn_task = active_task
+            turn_task = state.active_task
             tool_context = "\n\n".join(
-                value for value in (active_context, tool_call.context) if value
+                value for value in (state.active_context, tool_call.context) if value
             )
-
-            readfile_contexts: tuple[tuple[str, str], ...] | None = None
 
             def estimate_loaded_context_tokens(
                 contexts: tuple[tuple[str, str], ...],
                 output: str,
             ) -> int:
-                refreshed_paths = {path for path, _ in contexts}
-                context_turns = turns.copy()
-                record_agent_tool_history(
-                    context_turns,
-                    turn_task,
-                    tool_context,
-                    tool_call,
-                    output,
-                    turn_unix_time=model_result.turn_unix_time,
+                context_state = replace(
+                    state,
+                    turns=turns.copy(),
+                    file_contexts=file_contexts.copy(),
+                    file_expires_in_turns=file_expires_in_turns.copy(),
+                    pinned_paths=pinned_paths.copy(),
+                    pinned_turn_numbers=pinned_turn_numbers.copy(),
+                    meta_task_list=[task.copy() for task in state.meta_task_list],
+                    context_summary=replace(context_summary),
+                )
+                apply_agent_tool_result(
+                    context_state, tool_call,
+                    AgentToolExecution(output, readfile_contexts=contexts),
                     state_turn=int(model_result.turn_dir.name),
                     tool_call_index=tool_call_index,
-                    readfile_contexts=contexts,
+                    turn_unix_time=model_result.turn_unix_time,
                 )
-                (
-                    request_system_prompt, user_prompt, _, _,
-                ) = build_context_prompts(
-                    limit_context=False,
-                    context_files=[
-                        context for context in file_contexts
-                        if context[0] not in refreshed_paths
-                    ],
-                    context_turns=[
-                        limit_agent_shell_turn_for_context(
-                            turn,
-                            settings.model_settings.model,
-                            settings.token_limit,
-                        )
-                        for turn in context_turns
-                    ],
-                    context_expirations={
-                        path: expires_in_turns
-                        for path, expires_in_turns in file_expires_in_turns.items()
-                        if path not in refreshed_paths
-                    },
-                )
-                return estimate_request_tokens(
-                    model=settings.model_settings.model,
-                    system_prompt=request_system_prompt,
-                    user_prompt=user_prompt,
-                    tools=agent_tool_schemas(
-                        settings.agent_profiles,
-                        agent_expires_in_turns_schema(settings.agent_context_expires),
-                        default_profile=settings.agent_profile_default,
-                        prompt_overrides=settings.system_prompt_overrides,
-                    ),
-                )
-
-            if tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL:
-                try:
-                    apply_agent_context_control(
-                        tool_call,
-                        file_contexts,
-                        turns,
-                        file_expires_in_turns,
-                        pinned_paths,
-                        pinned_turn_numbers,
+                context_state.turns = [
+                    limit_agent_shell_turn_for_context(
+                        turn, settings.model_settings.model, settings.token_limit
                     )
-                except ValueError as exc:
-                    tool_output = f"ERROR: Failed to pin context: {exc}"
-                else:
-                    tool_output = ""
+                    for turn in context_state.turns
+                ]
+                return build_agent_controller_request(
+                    settings, context_state,
+                    hook_contents=hook_contents,
+                    limit_context=False,
+                    file_context_ids=settings.file_context_ids.copy(),
+                ).request_tokens
+
+            if tool_call.tool == AGENT_SESSION_TOOL:
+                execution = AgentToolExecution("Agent session ended.")
+            elif tool_call.tool == AGENT_META_CONTEXT_CONTROL_TOOL:
+                execution = AgentToolExecution("")
             elif tool_call.tool == AGENT_LOAD_FILE_FROM_STORAGE_TOOL:
                 execution = run_agent_load_file_from_storage_tool_call(
-                    settings,
-                    tool_call,
+                    settings, tool_call,
                     estimate_context_tokens=estimate_loaded_context_tokens,
                 )
-                tool_output = execution.output
-                readfile_contexts = execution.readfile_contexts
             elif tool_call.tool == AGENT_META_TASK_LIST_TOOL:
                 arguments = tool_call.arguments
                 if not isinstance(arguments, dict):
-                    tool_output = "ERROR: Task list tool received no operations."
+                    execution = AgentToolExecution(
+                        "ERROR: Task list tool received no operations."
+                    )
                 else:
                     execution = run_agent_meta_task_list_tool(
-                        settings,
-                        meta_task_list,
-                        arguments.get("operations"),
+                        settings, state.meta_task_list, arguments.get("operations")
                     )
-                    tool_output = execution.output
-                    if execution.meta_task_list is not None:
-                        meta_task_list = list(execution.meta_task_list)
             elif tool_call.tool == AGENT_PATCH_TOOL:
                 manifest = tool_call.arguments
                 if manifest is None:
-                    tool_output = "ERROR: Patch tool received no manifest."
+                    execution = AgentToolExecution(
+                        "ERROR: Patch tool received no manifest."
+                    )
                 else:
                     execution = run_agent_patch_tool(
-                        settings,
-                        manifest,
-                        model_result.turn_dir,
-                        turn_task,
+                        settings, manifest, model_result.turn_dir, turn_task,
                         tool_call_index=tool_call_index,
                         estimate_context_tokens=estimate_loaded_context_tokens,
-                    )
-                    tool_output = execution.output
-                    readfile_contexts = execution.readfile_contexts
-                    tool_revision_instruction = (
-                        execution.revision_instruction or ""
                     )
             elif tool_call.tool == AGENT_SHELL_TOOL:
                 arguments = tool_call.arguments
                 if arguments is None:
-                    tool_output = "ERROR: Shell tool received no command manifest."
+                    execution = AgentToolExecution(
+                        "ERROR: Shell tool received no command manifest."
+                    )
                 else:
                     try:
                         commands = _parse_shell_manifest_value(arguments)
                     except ValueError as exc:
-                        tool_output = (
+                        execution = AgentToolExecution(
                             f"ERROR: Shell tool received invalid commands: {exc}"
                         )
                     else:
                         execution = run_agent_shell_tool(
-                            settings,
-                            commands,
-                            model_result.turn_dir,
-                            turn_task,
+                            settings, commands, model_result.turn_dir, turn_task,
                             tool_call_index=tool_call_index,
-                        )
-                        tool_output = execution.output
-                        tool_revision_instruction = (
-                            execution.revision_instruction or ""
                         )
             elif tool_call.tool == AGENT_AGENT_TOOL:
                 if tool_call.profile_name:
                     execution = run_agent_profile_tool(
-                        settings,
-                        tool_call.profile_name,
-                        tool_call.task,
-                        tool_context,
-                        reasoning_items=reasoning_items,
+                        settings, tool_call.profile_name, tool_call.task,
+                        tool_context, reasoning_items=reasoning_items,
                     )
-                    tool_output = execution.output
                     reasoning_items = execution.reasoning_items
                 else:
-                    active_task = tool_call.task
-                    if settings.task_file_prompt is not None:
-                        settings.task_file_prompt.text = active_task
-                    active_context = tool_call.context
-                    context_summary.active_context_checksum = ""
-                    tool_output = (
+                    execution = AgentToolExecution(
                         "Started the requested agent task for the next turn."
                     )
             else:
                 continue
-            if tool_output.startswith("ERROR:"):
-                print(tool_output, file=sys.stderr)
-            if readfile_contexts is not None:
-                refreshed_paths = {path for path, _ in readfile_contexts}
-                file_contexts[:] = [
-                    context for context in file_contexts
-                    if context[0] not in refreshed_paths
-                ]
-                for path in refreshed_paths:
-                    file_expires_in_turns.pop(path, None)
-                pinned_paths.difference_update(refreshed_paths)
-                readfile_contexts_for_turn = (
-                    (readfile_contexts_for_turn or ()) + readfile_contexts
-                )
-            record_agent_tool_history(
-                turns,
-                turn_task,
-                tool_context,
-                tool_call,
-                tool_output,
-                turn_unix_time=model_result.turn_unix_time,
+            execution = apply_agent_tool_result(
+                state, tool_call, execution,
                 state_turn=int(model_result.turn_dir.name),
                 tool_call_index=tool_call_index,
-                readfile_contexts=readfile_contexts,
+                turn_unix_time=model_result.turn_unix_time,
             )
+            tool_output = execution.output
+            if (
+                tool_call.tool == AGENT_AGENT_TOOL
+                and not tool_call.profile_name
+                and tool_output
+                and not tool_output.startswith("ERROR:")
+                and settings.task_file_prompt is not None
+            ):
+                settings.task_file_prompt.text = state.active_task
+            if tool_call.tool in (AGENT_PATCH_TOOL, AGENT_SHELL_TOOL):
+                tool_revision_instruction = execution.revision_instruction or ""
+            if tool_output.startswith("ERROR:"):
+                print(tool_output, file=sys.stderr)
+            if execution.readfile_contexts is not None:
+                readfile_contexts_for_turn = (
+                    (readfile_contexts_for_turn or ()) + execution.readfile_contexts
+                )
             tool_outputs.append(tool_output)
             settings.context = current_file_context()
             if tool_revision_instruction:
@@ -14003,6 +14050,15 @@ def run_agent_controller(
                 log_outputs=tool_call_index + 1 == len(tool_calls)
             ):
                 return 1
+            if tool_call.tool == AGENT_SESSION_TOOL:
+                return emit_response_output(
+                    "" if settings.agent_auto else tool_call.reason,
+                    reasoning=model_result.reasoning,
+                    print_reasoning=settings.print_reasoning,
+                    skip_empty=True,
+                    suppress_response_output=settings.suppress_response_output,
+                    append_output=settings.agent_auto,
+                )
         try:
             model_result = request_next(tool_revision_instruction)
         except Exception as exc:
@@ -14234,180 +14290,6 @@ def create_openai_client(
         raise
 
 
-def call_openai(
-    api_key: str = "",
-    openai_base_url: str = "",
-    openai_proxy: str = "",
-    openai_organization: str = "",
-    openai_project: str = "",
-    model: str = "",
-    system_prompt: str = "",
-    user_prompt: str = "",
-    response_format: str = "text",
-    json_schema: dict[str, Any] | None = None,
-    response_verbosity: str | None = None,
-    temperature: float | None = None,
-    top_p: float | None = None,
-    max_output_tokens: int | None = None,
-    openai_service_tier: str | None = None,
-    openai_reasoning: str | None = None,
-    reasoning_mode: str | None = None,
-    extra_body: dict[str, Any] | None = None,
-    llm_timeout: int | None = None,
-    retry: int = DEFAULT_CONFIG["retry"],
-    safety_identifier: str | None = None,
-    store: bool = True,
-    stream: bool = False,
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
-    parallel_tool_calls: bool | None = None,
-    error_logger: Any = None,
-    request_logger: Callable[[str], None] | None = None,
-    response_logger: Callable[[str, str], None] | None = None,
-    explicit_prompt_cache: bool = False,
-    request_timer: ModelRequestTimer | None = None,
-    reasoning_items: tuple[dict[str, Any], ...] | None = None,
-    report_errors: bool = True,
-    image_urls: tuple[str, ...] = (),
-) -> tuple[Any, dict[str, Any] | None]:
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "instructions": system_prompt,
-        "input": user_prompt,
-        "extra_body": extra_body or {},
-        "store": store,
-    }
-
-    if reasoning_items is not None:
-        kwargs["include"] = ["reasoning.encrypted_content"]
-    if reasoning_items or image_urls:
-        user_content: str | list[dict[str, Any]] = user_prompt
-        if image_urls:
-            user_content = [{"type": "input_text", "text": user_prompt}]
-            user_content.extend(
-                {"type": "input_image", "detail": "original", "image_url": image_url}
-                for image_url in image_urls
-            )
-        kwargs["input"] = [
-            *(reasoning_items or ()),
-            {"role": "user", "content": user_content},
-        ]
-
-    if explicit_prompt_cache:
-        kwargs["prompt_cache_options"] = {"mode": "explicit"}
-
-    if tools is not None:
-        if not tools:
-            raise ValueError("tools must be a non-empty array")
-        kwargs["tools"] = tools
-    if tool_choice is not None:
-        if not tools:
-            raise ValueError("tool_choice requires tools")
-        kwargs["tool_choice"] = tool_choice
-    if parallel_tool_calls is not None:
-        if not tools:
-            raise ValueError("parallel_tool_calls requires tools")
-        kwargs["parallel_tool_calls"] = parallel_tool_calls
-
-    if safety_identifier is not None and str(safety_identifier).strip():
-        kwargs["safety_identifier"] = str(safety_identifier).strip()
-
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
-    if top_p is not None:
-        kwargs["top_p"] = top_p
-
-    if openai_reasoning is not None and str(openai_reasoning).strip().lower() != "off":
-        reasoning_payload: dict[str, Any] = {
-            "effort": openai_reasoning,
-            "summary": "detailed",
-        }
-        if reasoning_mode is not None:
-            reasoning_payload["mode"] = reasoning_mode
-        kwargs["reasoning"] = reasoning_payload
-
-    if max_output_tokens is not None:
-        kwargs["max_output_tokens"] = max_output_tokens
-
-    if openai_service_tier and str(openai_service_tier).lower() != "off":
-        kwargs["service_tier"] = openai_service_tier
-
-    text_payload: dict[str, Any] = {"format": {"type": "text"}}
-    if response_format == "json":
-        text_payload["format"] = {"type": "json_object"}
-    elif response_format == "schema":
-        if not json_schema:
-            raise ValueError("--response-format schema requires --schema-file")
-        text_payload["format"] = json_schema
-
-    if response_verbosity and response_verbosity != "off":
-        text_payload["verbosity"] = response_verbosity
-    kwargs["text"] = text_payload
-
-    if stream and response_format != "text":
-        raise ValueError("Streaming is only supported for text responses")
-    if stream:
-        kwargs["stream"] = True
-
-    request_tools = kwargs["extra_body"].get("tools", kwargs.get("tools"))
-    if request_tools is not None and request_logger is not None:
-        request_logger(f"{format_tools_context(request_tools)}\n")
-
-    if DEBUG:
-        print("<debug_request>", file=sys.stderr)
-        print(json.dumps(kwargs, indent=2), file=sys.stderr)
-        print("</debug_request>", file=sys.stderr)
-
-    @contextmanager
-    def request_response() -> Iterator[Any]:
-        with create_openai_client(
-            api_key=api_key,
-            openai_base_url=openai_base_url,
-            openai_proxy=openai_proxy,
-            openai_organization=openai_organization,
-            openai_project=openai_project,
-            llm_timeout=llm_timeout,
-        ) as client:
-            def create_response() -> Any:
-                if request_timer is not None:
-                    request_timer.reset()
-                response = client.responses.create(**kwargs)
-                if not stream:
-                    if request_timer is not None:
-                        request_timer.record_response(response)
-                    if response_logger is not None:
-                        response_logger(
-                            response_log_text(response),
-                            response_reasoning_text(response),
-                        )
-                    validate_model_response(response)
-                return response
-
-            response = execute_openai_request(
-                create_response,
-                retry=retry,
-                operation_name="API request",
-                error_logger=error_logger,
-                report_errors=report_errors,
-            )
-            try:
-                yield response
-            finally:
-                if stream:
-                    response.close()
-
-    if stream:
-        def response_events() -> Iterator[Any]:
-            with request_response() as response:
-                yield from response
-
-        return response_events(), None
-
-    with request_response() as response:
-        return response, usage_to_dict(response_field(response, "usage"))
-
-
 def call_model(
     settings: ModelSettings,
     system_prompt: str,
@@ -14428,42 +14310,142 @@ def call_model(
     report_errors: bool = True,
     image_urls: tuple[str, ...] = (),
 ) -> tuple[Any, dict[str, Any] | None]:
-    return call_openai(
-        api_key=settings.api_key,
-        openai_base_url=settings.openai_base_url,
-        openai_proxy=settings.openai_proxy,
-        openai_organization=settings.openai_organization,
-        openai_project=settings.openai_project,
-        model=settings.model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        image_urls=image_urls,
-        response_format=response_format,
-        json_schema=json_schema,
-        response_verbosity=settings.response_verbosity,
-        temperature=settings.temperature,
-        top_p=settings.top_p,
-        max_output_tokens=settings.max_output_tokens,
-        openai_service_tier=settings.openai_service_tier,
-        openai_reasoning=settings.openai_reasoning,
-        reasoning_mode=settings.reasoning_mode,
-        explicit_prompt_cache=settings.explicit_prompt_cache,
-        extra_body=settings.extra_body,
-        llm_timeout=settings.llm_timeout,
-        retry=settings.retry if retry is None else retry,
-        safety_identifier=settings.safety_identifier,
-        store=settings.api_log,
-        stream=stream,
-        tools=tools,
-        tool_choice=tool_choice,
-        parallel_tool_calls=parallel_tool_calls,
-        error_logger=error_logger,
-        request_logger=request_logger,
-        response_logger=response_logger,
-        request_timer=request_timer,
-        reasoning_items=reasoning_items,
-        report_errors=report_errors,
-    )
+    kwargs: dict[str, Any] = {
+        "model": settings.model,
+        "instructions": system_prompt,
+        "input": user_prompt,
+        "extra_body": settings.extra_body or {},
+        "store": settings.api_log,
+    }
+
+    if reasoning_items is not None:
+        kwargs["include"] = ["reasoning.encrypted_content"]
+    if reasoning_items or image_urls:
+        user_content: str | list[dict[str, Any]] = user_prompt
+        if image_urls:
+            user_content = [{"type": "input_text", "text": user_prompt}]
+            user_content.extend(
+                {"type": "input_image", "detail": "original", "image_url": image_url}
+                for image_url in image_urls
+            )
+        kwargs["input"] = [
+            *(reasoning_items or ()),
+            {"role": "user", "content": user_content},
+        ]
+
+    if settings.explicit_prompt_cache:
+        kwargs["prompt_cache_options"] = {"mode": "explicit"}
+
+    if tools is not None:
+        if not tools:
+            raise ValueError("tools must be a non-empty array")
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        if not tools:
+            raise ValueError("tool_choice requires tools")
+        kwargs["tool_choice"] = tool_choice
+    if parallel_tool_calls is not None:
+        if not tools:
+            raise ValueError("parallel_tool_calls requires tools")
+        kwargs["parallel_tool_calls"] = parallel_tool_calls
+
+    if settings.safety_identifier is not None and str(settings.safety_identifier).strip():
+        kwargs["safety_identifier"] = str(settings.safety_identifier).strip()
+    if settings.temperature is not None:
+        kwargs["temperature"] = settings.temperature
+    if settings.top_p is not None:
+        kwargs["top_p"] = settings.top_p
+    if (
+        settings.openai_reasoning is not None
+        and str(settings.openai_reasoning).strip().lower() != "off"
+    ):
+        reasoning_payload: dict[str, Any] = {
+            "effort": settings.openai_reasoning,
+            "summary": "detailed",
+        }
+        if settings.reasoning_mode is not None:
+            reasoning_payload["mode"] = settings.reasoning_mode
+        kwargs["reasoning"] = reasoning_payload
+    if settings.max_output_tokens is not None:
+        kwargs["max_output_tokens"] = settings.max_output_tokens
+    if (
+        settings.openai_service_tier
+        and str(settings.openai_service_tier).lower() != "off"
+    ):
+        kwargs["service_tier"] = settings.openai_service_tier
+
+    text_payload: dict[str, Any] = {"format": {"type": "text"}}
+    if response_format == "json":
+        text_payload["format"] = {"type": "json_object"}
+    elif response_format == "schema":
+        if not json_schema:
+            raise ValueError("--response-format schema requires --schema-file")
+        text_payload["format"] = json_schema
+    if settings.response_verbosity and settings.response_verbosity != "off":
+        text_payload["verbosity"] = settings.response_verbosity
+    kwargs["text"] = text_payload
+
+    if stream and response_format != "text":
+        raise ValueError("Streaming is only supported for text responses")
+    if stream:
+        kwargs["stream"] = True
+
+    request_tools = kwargs["extra_body"].get("tools", kwargs.get("tools"))
+    if request_tools is not None and request_logger is not None:
+        request_logger(f"{format_tools_context(request_tools)}\n")
+
+    if DEBUG:
+        print("<debug_request>", file=sys.stderr)
+        print(json.dumps(kwargs, indent=2), file=sys.stderr)
+        print("</debug_request>", file=sys.stderr)
+
+    @contextmanager
+    def request_response() -> Iterator[Any]:
+        with create_openai_client(
+            api_key=settings.api_key,
+            openai_base_url=settings.openai_base_url,
+            openai_proxy=settings.openai_proxy,
+            openai_organization=settings.openai_organization,
+            openai_project=settings.openai_project,
+            llm_timeout=settings.llm_timeout,
+        ) as client:
+            def create_response() -> Any:
+                if request_timer is not None:
+                    request_timer.reset()
+                response = client.responses.create(**kwargs)
+                if not stream:
+                    if request_timer is not None:
+                        request_timer.record_response(response)
+                    if response_logger is not None:
+                        response_logger(
+                            response_log_text(response),
+                            response_reasoning_text(response),
+                        )
+                    validate_model_response(response)
+                return response
+
+            response = execute_openai_request(
+                create_response,
+                retry=settings.retry if retry is None else retry,
+                operation_name="API request",
+                error_logger=error_logger,
+                report_errors=report_errors,
+            )
+            try:
+                yield response
+            finally:
+                if stream:
+                    response.close()
+
+    if stream:
+        def response_events() -> Iterator[Any]:
+            with request_response() as response:
+                yield from response
+
+        return response_events(), None
+
+    with request_response() as response:
+        return response, usage_to_dict(response_field(response, "usage"))
 
 
 def consume_response_stream(
@@ -14949,10 +14931,9 @@ def run_tree_mode(
         with log_lock:
             append_session_log(log_path, text, log_enabled)
     def save_tree_state_turn(
-        system_prompt: str,
+        request: RecordedModelTurn,
         task: str,
-        user_prompt: str,
-        reasoning: str,
+        response_obj: Any,
         response: str,
         error: str | None,
     ) -> None:
@@ -14960,21 +14941,14 @@ def run_tree_mode(
         with state_turn_lock:
             turn = next_state_turn
             next_state_turn += 1
-            turn_dir = start_state_turn(
-                state_session_dir,
-                turn,
-                system_prompt,
-                task,
-                file_paths=file_paths,
-                user_prompt=user_prompt,
-            )
+            request.start_state(state_session_dir, turn, task, file_paths)
             if error is not None:
-                append_state_response_error(turn_dir, error)
+                request.record_error(error)
                 return
             try:
-                complete_state_turn(turn_dir, reasoning, response)
+                request.complete(response_obj, response)
             except Exception as exc:
-                append_state_response_error(turn_dir, exc)
+                request.record_error(exc)
                 raise
 
     state_db_path = str(tree_session_dir / f"{tree_session_stem}.dbm")
@@ -15081,19 +15055,12 @@ def run_tree_mode(
         relative_path = relative_paths[file_path]
         rel_str = relative_path.as_posix()
         output_path = tree_session_dir / relative_path
-        request_characters = 0
-        request_tokens = 0
-        full_system_prompt = ""
-        user_prompt = ""
         result = ""
         reasoning = ""
+        response_obj: Any = None
         error_text: str | None = None
         error_type: str = "none"
         selected_task = task
-        request_timer = ModelRequestTimer()
-        stats_prefix = (
-            f"request_type=tree tree_file={quote_tag_attribute(file_path)}"
-        )
 
         def append_file_log(text: str) -> None:
             append_tree_log(
@@ -15106,91 +15073,65 @@ def run_tree_mode(
             reasoning = response_reasoning
             append_file_log(format_model_response_log(text, response_reasoning))
 
+        request = RecordedModelTurn(
+            ModelRequestSettings(model_settings, token_limit, token_cost),
+            cumulative_stats,
+            append_file_log,
+            prefix=f"request_type=tree tree_file={quote_tag_attribute(file_path)}",
+        )
         if agent_backup is not None:
             with state_turn_lock:
                 agent_backup.run_if_due()
-        try:
-            (
-                selected_task, full_system_prompt, user_prompt,
-            ) = build_tree_request_prompts(
-                file_path=file_path,
-                task=task,
-                tree_task_prompts=tree_task_prompts,
-                tree_system_prompts=tree_system_prompts,
-                system_prompt=system_prompt,
-                linenum_system_prompt=linenum_system_prompt,
-                add_line_numbers=add_line_numbers,
-                max_file_size_kb=max_file_size_kb,
-                model=model,
-                response_format=response_format,
-                json_schema=json_schema,
-            )
-            request_tokens = estimate_request_tokens(
-                model=model,
-                system_prompt=full_system_prompt,
-                user_prompt=user_prompt,
-            )
-            request_text = format_request_text(full_system_prompt, user_prompt)
-            request_characters = len(request_text)
-            if request_tokens > token_limit:
-                raise ValueError(
-                    f"Estimated input token count ({request_tokens}) exceeds token limit ({token_limit})"
+        with request.record():
+            try:
+                (
+                    selected_task, full_system_prompt, user_prompt,
+                ) = build_tree_request_prompts(
+                    file_path=file_path,
+                    task=task,
+                    tree_task_prompts=tree_task_prompts,
+                    tree_system_prompts=tree_system_prompts,
+                    system_prompt=system_prompt,
+                    linenum_system_prompt=linenum_system_prompt,
+                    add_line_numbers=add_line_numbers,
+                    max_file_size_kb=max_file_size_kb,
+                    model=model,
+                    response_format=response_format,
+                    json_schema=json_schema,
                 )
-            emit_stats(
-                format_request_stats(
-                    request_characters=request_characters,
-                    request_tokens=request_tokens,
-                    token_cost=token_cost,
-                    model_settings=model_settings,
-                    prefix=stats_prefix,
-                ),
-                append_file_log,
-                "request_stats",
-            )
-            append_file_log(f"<request>\n{request_text}\n</request>\n")
-            response_obj, _ = call_model(
-                model_settings,
-                full_system_prompt,
-                user_prompt,
-                image_urls=image_urls,
-                response_format=response_format,
-                json_schema=json_schema,
-                retry=0,
-                report_errors=False,
-                request_timer=request_timer,
-                request_logger=append_file_log,
-                response_logger=log_response,
-            )
-            result = response_output_text(response_obj)
-            if not result.strip():
-                error_text = "LLM returned an empty response"
-                error_type = "temp"
-            if response_format in ("json", "schema") and result.strip():
-                try:
-                    result = json.dumps(
-                        parse_json_response(result, model_settings.response_json_repair),
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                except (ValueError, TypeError) as exc:
-                    error_text = f"Failed to parse JSON response: {exc}"
+                request.prepare(full_system_prompt, user_prompt)
+                request.check_token_limit()
+                request.log_request()
+                response_obj, result = request.call(
+                    image_urls=image_urls,
+                    response_format=response_format,
+                    json_schema=json_schema,
+                    retry=0,
+                    report_errors=False,
+                    response_logger=log_response,
+                )
+                if not result.strip():
+                    error_text = "LLM returned an empty response"
                     error_type = "temp"
-        except BaseException as exc:
-            error_text = format_exception_message(exc, include_type=True)
-            if _is_openai_perm_error(exc):
-                error_type = "perm"
-            elif _is_openai_temp_error(exc):
-                error_type = "temp"
-            else:
-                error_type = "perm"
-        statsline = record_response_stats(
-            request_timer,
-            cumulative_stats,
-            request_characters=request_characters,
-            request_tokens=request_tokens,
-            token_cost=token_cost,
-            prefix=stats_prefix,
-        )
+                if response_format in ("json", "schema") and result.strip():
+                    try:
+                        result = json.dumps(
+                            parse_json_response(result, model_settings.response_json_repair),
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    except (ValueError, TypeError) as exc:
+                        error_text = f"Failed to parse JSON response: {exc}"
+                        error_type = "temp"
+            except BaseException as exc:
+                error_text = format_exception_message(exc, include_type=True)
+                if _is_openai_perm_error(exc):
+                    error_type = "perm"
+                elif _is_openai_temp_error(exc):
+                    error_type = "temp"
+                else:
+                    error_type = "perm"
+        statsline = request.response_stats
         stored_result = result
         if not stored_result:
             stored_result = f"ERROR: {error_text}" if error_text else ""
@@ -15205,10 +15146,9 @@ def run_tree_mode(
                 error_text = output_error
             error_type = "perm"
         save_tree_state_turn(
-            system_prompt=full_system_prompt,
+            request=request,
             task=selected_task,
-            user_prompt=user_prompt,
-            reasoning=reasoning,
+            response_obj=response_obj,
             response=result,
             error=(
                 f"{file_path}: {error_text}"
@@ -15339,10 +15279,44 @@ def run_tree_mode(
 # CLI
 # -------------------------------------------------------------------
 
+CLI_COMPATIBILITY_OPTIONS: dict[str, tuple[str, bool]] = {
+    "--reuse-session": ("--resume-session", True),
+    "--reuse-session-skip-verify": ("--resume-session-skip-verify", True),
+    "--tree-reuse-session": ("--resume-session", True),
+    "--patch-view": ("--patch-file-print", True),
+    "--contain-networking": ("--shell-networking", False),
+    "--openai-base-url": ("--base-url", False),
+    "--openai-proxy": ("--proxy-server", False),
+    "--openai-organization": ("--meta-organization", False),
+    "--openai-project": ("--meta-project", False),
+    "--openai-service-tier": ("--service-tier", False),
+    "--openai-reasoning": ("--reasoning", False),
+    "--openai-extra-body": ("--extra-body", False),
+    "--show-profiles": ("--print-profiles", False),
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="mce: Minimal Context Engine"
     )
+    registered_arguments: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    def register_argument(container: Any, *names: str, **options: Any) -> None:
+        action = container.add_argument(*names, **options)
+        for name in names:
+            registered_arguments[name] = (action.dest, options)
+
+    def add_legacy_argument(container: Any, name: str, **overrides: Any) -> None:
+        canonical_name, _ = CLI_COMPATIBILITY_OPTIONS[name]
+        destination, options = registered_arguments[canonical_name]
+        container.add_argument(name, **{
+            **options,
+            "dest": destination,
+            "help": argparse.SUPPRESS,
+            "default": argparse.SUPPRESS,
+            **overrides,
+        })
 
     parser.add_argument(
         "--chdir",
@@ -15603,7 +15577,8 @@ def parse_args() -> argparse.Namespace:
         help="Timeout for shell commands in seconds (0 to disable; default: disabled)",
     )
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--shell-networking",
         nargs="?",
         const=True,
@@ -15622,16 +15597,7 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
 
-    parser.add_argument(
-        "--contain-networking",
-        dest="shell_networking",
-        nargs="?",
-        const=True,
-        default=argparse.SUPPRESS,
-        type=parse_bool,
-        metavar="BOOL",
-        help=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--contain-networking")
 
     parser.add_argument(
         "--patch",
@@ -15716,14 +15682,16 @@ def parse_args() -> argparse.Namespace:
         help="Apply a saved patch file from a session (with optional TURN) or JSON patch file",
     )
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--patch-file-print",
         nargs="+",
         metavar=("SESSION|PATH", "TURN"),
         help="Print the diff from a session (with optional TURN) or JSON patch file",
     )
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "-R",
         "--resume-session",
         nargs="+",
@@ -15735,28 +15703,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument(
-        "--reuse-session",
-        dest="resume_session",
-        nargs="+",
-        metavar=("SESSION_NAME", "TURN"),
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--reuse-session")
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--resume-session-skip-verify",
         action="store_true",
         help="Skip checksum verification when resuming a session",
     )
 
-    parser.add_argument(
-        "--reuse-session-skip-verify",
-        dest="resume_session_skip_verify",
-        action="store_true",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--reuse-session-skip-verify")
 
     tree_files_group = parser.add_mutually_exclusive_group()
     tree_files_group.add_argument(
@@ -15841,12 +15797,8 @@ def parse_args() -> argparse.Namespace:
         help="Maximum parallel tree calls (default: 16)",
     )
 
-    parser.add_argument(
-        "--tree-reuse-session",
-        dest="resume_session",
-        metavar="NAME",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
+    add_legacy_argument(
+        parser, "--tree-reuse-session", nargs=None, metavar="NAME"
     )
 
     sys_prompt_group = parser.add_mutually_exclusive_group()
@@ -15924,80 +15876,55 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--base-url",
         dest="base_url",
         metavar="URL",
         help="OpenAI-compatible API base URL",
     )
 
-    parser.add_argument(
-        "--openai-base-url",
-        dest="base_url",
-        metavar="URL",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--openai-base-url")
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--proxy-server",
         dest="proxy_server",
         metavar="URL",
         help="HTTP(S) proxy URL (eg: http://user:pass@proxy:8080)",
     )
 
-    parser.add_argument(
-        "--openai-proxy",
-        dest="proxy_server",
-        metavar="URL",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--openai-proxy")
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--meta-organization",
         dest="meta_organization",
         metavar="TEXT",
         help="Optional organization ID",
     )
 
-    parser.add_argument(
-        "--openai-organization",
-        dest="meta_organization",
-        metavar="TEXT",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--openai-organization")
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--meta-project",
         dest="meta_project",
         metavar="TEXT",
         help="Optional project name or ID",
     )
 
-    parser.add_argument(
-        "--openai-project",
-        dest="meta_project",
-        metavar="TEXT",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--openai-project")
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--service-tier",
         dest="service_tier",
         choices=CONFIG_VALUE_CHOICES["service_tier"],
         help="Service tier",
     )
 
-    parser.add_argument(
-        "--openai-service-tier",
-        dest="service_tier",
-        choices=CONFIG_VALUE_CHOICES["service_tier"],
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--openai-service-tier")
 
     parser.add_argument(
         "--response-format",
@@ -16063,20 +15990,15 @@ def parse_args() -> argparse.Namespace:
         help="Top-p nucleus sampling (0.0-1.0) or 'off' to disable",
     )
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--reasoning",
         dest="reasoning",
         choices=CONFIG_VALUE_CHOICES["reasoning"],
         help="Reasoning effort level (off to disable)",
     )
 
-    parser.add_argument(
-        "--openai-reasoning",
-        dest="reasoning",
-        choices=CONFIG_VALUE_CHOICES["reasoning"],
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(parser, "--openai-reasoning")
 
     parser.add_argument(
         "--reasoning-mode",
@@ -16085,19 +16007,16 @@ def parse_args() -> argparse.Namespace:
         help="Reasoning mode (standard or pro)",
     )
 
-    parser.add_argument(
+    register_argument(
+        parser,
         "--extra-body",
         dest="extra_body",
         metavar="PARAMETERS",
         help="Custom model parameters as key=value pairs or a JSON object",
     )
 
-    parser.add_argument(
-        "--openai-extra-body",
-        dest="extra_body",
-        metavar="KEY=VALUE[,KEY=VALUE,...]",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
+    add_legacy_argument(
+        parser, "--openai-extra-body", metavar="KEY=VALUE[,KEY=VALUE,...]"
     )
 
     parser.add_argument(
@@ -16305,7 +16224,8 @@ def parse_args() -> argparse.Namespace:
         help="Create a new configuration profile inheriting the current profile",
     )
 
-    profile_action_group.add_argument(
+    register_argument(
+        profile_action_group,
         "--print-profiles",
         nargs="*",
         metavar="NAME",
@@ -16319,14 +16239,7 @@ def parse_args() -> argparse.Namespace:
         help="Display all configuration profiles or only the named profiles as a JSON object keyed by name",
     )
 
-    profile_action_group.add_argument(
-        "--show-profiles",
-        nargs="*",
-        metavar="NAME",
-        dest="print_profiles",
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(profile_action_group, "--show-profiles")
 
     profile_action_group.add_argument(
         "--prompt-list",
@@ -16475,14 +16388,7 @@ def parse_args() -> argparse.Namespace:
         help="Display a saved log session",
     )
 
-    session_view_group.add_argument(
-        "--patch-view",
-        dest="patch_file_print",
-        nargs="+",
-        metavar=("SESSION|PATH", "TURN"),
-        help=argparse.SUPPRESS,
-        default=argparse.SUPPRESS,
-    )
+    add_legacy_argument(session_view_group, "--patch-view")
 
     session_view_group.add_argument(
         "--tree-view",
@@ -16553,16 +16459,9 @@ def parse_args() -> argparse.Namespace:
             "WARNING: --system-prompt-with-task is deprecated and has no effect.",
             file=sys.stderr,
         )
-    for deprecated, replacement in (
-        ("--reuse-session", "--resume-session"),
-        ("--reuse-session-skip-verify", "--resume-session-skip-verify"),
-        ("--tree-reuse-session", "--resume-session"),
-        ("--patch-view", "--patch-file-print"),
-    ):
-        if any(
-            argument.split("=", 1)[0] == deprecated
-            for argument in sys.argv[1:]
-        ):
+    used_options = {argument.split("=", 1)[0] for argument in sys.argv[1:]}
+    for deprecated, (replacement, warn) in CLI_COMPATIBILITY_OPTIONS.items():
+        if warn and deprecated in used_options:
             print(
                 f"WARNING: {deprecated} is deprecated; use {replacement} instead.",
                 file=sys.stderr,
@@ -17061,12 +16960,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         name, source_profile = args.set_config_from
         try:
             name = name.strip()
-            if not name:
-                raise ValueError("configuration name cannot be empty")
-            if name == INHERIT_PROFILE_CONFIG_KEY:
-                raise ValueError(
-                    f"{INHERIT_PROFILE_CONFIG_KEY} is managed by --inherit-profile"
-                )
+            canonical_name = canonical_config_assignment_name(name)
             source_profile = validate_prompt_profile_name(source_profile)
             source_path = get_profile_path(source_profile)
             source_config = read_config_document(source_path)
@@ -17074,21 +16968,17 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 source_config = merged_config(source_path)
             if name in source_config:
                 value = source_config[name]
+            elif canonical_name in source_config:
+                value = source_config[canonical_name]
             else:
-                replacement = DEPRECATED_CONFIG_KEYS.get(name)
-                if replacement is None or replacement not in source_config:
-                    raise ValueError(
-                        f"configuration value '{name}' does not exist in "
-                        f"profile '{source_profile}'"
-                    )
-                value = source_config[replacement]
-
+                raise ValueError(
+                    f"configuration value '{name}' does not exist in "
+                    f"profile '{source_profile}'"
+                )
             config = load_config()
-            config[name] = value
-            replacement = DEPRECATED_CONFIG_KEYS.get(name)
-            if replacement is not None:
-                config[replacement] = value
-            save_config(config)
+            save_config(update_config_document(
+                config, [ConfigAssignment(canonical_name, value)]
+            ))
         except Exception as exc:
             print(
                 f"ERROR: Failed to set configuration from profile: {exc}",
@@ -17103,63 +16993,20 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             ensure_writable_config_path(CONFIG_FILE)
             raw_config = read_config_document(CONFIG_FILE, missing_ok=True)
             inherited_parent = _inherit_profile_name(raw_config, CONFIG_FILE)
-            updates: list[tuple[str, Any, bool]] = []
-            for assignment in args.set_config:
-                if inherited_parent is not None and "=" in assignment:
-                    raw_name, raw_value = assignment.split("=", 1)
-                    name = raw_name.strip()
-                    if raw_value.strip() == "DEFAULT":
-                        if not name:
-                            raise ValueError(
-                                "configuration name cannot be empty"
-                            )
-                        canonical_name = DEPRECATED_CONFIG_KEYS.get(name) or name
-                        if canonical_name == INHERIT_PROFILE_CONFIG_KEY:
-                            raise ValueError(
-                                f"{INHERIT_PROFILE_CONFIG_KEY} is managed by "
-                                "--inherit-profile"
-                            )
-                        if name in DEPRECATED_CONFIG_KEYS and name not in config:
-                            raise ValueError(
-                                f"{name} is deprecated and is not present in the config"
-                            )
-                        if (
-                            name not in config
-                            and canonical_name not in config
-                        ):
-                            raise ValueError(
-                                f"{name} has no built-in default value"
-                            )
-                        updates.append((name, None, True))
-                        continue
-                name, value = parse_config_assignment(assignment, config)
-                updates.append((name, value, False))
+            assignments = [
+                parse_config_assignment(
+                    assignment, config,
+                    inherited_defaults=inherited_parent is not None,
+                )
+                for assignment in args.set_config
+            ]
         except ValueError as exc:
             print(f"ERROR: Invalid config assignment: {exc}", file=sys.stderr)
             return 1
-
-        if inherited_parent is not None:
-            for name, value, remove_from_child in updates:
-                canonical_name = DEPRECATED_CONFIG_KEYS.get(name) or name
-                if remove_from_child:
-                    raw_config.pop(name, None)
-                    raw_config.pop(canonical_name, None)
-                    for deprecated, replacement in DEPRECATED_CONFIG_KEYS.items():
-                        if replacement == canonical_name:
-                            raw_config.pop(deprecated, None)
-                    continue
-                raw_config[name] = value
-                replacement = DEPRECATED_CONFIG_KEYS.get(name)
-                if replacement is not None:
-                    raw_config[replacement] = value
-            save_config(raw_config)
-        else:
-            for name, value, _ in updates:
-                config[name] = value
-                replacement = DEPRECATED_CONFIG_KEYS.get(name)
-                if replacement is not None:
-                    config[replacement] = value
-            save_config(config)
+        save_config(update_config_document(
+            raw_config if inherited_parent is not None else config,
+            assignments,
+        ))
         return 0
 
     if args.get_config is not None or args.get_config_detail is not None:
@@ -17931,34 +17778,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     cumulative_stats.log_path = log_path
     cumulative_stats.log_enabled = log_enabled
 
-    def log_model_request(
-        request_characters: int,
-        request_tokens: int,
-        request_text: str,
-        *,
-        turn: int | None = None,
-        prefix: str = "",
-        request_token_cost: tuple[float, float] | None = token_cost,
-    ) -> None:
-        emit_stats(
-            format_request_stats(
-                request_characters=request_characters,
-                request_tokens=request_tokens,
-                token_cost=request_token_cost,
-                model_settings=model_settings,
-                turn=turn,
-                prefix=prefix,
-            ),
-            append_log,
-            "request_stats",
-        )
-        append_log(f"<request>\n{request_text}\n</request>\n")
-
-    def log_model_response(
-        response_text: str,
-        reasoning: str,
-    ) -> None:
-        append_log(format_model_response_log(response_text, reasoning))
 
     def log_model_response_stats(statsline: str) -> None:
         timestamp = int(time.time())
@@ -18255,89 +18074,52 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         if args.estimate_only:
             print(plan_request_tokens)
             return 0
-        plan_request_text = format_request_text(
-            plan_full_system_prompt, plan_user_prompt
+        plan_request = RecordedModelTurn(
+            ModelRequestSettings(model_settings, token_limit, token_cost),
+            cumulative_stats,
+            append_log,
+            turn=state_turn,
+            prefix="request_type=plan",
+            response_tag="plan_response",
         )
-        plan_request_characters = len(plan_request_text)
-        if plan_request_tokens > token_limit:
-            print(f"ERROR: Estimated plan input token count ({plan_request_tokens}) exceeds token limit ({token_limit})", file=sys.stderr)
+        plan_request.prepare(
+            plan_full_system_prompt, plan_user_prompt,
+            request_tokens=plan_request_tokens,
+        )
+        try:
+            plan_request.check_token_limit("plan input")
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        plan_state_turn_path = start_state_turn(
-            state_session_dir,
-            state_turn,
-            plan_full_system_prompt,
-            task,
-            file_paths=file_paths,
+        plan_request.start_state(
+            state_session_dir, state_turn, task, file_paths,
             skip_missing_files=agent_mode,
-            user_prompt=plan_user_prompt,
         )
         append_log("<plan_request>\n")
-        emit_stats(
-            format_request_stats(
-                request_characters=plan_request_characters,
-                request_tokens=plan_request_tokens,
-                token_cost=token_cost,
-                model_settings=model_settings,
-                turn=state_turn,
-                prefix="request_type=plan",
-            ),
-            append_log,
-            "plan_request_stats",
-        )
-        append_log(
-            f"<request>\n{plan_request_text}\n</request>\n"
-            "</plan_request>\n"
-        )
-        plan_request_timer = ModelRequestTimer()
-        plan_response_obj: Any = None
+        plan_request.log_request("plan_request_stats")
+        append_log("</plan_request>\n")
         try:
-            plan_response_obj, _ = call_model(
-                model_settings,
-                plan_full_system_prompt,
-                plan_user_prompt,
-                image_urls=image_urls,
-                response_format="text",
-                error_logger=append_log,
-                request_timer=plan_request_timer,
-                request_logger=append_log,
-                response_logger=lambda response_text, reasoning: append_log(
-                    format_model_response_log(
-                        response_text, reasoning, "plan_response"
-                    )
-                ),
-                reasoning_items=reasoning_items,
-            )
-            plan_result = response_output_text(plan_response_obj).strip()
-            if not plan_result:
-                raise ModelResponseError("LLM returned an empty AI prompt plan")
-            plan_reasoning = response_reasoning_text(plan_response_obj)
-            reasoning_items = response_reasoning_encrypted_items(plan_response_obj)
-            complete_state_turn(
-                plan_state_turn_path, plan_reasoning, plan_result, reasoning_items
-            )
-            state_turn += 1
+            with plan_request.record():
+                plan_response_obj, plan_result = plan_request.call(
+                    image_urls=image_urls,
+                    response_format="text",
+                    error_logger=append_log,
+                    reasoning_items=reasoning_items,
+                )
+                plan_result = plan_result.strip()
+                if not plan_result:
+                    raise ModelResponseError("LLM returned an empty AI prompt plan")
+                _, reasoning_items = plan_request.complete(
+                    plan_response_obj, plan_result
+                )
+                state_turn += 1
         except Exception as exc:
-            append_state_response_error(plan_state_turn_path, exc)
-            append_log(
-                "<plan_response_error>\n"
-                f"{format_exception_message(exc)}\n"
-                "</plan_response_error>\n"
-            )
+            plan_request.record_error(exc)
             report_request_error(exc)
             return 1
         finally:
             emit_stats(
-                record_response_stats(
-                    plan_request_timer,
-                    cumulative_stats,
-                    request_characters=plan_request_characters,
-                    request_tokens=plan_request_tokens,
-                    token_cost=token_cost,
-                    turn=int(plan_state_turn_path.name),
-                    prefix="request_type=plan",
-                ),
-                append_log,
-                "plan_response_stats",
+                plan_request.response_stats, append_log, "plan_response_stats"
             )
         if args.noninteractive:
             return 0
@@ -18444,6 +18226,7 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             initial_tool_outputs=(
                 reused_agent_history.completed_tool_outputs
                 if reused_agent_history is not None
+                and reused_agent_history.pending_model_result is not None
                 and not task_supplied
                 and not plan_mode
                 else ()
@@ -18555,6 +18338,33 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
     stream_output_emitted = False
     response_obj: Any = None
 
+    def build_current_patch_changes(
+        manifest: Any,
+    ) -> tuple[dict[str, str], str, list[tuple[str, str]]]:
+        manifest = normalize_patch_manifest(
+            manifest, require_commit_message=patch_branch_mode
+        )
+        if patch_branch_mode:
+            if patch_repo_root is None or patch_branch_name is None:
+                raise ValueError("patch branch was not prepared")
+            for path, _ in patch_manifest_documents(manifest):
+                if str(path) in original_texts:
+                    continue
+                relative_path = git_relative_path(patch_repo_root, path)
+                branch_path = run_git_command(
+                    patch_repo_root,
+                    [
+                        "ls-tree", "--name-only", "-z",
+                        patch_branch_name, "--", relative_path,
+                    ],
+                ).stdout
+                if path.exists() or branch_path:
+                    raise ValueError(
+                        "existing patch branch targets must be included "
+                        f"in file context: {path}"
+                    )
+        return build_patch_changes(original_texts, manifest)
+
     def request_model_turn(
         request_system_prompt: str,
         request_user_prompt: str,
@@ -18568,21 +18378,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         nonlocal reasoning_items
         if agent_backup is not None:
             agent_backup.run_if_due()
-        if request_tokens is None:
-            request_tokens = estimate_request_tokens(
-                model=model,
-                system_prompt=request_system_prompt,
-                user_prompt=request_user_prompt,
-            )
-        request_text = format_request_text(
-            request_system_prompt, request_user_prompt
-        )
-        request_characters = len(request_text)
-        if request_tokens > token_limit:
-            raise ValueError(
-                f"Estimated input token count ({request_tokens}) exceeds "
-                f"token limit ({token_limit})"
-            )
         current_turn = state_turn if state_enabled else None
         stats_prefix = (
             "request_type=shell" if shell_mode
@@ -18590,165 +18385,104 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             else "request_type=ask" if ask_mode
             else "request_type=task"
         )
-        log_model_request(
-            request_characters=request_characters,
-            request_tokens=request_tokens,
-            request_text=request_text,
+        request = RecordedModelTurn(
+            ModelRequestSettings(model_settings, token_limit, token_cost),
+            cumulative_stats,
+            append_log,
             turn=current_turn,
             prefix=stats_prefix,
         )
-        request_timer = ModelRequestTimer()
-        request_state_path: Path | None = None
+        request.prepare(
+            request_system_prompt, request_user_prompt,
+            request_tokens=request_tokens,
+        )
+        request.check_token_limit()
+        request.log_request()
         if state_enabled:
-            request_state_path = start_state_turn(
-                state_session_dir,
-                state_turn,
-                request_system_prompt,
-                task,
-                file_paths=file_paths,
-                user_prompt=request_user_prompt,
+            request.start_state(
+                state_session_dir, state_turn, task, file_paths
             )
         stream_sink = None
         stream_output_emitted = False
         try:
-            if stream and not print_reasoning:
-                def emit_stream_text(delta: str) -> None:
-                    nonlocal stream_output_emitted
-                    if OUTPUT_FILE is not None:
-                        write_output_file(delta)
-                    else:
-                        sys.stdout.write(delta)
-                        sys.stdout.flush()
-                    stream_output_emitted = True
+            with request.record():
+                if stream and not print_reasoning:
+                    def emit_stream_text(delta: str) -> None:
+                        nonlocal stream_output_emitted
+                        if OUTPUT_FILE is not None:
+                            write_output_file(delta)
+                        else:
+                            sys.stdout.write(delta)
+                            sys.stdout.flush()
+                        stream_output_emitted = True
 
-                stream_sink = emit_stream_text
+                    stream_sink = emit_stream_text
 
-            def request_response() -> tuple[str, Any]:
-                response_obj, _ = call_model(
-                    model_settings,
-                    request_system_prompt,
-                    request_user_prompt,
-                    image_urls=image_urls,
-                    response_format=(
-                        response_format
-                        if response_format_override is None
-                        else response_format_override
-                    ),
-                    json_schema=(
-                        json_schema
-                        if response_format_override is None
-                        else json_schema_override
-                    ),
-                    stream=stream,
-                    retry=0,
-                    report_errors=False,
-                    request_timer=request_timer,
-                    request_logger=append_log,
-                    response_logger=log_model_response,
-                    reasoning_items=reasoning_items if state_enabled else None,
-                )
-                if stream:
-                    response, _, response_obj = consume_response_stream(
-                        response_obj,
-                        stream_sink,
-                        response_logger=log_model_response,
-                        request_timer=request_timer,
+                def request_response() -> tuple[str, Any]:
+                    response_obj, response = request.call(
+                        image_urls=image_urls,
+                        response_format=(
+                            response_format
+                            if response_format_override is None
+                            else response_format_override
+                        ),
+                        json_schema=(
+                            json_schema
+                            if response_format_override is None
+                            else json_schema_override
+                        ),
+                        stream=stream,
+                        retry=0,
+                        report_errors=False,
+                        reasoning_items=reasoning_items if state_enabled else None,
                     )
-                else:
-                    response = response_output_text(response_obj)
-                if not response.strip():
-                    raise ModelResponseError("LLM returned an empty response")
-                return response, response_obj
-
-            response, response_obj = execute_openai_request(
-                request_response,
-                retry=model_settings.retry,
-                operation_name="API request",
-                error_logger=append_log,
-                retry_if=lambda exc: (
-                    not stream_output_emitted and _is_openai_temp_error(exc)
-                ),
-            )
-            if shell_mode:
-                if json_schema_override is SHELL_FOLLOWUP_SCHEMA:
-                    parse_shell_followup_response(
-                        response, response_json_repair
-                    )
-                else:
-                    parse_shell_manifest(response, response_json_repair)
-            elif patch_mode:
-                manifest = parse_json_response(response, response_json_repair)
-                if not isinstance(manifest, dict):
-                    raise ValueError("Patch manifest must be a JSON object")
-                if patch_branch_mode:
-                    raw_commit_message = manifest.get("commit_message")
-                    if (
-                        not isinstance(raw_commit_message, str)
-                        or not raw_commit_message.strip()
-                    ):
-                        raise ValueError(
-                            "Patch manifest commit_message cannot be empty"
+                    if stream:
+                        response, _, response_obj = consume_response_stream(
+                            response_obj,
+                            stream_sink,
+                            response_logger=request.log_response,
+                            request_timer=request.timer,
                         )
-                    if patch_repo_root is None or patch_branch_name is None:
-                        raise ValueError("patch branch was not prepared")
-                    for path, _ in patch_manifest_documents(manifest):
-                        if str(path) in original_texts:
-                            continue
-                        relative_path = git_relative_path(patch_repo_root, path)
-                        branch_path = run_git_command(
-                            patch_repo_root,
-                            [
-                                "ls-tree", "--name-only", "-z",
-                                patch_branch_name, "--", relative_path,
-                            ],
-                        ).stdout
-                        if path.exists() or branch_path:
-                            raise ValueError(
-                                "existing patch branch targets must be included "
-                                f"in file context: {path}"
-                            )
-                build_patch_changes(original_texts, manifest)
-            elif (
-                response_format
-                if response_format_override is None
-                else response_format_override
-            ) in ("json", "schema"):
-                parse_json_response(response, response_json_repair)
-            reasoning = response_reasoning_text(response_obj)
-            response_reasoning_items = response_reasoning_encrypted_items(
-                response_obj
-            )
-            if request_state_path is not None:
-                complete_state_turn(
-                    request_state_path,
-                    reasoning,
-                    response,
-                    response_reasoning_items,
+                    if not response.strip():
+                        raise ModelResponseError("LLM returned an empty response")
+                    return response, response_obj
+
+                response, response_obj = execute_openai_request(
+                    request_response,
+                    retry=model_settings.retry,
+                    operation_name="API request",
+                    error_logger=append_log,
+                    retry_if=lambda exc: (
+                        not stream_output_emitted and _is_openai_temp_error(exc)
+                    ),
                 )
-                state_turn += 1
-            reasoning_items = response_reasoning_items
+                if shell_mode:
+                    if json_schema_override is SHELL_FOLLOWUP_SCHEMA:
+                        parse_shell_followup_response(response, response_json_repair)
+                    else:
+                        parse_shell_manifest(response, response_json_repair)
+                elif patch_mode:
+                    build_current_patch_changes(
+                        parse_json_response(response, response_json_repair)
+                    )
+                elif (
+                    response_format
+                    if response_format_override is None
+                    else response_format_override
+                ) in ("json", "schema"):
+                    parse_json_response(response, response_json_repair)
+                reasoning, response_reasoning_items = request.complete(
+                    response_obj, response
+                )
+                if request.turn_dir is not None:
+                    state_turn += 1
+                reasoning_items = response_reasoning_items
         except Exception as exc:
-            if request_state_path is not None:
-                append_state_response_error(request_state_path, exc)
-            append_log(
-                "<response_error>\n"
-                f"{format_exception_message(exc)}\n"
-                "</response_error>\n"
-            )
+            request.record_error(exc)
             raise
         finally:
-            log_model_response_stats(
-                record_response_stats(
-                    request_timer,
-                    cumulative_stats,
-                    request_characters=request_characters,
-                    request_tokens=request_tokens,
-                    token_cost=token_cost,
-                    turn=current_turn,
-                    prefix=stats_prefix,
-                )
-            )
-        state_turn_path = request_state_path
+            log_model_response_stats(request.response_stats)
+        state_turn_path = request.turn_dir
         return response, reasoning
 
     if resume_reused_shell_turn:
@@ -18804,19 +18538,22 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             f"<resumed_shell_turn path={quote_tag_attribute(reused_shell_turn.turn_dir)}>\n"
         )
         if reused_request is not None:
-            log_model_request(
-                request_characters=reused_request_characters,
-                request_tokens=reused_request_tokens,
-                request_text=reused_request,
+            reused_record = RecordedModelTurn(
+                ModelRequestSettings(model_settings, token_limit, None),
+                cumulative_stats,
+                append_log,
                 turn=int(state_turn_path.name),
                 prefix="request_type=shell reused=true",
-                request_token_cost=None,
+                request_text=reused_request,
+                request_tokens=reused_request_tokens,
+                request_characters=reused_request_characters,
             )
+            reused_record.log_request()
         else:
             append_log(
                 "<request_unavailable>Saved shell turn has no request text.</request_unavailable>\n"
             )
-        log_model_response(result, reasoning)
+        append_log(format_model_response_log(result, reasoning))
         log_model_response_stats(
             format_response_stats(
                 request_characters=reused_request_characters,
@@ -18973,20 +18710,6 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             request_tokens=followup_request_tokens,
         )
 
-    def finish_shell_response(
-        response_text: str,
-        response_reasoning: str,
-    ) -> int:
-        return emit_response_output(
-            format_response_output(
-                response_text,
-                response_reasoning,
-                print_reasoning,
-            ),
-            suppress_response_output=suppress_response_output,
-            output_file_path=args.output_file,
-        )
-
     if shell_mode:
         try:
             if resume_reused_shell_turn:
@@ -18996,9 +18719,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     )
                 )
                 if reused_session_end_reason is not None:
-                    return finish_shell_response(
+                    return emit_response_output(
                         reused_session_end_reason,
-                        reasoning,
+                        reasoning=reasoning,
+                        print_reasoning=print_reasoning,
+                        suppress_response_output=suppress_response_output,
+                        output_file_path=args.output_file,
                     )
                 if shell_steps is None:
                     raise ValueError("reused shell turn returned no commands")
@@ -19060,9 +18786,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     return 1
                 continue
             if review_action == 'save':
-                return finish_shell_response(
+                return emit_response_output(
                     str(result or ''),
-                    shell_response_reasoning,
+                    reasoning=shell_response_reasoning,
+                    print_reasoning=print_reasoning,
+                    suppress_response_output=suppress_response_output,
+                    output_file_path=args.output_file,
                 )
             if review_action != 'accept':
                 if VERBOSE:
@@ -19108,9 +18837,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                     or complete_reused_shell_turn_after_execution
                 )
             ):
-                return finish_shell_response(
+                return emit_response_output(
                     "Shell command turn completed.",
-                    shell_response_reasoning,
+                    reasoning=shell_response_reasoning,
+                    print_reasoning=print_reasoning,
+                    suppress_response_output=suppress_response_output,
+                    output_file_path=args.output_file,
                 )
             try:
                 result, followup_reasoning = request_shell_followup(
@@ -19143,9 +18875,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
             if session_reason is None:
                 print("ERROR: Shell follow-up returned no session reason", file=sys.stderr)
                 return 1
-            return finish_shell_response(
+            return emit_response_output(
                 session_reason,
-                followup_reasoning,
+                reasoning=followup_reasoning,
+                print_reasoning=print_reasoning,
+                suppress_response_output=suppress_response_output,
+                output_file_path=args.output_file,
             )
 
     if patch_mode:
@@ -19206,21 +18941,12 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
                 )
                 return 1
 
-            patch_commit_message = ''
-            if patch_branch_mode:
-                if not isinstance(manifest, dict):
-                    print('ERROR: Patch manifest must be a JSON object', file=sys.stderr)
-                    return 1
-                raw_commit_message = manifest.get('commit_message')
-                if not isinstance(raw_commit_message, str) or not raw_commit_message.strip():
-                    print('ERROR: Patch manifest commit_message cannot be empty', file=sys.stderr)
-                    return 1
-                patch_commit_message = raw_commit_message.strip()
-
             try:
-                updated_texts, diff_text, changed_items = build_patch_changes(
-                    original_texts,
-                    manifest,
+                updated_texts, diff_text, changed_items = build_current_patch_changes(
+                    manifest
+                )
+                patch_commit_message = (
+                    manifest["commit_message"].strip() if patch_branch_mode else ''
                 )
                 result = json.dumps(manifest, indent=2, ensure_ascii=False)
             except Exception as exc:
@@ -19364,13 +19090,10 @@ def run_main(cumulative_stats: CumulativeStats) -> int:
         finally:
             result = pretty_json(result)
 
-    output_str = format_response_output(
-        result,
-        reasoning,
-        print_reasoning,
-    )
     output_status = emit_response_output(
-        output_str,
+        result,
+        reasoning=reasoning,
+        print_reasoning=print_reasoning,
         suppress_response_output=suppress_response_output,
         stream_output_emitted=stream_output_emitted,
         output_file_path=args.output_file,
@@ -19423,10 +19146,11 @@ finally:
             OUTPUT_FILE.close()
         except Exception:
             pass
-    if VERBOSE and not NONINTERACTIVE:
-        print(f"session_name={SESSION_NAME}", file=sys.stderr)
-    elif NONINTERACTIVE:
-        print(f"{SESSION_NAME}")
+    if SESSION_NAME is not None:
+        if VERBOSE and not NONINTERACTIVE:
+            print(f"session_name={SESSION_NAME}", file=sys.stderr)
+        elif NONINTERACTIVE:
+            print(f"{SESSION_NAME}")
 
     if isinstance(err, BaseException):
         report_request_error(err)
