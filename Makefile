@@ -24,6 +24,15 @@ ifeq ($(shell id -u),0)
 SUDO :=
 endif
 
+# Resolve the version-specific site-packages directory with the venv's Python.
+# $(1): virtualenv directory; $(2): optional privilege prefix.
+define install-mcelibs
+module_dir=$$($(2) "$(1)/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))'); \
+$(2) mkdir -p "$$module_dir"; \
+$(2) install -m 644 "lib/mcencurses.py" "$$module_dir/mcencurses.py"; \
+$(2) install -m 644 "lib/mcecore.py" "$$module_dir/mcecore.py"
+endef
+
 .PHONY: install-user uninstall-user update-user install-global uninstall-global update-global update help shell changelog
 
 help:
@@ -56,6 +65,7 @@ install-user:
 		"$(PYTHON)" -m venv "$(USER_VENV)"; \
 	fi; \
 	"$(USER_VENV)/bin/python" -m pip install --disable-pip-version-check -r requirements.txt; \
+	$(call install-mcelibs,$(USER_VENV)); \
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 	chmod 755 "$(USER_LAUNCH)"; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
@@ -86,6 +96,7 @@ update-user:
 			"$(PYTHON)" -m venv "$(USER_VENV)"; \
 		fi; \
 		"$(USER_VENV)/bin/python" -m pip install --disable-pip-version-check --upgrade -q -r requirements.txt; \
+		$(call install-mcelibs,$(USER_VENV)); \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(PROGRAM)" "$$@"' > "$(USER_LAUNCH)"; \
 		chmod 755 "$(USER_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(USER_VENV)/bin/python" "$(USER_DIR)/$(CONTAIN_PROGRAM)" "$$@"' > "$(USER_CONTAIN_LAUNCH)"; \
@@ -109,6 +120,7 @@ install-global:
 		$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 	fi; \
 	$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --disable-pip-version-check -r requirements.txt; \
+	$(call install-mcelibs,$(GLOBAL_VENV),$(SUDO)); \
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 	$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 	printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \
@@ -139,6 +151,7 @@ update-global:
 			$(SUDO) "$(PYTHON)" -m venv "$(GLOBAL_VENV)"; \
 		fi; \
 		$(SUDO) "$(GLOBAL_VENV)/bin/python" -m pip install --disable-pip-version-check --upgrade -q -r requirements.txt; \
+		$(call install-mcelibs,$(GLOBAL_VENV),$(SUDO)); \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_LAUNCH)" >/dev/null; \
 		$(SUDO) chmod 755 "$(GLOBAL_LAUNCH)"; \
 		printf '%s\n' '#!/bin/sh' 'exec "$(GLOBAL_VENV)/bin/python" "$(GLOBAL_DIR)/$(CONTAIN_PROGRAM)" "$$@"' | $(SUDO) tee "$(GLOBAL_CONTAIN_LAUNCH)" >/dev/null; \

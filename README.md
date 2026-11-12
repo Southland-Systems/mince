@@ -692,11 +692,11 @@ All targets are **idempotent** – running them twice will simply refresh the ex
 
 ## Tests passed
 
-Last tested: `2026-11-03`
+Last tested: `2026-11-12`
 
 ```text
 TAP version 13
-1..95
+1..101
 ok 1 - prints the built-in configuration offline
 ok 2 - migrates legacy configuration into conf without overwriting conflicts
 ok 3 - resolves virtual built-in profiles and protects internal profiles
@@ -712,86 +712,92 @@ ok 12 - retries transient tree failures and resumes completed or partially faile
 ok 13 - creates, assigns, and removes prompt-library entries
 ok 14 - expands prompt-library references
 ok 15 - loads prompt and context files
-ok 16 - lists state artifact types offline
-ok 17 - applies patches to multiple files and creates files
-ok 18 - inserts patches into empty files
-ok 19 - validates patches and preserves line endings
-ok 20 - reviews patches interactively without a suffix
-ok 21 - handles text and JSON responses from a local API
-ok 22 - handles streamed text and buffered reasoning responses
-ok 23 - streams text responses to an output file
-ok 24 - reconstructs streamed reasoning, replays cached context, and rejects incomplete streams
-ok 25 - enables text streaming from configuration
-ok 26 - preserves prompt placement and line-number overrides
-ok 27 - reports relative file paths without inventing them for external files or stdin
-ok 28 - separates system schema instructions from literal schema data
-ok 29 - handles custom JSON-schema responses
-ok 30 - validates and writes an API patch response
-ok 31 - creates API patch files without initial context
-ok 32 - records session patch artifacts and reapplies exported JSON
-ok 33 - applies deletion and replacement patch ranges
-ok 34 - rejects resumed sessions with changed files
-ok 35 - executes shell scripts and saves state offline
-ok 36 - handles shell follow-up commands and failures
-ok 37 - rejects invalid shell follow-ups while preserving accepted output and recording response errors
-ok 38 - separates shell execution timeouts from API timeouts
-ok 39 - totals shell and agent usage and costs once in stderr and session logs
-ok 40 - accepts compound token costs and rejects invalid costs before API requests
-ok 41 - traces shell and agent commands into distinct indexed state artifacts
-ok 42 - resumes completed shell sessions without an extra request
-ok 43 - writes and commits patch changes on a git branch
-ok 44 - merges and removes patch branches
-ok 45 - rejects invalid patch ranges, content types, endings, and duplicate paths
-ok 46 - accepts permissive replacement ranges and string content
-ok 47 - applies a saved session patch only once
-ok 48 - repairs JSON and controls explicit prompt caching
-ok 49 - validates response completion, refusals, and retryable response errors
-ok 50 - records failed requests without completing turns and resumes only completed work
-ok 51 - selects API keys securely from configuration, environment, and file descriptors
-ok 52 - bounds transient API attempts and does not retry permanent failures
-ok 53 - disables conflicting task modes for ask requests
-ok 54 - ignores standalone patch and shell options in agent mode
-ok 55 - revises the last shell command turn after session completion
-ok 56 - restricts shell address families and overrides inherited pagers
-ok 57 - isolates shell stdin and preserves non-UTF-8 output and exit statuses
-ok 58 - applies native agent patches and refreshes companion file context
-ok 59 - bounds loaded file content and expires missing files independently
-ok 60 - bounds automatic file refreshes and restores normal retention after file errors
-ok 61 - updates persistent agent tasks atomically at capacity
-ok 62 - retries invalid agent requests and rejects invalid call batches
-ok 63 - manages agent profiles and replays reasoning across worker delegation
-ok 64 - delegates named and default built-in worker profiles without executing their proposals
-ok 65 - reviews plans and preserves accepted, rejected, and saved state
-ok 66 - navigates patch revisions and applies the selected state turn
-ok 67 - resumes indexed and legacy shell output without executing commands again
-ok 68 - pins agent file context and extends unpinned context expiry
-ok 69 - restores selected agent history, tasks, file context, and remaining expiry
-ok 70 - redacts API keys in configuration output and session logs
-ok 71 - writes text and JSON output files without duplicating stdout
-ok 72 - estimates tokens and rejects oversized requests before API calls
-ok 73 - rejects invalid shell manifests before executing commands
-ok 74 - runs agent hooks per turn and omits failed output and stdin
-ok 75 - refreshes live file context per turn without overwriting saved snapshots
-ok 76 - preserves rejected tool proposals without applying patches or executing commands
-ok 77 - revises resumed patches with checksum verification explicitly skipped
-ok 78 - honors explicit automatic-agent patch suffixes without modifying source files
-ok 79 - rejects task-list overflow atomically and renumbers removal batches
-ok 80 - persists encrypted reasoning and replays it when resuming a task
-ok 81 - forks resumed session chains and respects inherited turn cutoffs
-ok 82 - distinguishes automatic, reviewed, rejected, and saved agent execution
-ok 83 - reviews context independently and requests summaries without compaction
-ok 84 - automatically compacts pinned context and resumes summary-only turns
-ok 85 - refreshes expired summaries without compacting or double-aging live context
-ok 86 - updates in-memory prompts using independent profile-based reviews
-ok 87 - retains deprecated option compatibility with explicit warnings
-ok 88 - builds default containment commands and preserves argument boundaries
-ok 89 - selects containment state, visibility, network, runtime, and shell modes
-ok 90 - resolves, quotes, deduplicates, and orders containment grants and bindings
-ok 91 - preserves mapped working directories and exposes explicit grant overrides
-ok 92 - forwards nested shell containment grants and respects argument separators
-ok 93 - grants requested backup directories and forwards them to nested containment
-ok 94 - grants and executes containment tracing without modifying dry-run destinations
-ok 95 - rejects invalid containment options and paths before execution
+ok 16 - combines repeated prompts and rereads CLI and configured task files before each turn
+ok 17 - preserves original image bytes across task, patch, tree, and resumed requests
+ok 18 - lists state artifact types offline
+ok 19 - applies patches to multiple files and creates files
+ok 20 - inserts patches into empty files
+ok 21 - validates patches and preserves line endings
+ok 22 - reviews patches interactively without a suffix
+ok 23 - handles text and JSON responses from a local API
+ok 24 - handles streamed text and buffered reasoning responses
+ok 25 - streams text responses to an output file
+ok 26 - reconstructs streamed reasoning, replays cached context, and rejects incomplete streams
+ok 27 - enables text streaming from configuration
+ok 28 - preserves prompt placement and line-number overrides
+ok 29 - reports relative file paths without inventing them for external files or stdin
+ok 30 - separates system schema instructions from literal schema data
+ok 31 - handles custom JSON-schema responses
+ok 32 - validates and writes an API patch response
+ok 33 - creates API patch files without initial context
+ok 34 - records session patch artifacts and reapplies exported JSON
+ok 35 - applies deletion and replacement patch ranges
+ok 36 - rejects resumed sessions with changed files
+ok 37 - executes shell scripts and saves state offline
+ok 38 - handles shell follow-up commands and failures
+ok 39 - rejects invalid shell follow-ups while preserving accepted output and recording response errors
+ok 40 - separates shell execution timeouts from API timeouts
+ok 41 - totals shell and agent usage and costs once in stderr and session logs
+ok 42 - accepts compound token costs and rejects invalid costs before API requests
+ok 43 - traces shell and agent commands into distinct indexed state artifacts
+ok 44 - resumes completed shell sessions without an extra request
+ok 45 - writes and commits patch changes on a git branch
+ok 46 - merges and removes patch branches
+ok 47 - rejects invalid patch ranges, content types, endings, and duplicate paths
+ok 48 - accepts permissive replacement ranges and string content
+ok 49 - applies a saved session patch only once
+ok 50 - repairs JSON and controls explicit prompt caching
+ok 51 - validates response completion, refusals, and retryable response errors
+ok 52 - records failed requests without completing turns and resumes only completed work
+ok 53 - selects API keys securely from configuration, environment, and file descriptors
+ok 54 - bounds transient API attempts and does not retry permanent failures
+ok 55 - disables conflicting task modes for ask requests
+ok 56 - ignores standalone patch and shell options in agent mode
+ok 57 - revises the last shell command turn after session completion
+ok 58 - restricts shell address families and overrides inherited pagers
+ok 59 - isolates shell stdin and preserves non-UTF-8 output and exit statuses
+ok 60 - refreshes existing agent patch context and loads newly created files without redundant calls
+ok 61 - merges touching ranges, removes overlapping patch calls, accepts no-op patches, and ends batches last
+ok 62 - bounds loaded file content and expires missing files independently
+ok 63 - bounds automatic file refreshes and restores normal retention after file errors
+ok 64 - updates persistent agent tasks atomically at capacity
+ok 65 - retries invalid agent responses and rejects leading retention and unknown calls
+ok 66 - manages agent profiles and replays reasoning across worker delegation
+ok 67 - delegates named and default built-in worker profiles without executing their proposals
+ok 68 - reviews plans and preserves accepted, rejected, and saved state
+ok 69 - navigates patch revisions and applies the selected state turn
+ok 70 - resumes indexed and legacy shell output without executing commands again
+ok 71 - pins agent file context and extends unpinned context expiry
+ok 72 - restores selected agent history, tasks, file context, and remaining expiry
+ok 73 - resumes pending agent tool-call suffixes without requesting or executing completed work again
+ok 74 - restores failed agent request checkpoints without double-aging retained context
+ok 75 - redacts API keys in configuration output and session logs
+ok 76 - writes text and JSON output files without duplicating stdout
+ok 77 - estimates tokens and rejects oversized requests before API calls
+ok 78 - rejects invalid shell manifests before executing commands
+ok 79 - runs agent hooks per turn and omits failed output and stdin
+ok 80 - refreshes live file context per turn without overwriting saved snapshots
+ok 81 - preserves rejected tool proposals without applying patches or executing commands
+ok 82 - revises resumed patches with checksum verification explicitly skipped
+ok 83 - honors explicit automatic-agent patch suffixes without modifying source files
+ok 84 - rejects task-list overflow atomically and renumbers removal batches
+ok 85 - persists encrypted reasoning and replays it when resuming a task
+ok 86 - forks resumed session chains and respects inherited turn cutoffs
+ok 87 - distinguishes automatic, reviewed, rejected, and saved agent execution
+ok 88 - removes stale reviewed context by stable IDs while retaining changed files and newer outcomes
+ok 89 - clears stale summary guidance without compacting live context or generating a replacement
+ok 90 - uses native summary calls, compacts pinned context, and resumes without immediate redundant reviews
+ok 91 - refreshes expired summaries without compacting or double-aging live context
+ok 92 - tracks current, previous, and original prompts across independent reviews and resumed sessions
+ok 93 - retains deprecated option compatibility with explicit warnings
+ok 94 - builds default containment commands and preserves argument boundaries
+ok 95 - selects containment state, visibility, network, runtime, and shell modes
+ok 96 - resolves, quotes, deduplicates, and orders containment grants and bindings
+ok 97 - preserves mapped working directories and exposes explicit grant overrides
+ok 98 - forwards nested shell containment grants and respects argument separators
+ok 99 - grants requested backup directories and forwards them to nested containment
+ok 100 - grants and executes containment tracing without modifying dry-run destinations
+ok 101 - rejects invalid containment options and paths before execution
 ```
 
 
